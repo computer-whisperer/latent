@@ -11,4 +11,5 @@ authors.workspace = true
 anyhow.workspace = true
 exr.workspace = true
 png.workspace = true
+image.workspace = true
 half.workspace = true

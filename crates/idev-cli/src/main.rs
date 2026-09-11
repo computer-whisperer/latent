@@ -1,11 +1,14 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use idev_core::gpu::{Developer, Gpu, OutputTarget};
-use idev_core::params::{DevelopParams, WhiteBalance};
-use idev_core::{output, sensor};
+use idev_core::params::{
+    Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sidecar_path,
+};
+use idev_core::sensor::SensorFrame;
+use idev_core::{WorkingImage, output, sensor};
 
 #[derive(Parser)]
 #[command(name = "idev", about = "Raw developer")]
@@ -14,24 +17,214 @@ struct Cli {
     cmd: Cmd,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Format {
+    /// scRGB linear f16
+    Exr,
+    /// sRGB 8-bit, or BT.2020 PQ 16-bit with --hdr
+    Png,
+    /// sRGB 8-bit
+    Jpg,
+}
+
+impl Format {
+    fn extension(self) -> &'static str {
+        match self {
+            Format::Exr => "exr",
+            Format::Png => "png",
+            Format::Jpg => "jpg",
+        }
+    }
+
+    fn from_path(p: &Path) -> Option<Format> {
+        match p.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+            "exr" => Some(Format::Exr),
+            "png" => Some(Format::Png),
+            "jpg" | "jpeg" => Some(Format::Jpg),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum DemosaicArg {
+    Bilinear,
+    Rcd,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum HighlightsArg {
+    Clip,
+    Blend,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ToneArg {
+    None,
+    Sigmoid,
+}
+
+/// Parameter overrides shared by `develop` and `params`.
+#[derive(clap::Args, Default)]
+struct Overrides {
+    /// Read parameters from this file instead of the raw's sidecar.
+    #[arg(long)]
+    params: Option<PathBuf>,
+    /// Exposure compensation in stops.
+    #[arg(long)]
+    exposure: Option<f32>,
+    /// White balance multipliers "R,B" (green = 1).
+    #[arg(long)]
+    wb: Option<String>,
+    /// White balance as "kelvin" or "kelvin,tint".
+    #[arg(long)]
+    temp: Option<String>,
+    /// As-shot white balance (clears a sidecar override).
+    #[arg(long)]
+    wb_as_shot: bool,
+    #[arg(long)]
+    demosaic: Option<DemosaicArg>,
+    #[arg(long)]
+    highlights: Option<HighlightsArg>,
+    #[arg(long)]
+    tone: Option<ToneArg>,
+    /// Sigmoid contrast (slope at middle grey).
+    #[arg(long)]
+    contrast: Option<f32>,
+    /// Sigmoid hue preservation, 0 (per channel) to 1 (luminance ratio).
+    #[arg(long)]
+    hue_preservation: Option<f32>,
+}
+
+impl Overrides {
+    fn apply(&self, p: &mut DevelopParams) -> Result<()> {
+        if let Some(ev) = self.exposure {
+            p.exposure_ev = ev;
+        }
+        if self.wb_as_shot {
+            p.white_balance = WhiteBalance::AsShot;
+        }
+        if let Some(s) = &self.wb {
+            let parts = parse_floats(s).context("parse --wb")?;
+            let [red, blue] = parts.as_slice() else {
+                bail!("--wb expects \"R,B\"")
+            };
+            p.white_balance = WhiteBalance::Multipliers {
+                red: *red,
+                blue: *blue,
+            };
+        }
+        if let Some(s) = &self.temp {
+            let parts = parse_floats(s).context("parse --temp")?;
+            p.white_balance = match parts.as_slice() {
+                [k] => WhiteBalance::Temperature {
+                    kelvin: *k,
+                    tint: 0.0,
+                },
+                [k, t] => WhiteBalance::Temperature {
+                    kelvin: *k,
+                    tint: *t,
+                },
+                _ => bail!("--temp expects \"K\" or \"K,tint\""),
+            };
+        }
+        if let Some(d) = self.demosaic {
+            p.demosaic = match d {
+                DemosaicArg::Bilinear => Demosaic::Bilinear,
+                DemosaicArg::Rcd => Demosaic::Rcd,
+            };
+        }
+        if let Some(h) = self.highlights {
+            p.highlights = match h {
+                HighlightsArg::Clip => Highlights::Clip,
+                HighlightsArg::Blend => Highlights::Blend,
+            };
+        }
+        if let Some(t) = self.tone {
+            p.tone = match t {
+                ToneArg::None => ToneCurve::None,
+                ToneArg::Sigmoid => match p.tone {
+                    ToneCurve::Sigmoid { .. } => p.tone,
+                    ToneCurve::None => ToneCurve::default(),
+                },
+            };
+        }
+        if self.contrast.is_some() || self.hue_preservation.is_some() {
+            let (mut c, mut h) = match p.tone {
+                ToneCurve::Sigmoid {
+                    contrast,
+                    hue_preservation,
+                } => (contrast, hue_preservation),
+                ToneCurve::None => match ToneCurve::default() {
+                    ToneCurve::Sigmoid {
+                        contrast,
+                        hue_preservation,
+                    } => (contrast, hue_preservation),
+                    ToneCurve::None => unreachable!(),
+                },
+            };
+            if let Some(v) = self.contrast {
+                c = v;
+            }
+            if let Some(v) = self.hue_preservation {
+                h = v;
+            }
+            p.tone = ToneCurve::Sigmoid {
+                contrast: c,
+                hue_preservation: h,
+            };
+        }
+        Ok(())
+    }
+
+    /// Sidecar (or --params file) plus overrides.
+    fn resolve(&self, raw: &Path) -> Result<DevelopParams> {
+        let mut p = match &self.params {
+            Some(f) => DevelopParams::load(f)?,
+            None => DevelopParams::for_raw(raw)?,
+        };
+        self.apply(&mut p)?;
+        Ok(p)
+    }
+}
+
+fn parse_floats(s: &str) -> Result<Vec<f32>> {
+    s.split(',')
+        .map(|p| p.trim().parse::<f32>().map_err(Into::into))
+        .collect()
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Print what the decoder learned about a raw file.
     Inspect { file: PathBuf },
-    /// Develop a raw file into an output image (.exr or .png by extension).
+    /// Develop raw files. One input with -o, or any number with --out-dir.
     Develop {
-        file: PathBuf,
-        #[arg(short, long)]
-        out: PathBuf,
-        /// Exposure compensation in stops.
-        #[arg(long, default_value_t = 0.0)]
-        exposure: f32,
-        /// White balance multipliers "R,B" (green = 1); default as-shot.
+        files: Vec<PathBuf>,
+        /// Output file (single input; format from the extension).
+        #[arg(short, long, conflicts_with = "out_dir")]
+        out: Option<PathBuf>,
+        /// Output directory (batch; names follow the inputs).
         #[arg(long)]
-        wb: Option<String>,
-        /// White balance as "kelvin" or "kelvin,tint".
+        out_dir: Option<PathBuf>,
+        /// Output format for --out-dir (default png).
+        #[arg(long, value_enum)]
+        format: Option<Format>,
+        /// HDR output: tone-map for a display of this peak in nits and
+        /// write PNG as BT.2020 PQ 16-bit.
         #[arg(long)]
-        temp: Option<String>,
+        hdr: Option<f32>,
+        /// JPEG quality.
+        #[arg(long, default_value_t = 92)]
+        quality: u8,
+        /// Overwrite existing outputs.
+        #[arg(long)]
+        force: bool,
+        /// Write the resolved parameters to each raw's sidecar.
+        #[arg(long)]
+        save_params: bool,
+        #[command(flatten)]
+        overrides: Overrides,
     },
     /// Dump the raw sensor plane as 16-bit PGM (for decoder cross-checks).
     DumpBayer {
@@ -39,8 +232,12 @@ enum Cmd {
         #[arg(short, long)]
         out: PathBuf,
     },
-    /// Print the default parameters as TOML.
-    Params,
+    /// Print parameters as TOML: defaults, or a raw's sidecar plus overrides.
+    Params {
+        file: Option<PathBuf>,
+        #[command(flatten)]
+        overrides: Overrides,
+    },
 }
 
 fn main() -> Result<()> {
@@ -50,24 +247,46 @@ fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Inspect { file } => inspect(&file),
         Cmd::Develop {
-            file,
+            files,
             out,
-            exposure,
-            wb,
-            temp,
-        } => develop(&file, &out, exposure, wb.as_deref(), temp.as_deref()),
+            out_dir,
+            format,
+            hdr,
+            quality,
+            force,
+            save_params,
+            overrides,
+        } => develop(
+            &files,
+            out.as_deref(),
+            out_dir.as_deref(),
+            format,
+            hdr,
+            quality,
+            force,
+            save_params,
+            &overrides,
+        ),
         Cmd::DumpBayer { file, out } => {
             let frame = sensor::unpack(&file)?;
             idev_formats::write_pgm16(&out, frame.width, frame.height, &frame.data)
         }
-        Cmd::Params => {
-            print!("{}", toml::to_string_pretty(&DevelopParams::default())?);
+        Cmd::Params { file, overrides } => {
+            let p = match file {
+                Some(f) => overrides.resolve(&f)?,
+                None => {
+                    let mut p = DevelopParams::default();
+                    overrides.apply(&mut p)?;
+                    p
+                }
+            };
+            print!("{}", toml::to_string_pretty(&p)?);
             Ok(())
         }
     }
 }
 
-fn inspect(file: &std::path::Path) -> Result<()> {
+fn inspect(file: &Path) -> Result<()> {
     let t = Instant::now();
     let f = sensor::unpack(file)?;
     println!("{}  ({:.2?})", file.display(), t.elapsed());
@@ -125,92 +344,167 @@ fn inspect(file: &std::path::Path) -> Result<()> {
         .iter()
         .fold((u16::MAX, 0u16), |(lo, hi), &v| (lo.min(v), hi.max(v)));
     println!("data range   {min} ..= {max}");
+    let side = sidecar_path(file);
+    if side.exists() {
+        println!("sidecar      {}", side.display());
+    }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn develop(
-    file: &std::path::Path,
-    out: &std::path::Path,
-    exposure: f32,
-    wb: Option<&str>,
-    temp: Option<&str>,
+    files: &[PathBuf],
+    out: Option<&Path>,
+    out_dir: Option<&Path>,
+    format: Option<Format>,
+    hdr: Option<f32>,
+    quality: u8,
+    force: bool,
+    save_params: bool,
+    overrides: &Overrides,
 ) -> Result<()> {
-    let mut params = DevelopParams {
-        exposure_ev: exposure,
-        ..Default::default()
-    };
-    if let Some(s) = wb {
-        let parts: Vec<f32> = s
-            .split(',')
-            .map(|p| p.trim().parse::<f32>())
-            .collect::<Result<_, _>>()
-            .context("parse --wb")?;
-        if parts.len() != 2 {
-            bail!("--wb expects \"R,B\"");
+    if files.is_empty() {
+        bail!("no input files");
+    }
+    // Resolve each input's output path and format up front.
+    let jobs: Vec<(PathBuf, PathBuf, Format)> = match (out, out_dir) {
+        (Some(o), None) => {
+            if files.len() != 1 {
+                bail!("-o takes exactly one input; use --out-dir for several");
+            }
+            let fmt = format
+                .or_else(|| Format::from_path(o))
+                .context("cannot tell the output format from the extension; pass --format")?;
+            vec![(files[0].clone(), o.to_path_buf(), fmt)]
         }
-        params.white_balance = WhiteBalance::Multipliers {
-            red: parts[0],
-            blue: parts[1],
-        };
-    }
-    if let Some(s) = temp {
-        let parts: Vec<f32> = s
-            .split(',')
-            .map(|p| p.trim().parse::<f32>())
-            .collect::<Result<_, _>>()
-            .context("parse --temp")?;
-        params.white_balance = match parts.as_slice() {
-            [k] => WhiteBalance::Temperature {
-                kelvin: *k,
-                tint: 0.0,
-            },
-            [k, t] => WhiteBalance::Temperature {
-                kelvin: *k,
-                tint: *t,
-            },
-            _ => bail!("--temp expects \"K\" or \"K,tint\""),
-        };
-    }
+        (None, Some(dir)) => {
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+            let fmt = format.unwrap_or(Format::Png);
+            files
+                .iter()
+                .map(|f| {
+                    let stem = f.file_stem().map(|s| s.to_os_string()).unwrap_or_default();
+                    let mut name = stem;
+                    name.push(".");
+                    name.push(fmt.extension());
+                    (f.clone(), dir.join(name), fmt)
+                })
+                .collect()
+        }
+        (None, None) => bail!("pass -o FILE or --out-dir DIR"),
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with"),
+    };
 
-    let t0 = Instant::now();
-    let frame = sensor::unpack(file)?;
-    let t1 = Instant::now();
+    let target = match hdr {
+        Some(nits) => OutputTarget::hdr_nits(nits),
+        None => OutputTarget::SDR,
+    };
+
+    let t = Instant::now();
     let gpu = Gpu::headless()?;
     let dev = Developer::new(&gpu);
-    let t2 = Instant::now();
-    let img = dev.develop(&gpu, &frame, &params, OutputTarget::SDR)?;
-    let t3 = Instant::now();
+    tracing::info!("gpu ready in {:.0?}", t.elapsed());
 
-    let ext = out
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "exr" => {
-            let rgb = output::scrgb_linear_f32(&img);
-            idev_formats::write_exr_rgb_f32(out, img.width, img.height, &rgb)?;
+    let mut failures = 0usize;
+    for (input, output_path, fmt) in &jobs {
+        if output_path.exists() && !force {
+            println!(
+                "{}  exists, skipped (--force to overwrite)",
+                output_path.display()
+            );
+            continue;
         }
-        "png" => {
-            let rgb = output::srgb8(&img);
-            idev_formats::write_png_srgb8(out, img.width, img.height, &rgb)?;
+        match develop_one(
+            &gpu,
+            &dev,
+            input,
+            output_path,
+            *fmt,
+            target,
+            hdr,
+            quality,
+            save_params,
+            overrides,
+        ) {
+            Ok(()) => {}
+            Err(e) => {
+                failures += 1;
+                eprintln!("{}: {e:#}", input.display());
+            }
         }
-        other => bail!("unsupported output extension {other:?} (use .exr or .png)"),
     }
-    let t4 = Instant::now();
+    if failures > 0 {
+        bail!("{failures} of {} inputs failed", jobs.len());
+    }
+    Ok(())
+}
 
-    let (max, mean) = output::stats(&img);
+#[allow(clippy::too_many_arguments)]
+fn develop_one(
+    gpu: &Gpu,
+    dev: &Developer,
+    input: &Path,
+    output_path: &Path,
+    fmt: Format,
+    target: OutputTarget,
+    hdr: Option<f32>,
+    quality: u8,
+    save_params: bool,
+    overrides: &Overrides,
+) -> Result<()> {
+    let params = overrides.resolve(input)?;
+    let t0 = Instant::now();
+    let frame: SensorFrame = sensor::unpack(input)?;
+    let t1 = Instant::now();
+    let img: WorkingImage = dev.develop(gpu, &frame, &params, target)?;
+    let t2 = Instant::now();
+    let img = output::oriented(&img, frame.orientation);
+    encode(&img, output_path, fmt, hdr, quality)?;
+    let t3 = Instant::now();
+    if save_params {
+        params.save(&sidecar_path(input))?;
+    }
     println!(
-        "{} -> {}  {}x{}  unpack {:.0?}  gpu init {:.0?}  develop {:.0?}  encode {:.0?}",
-        file.display(),
-        out.display(),
+        "{} -> {}  {}x{}  unpack {:.0?}  develop {:.0?}  encode {:.0?}",
+        input.display(),
+        output_path.display(),
         img.width,
         img.height,
         t1 - t0,
         t2 - t1,
-        t3 - t2,
-        t4 - t3
+        t3 - t2
     );
-    println!("working max rgb {:?}  mean luminance {:.4}", max, mean);
     Ok(())
+}
+
+fn encode(
+    img: &WorkingImage,
+    path: &Path,
+    fmt: Format,
+    hdr: Option<f32>,
+    quality: u8,
+) -> Result<()> {
+    match (fmt, hdr) {
+        (Format::Exr, _) => {
+            let rgb = output::scrgb_linear_f32(img);
+            idev_formats::write_exr_rgb_f32(path, img.width, img.height, &rgb)
+        }
+        (Format::Png, None) => {
+            idev_formats::write_png_srgb8(path, img.width, img.height, &output::srgb8(img))
+        }
+        (Format::Png, Some(_)) => idev_formats::write_png_bt2020_pq16(
+            path,
+            img.width,
+            img.height,
+            &output::bt2020_pq16(img),
+        ),
+        (Format::Jpg, None) => idev_formats::write_jpeg_srgb8(
+            path,
+            img.width,
+            img.height,
+            &output::srgb8(img),
+            quality,
+        ),
+        (Format::Jpg, Some(_)) => bail!("JPEG has no HDR encoding; use png or exr with --hdr"),
+    }
 }

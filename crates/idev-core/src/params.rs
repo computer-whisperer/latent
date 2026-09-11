@@ -2,6 +2,9 @@
 //! controls, sidecar files, and the pipeline, so it is serialized with
 //! defaults for every field and a schema version.
 
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -89,6 +92,50 @@ impl Default for DevelopParams {
             demosaic: Demosaic::default(),
             highlights: Highlights::default(),
             tone: ToneCurve::default(),
+        }
+    }
+}
+
+/// Sidecar extension, appended to the raw's full file name.
+pub const SIDECAR_SUFFIX: &str = ".idev.toml";
+
+pub fn sidecar_path(raw: &Path) -> PathBuf {
+    let mut name = raw
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(SIDECAR_SUFFIX);
+    raw.with_file_name(name)
+}
+
+impl DevelopParams {
+    pub fn load(path: &Path) -> Result<DevelopParams> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let params: DevelopParams =
+            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        if params.schema > SCHEMA_VERSION {
+            anyhow::bail!(
+                "{}: schema {} is newer than this build ({SCHEMA_VERSION})",
+                path.display(),
+                params.schema
+            );
+        }
+        Ok(params)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let text = toml::to_string_pretty(self).context("serialize params")?;
+        std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
+    }
+
+    /// The sidecar beside `raw` if there is one, else defaults.
+    pub fn for_raw(raw: &Path) -> Result<DevelopParams> {
+        let side = sidecar_path(raw);
+        if side.exists() {
+            Self::load(&side)
+        } else {
+            Ok(Self::default())
         }
     }
 }

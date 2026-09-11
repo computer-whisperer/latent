@@ -5,13 +5,19 @@ and SDR images out, one GPU pipeline behind both a CLI and (later) a
 damascene GUI. `DESIGN.md` is the plan and the decision record.
 
 ```
-cargo run --release -p idev-cli -- inspect  DSC00039.ARW
-cargo run --release -p idev-cli -- develop  DSC00039.ARW -o out.exr   # scRGB linear f16
-cargo run --release -p idev-cli -- develop  DSC00039.ARW -o out.png   # sRGB 8-bit, clipped
-cargo run --release -p idev-cli -- develop  DSC00039.ARW -o out.png --exposure 1.0 --wb 2.5,1.5
-cargo run --release -p idev-cli -- dump-bayer DSC00039.ARW -o raw.pgm  # decoder cross-checks
-cargo run --release -p idev-cli -- params                              # default params as TOML
+idev inspect DSC00039.ARW
+idev develop DSC00039.ARW -o out.jpg                      # sRGB JPEG, sidecar params if present
+idev develop DSC00039.ARW -o out.png --hdr 1000           # BT.2020 PQ 16-bit PNG for a 1000-nit master
+idev develop DSC00039.ARW -o out.exr --tone none          # scene-referred scRGB linear f16
+idev develop DSC00039.ARW -o out.jpg --exposure 0.5 --temp 5200,4 --contrast 1.8 --save-params
+idev develop *.ARW --out-dir developed --format jpg       # batch; skips existing outputs
+idev params DSC00039.ARW                                  # resolved params (sidecar + defaults)
+idev dump-bayer DSC00039.ARW -o raw.pgm                   # decoder cross-checks
 ```
+
+Build with `cargo build --release`; the binary is `target/release/idev`.
+Parameters live in `<raw>.idev.toml` beside each raw; flags override,
+`--save-params` writes back.
 
 Crates:
 

@@ -206,9 +206,11 @@ CPU output transform (orientation, primaries, transfer) → encoder.
 - **Highlights: blend**, per pixel after demosaic. Each channel clamps
   at its own post-WB clip level (a clipped value is a lower bound), a
   clipped channel is lifted to at least the brightest still-valid
-  channel, and a fully clipped pixel becomes a neutral at the
-  luminance of the clamped value (~1.5x diffuse white on this camera),
-  with a 2% soft ramp under the clip. Rejected: desaturating by the
+  channel, and once a second channel clips the pixel desaturates
+  toward a neutral at its own luminance (weight = the second-largest
+  clip factor, so the transition is continuous); fully clipped pixels
+  are neutral at ~1.5x diffuse white on this camera. 2% soft ramp
+  under the clip. Rejected: desaturating by the
   fraction of clipped channels; green clips first on this sensor and
   that left near-white walls pink.
 - **Tone curve: sigmoid** in linear light, grey-anchored (0.18→0.18),
@@ -223,6 +225,31 @@ CPU output transform (orientation, primaries, transfer) → encoder.
 - **Sidecars** `<raw>.idev.toml` = `DevelopParams`; CLI flags
   override; `--save-params` writes back. **Batch**: many inputs, one
   GPU, one output directory, skip-existing.
+
+## Milestone 2 results (2026-09-10)
+
+Everything in the arc landed; the CLI is usable for real batches.
+
+- Tone: the sigmoid default (contrast 1.6, per-channel) puts the
+  calibration-board frame visually on top of the camera JPEG; the
+  high-ISO cat frame is close but a touch flatter in the shadows.
+  `skew` was dropped from the design: separate toe/shoulder exponents
+  put a slope kink at grey. A finite white point (input that maps to
+  peak, instead of the asymptote) is the likely next tone control.
+- Highlights: the first "desaturate by fraction clipped" rule left
+  green-clipped walls pink; the lift-to-brightest-channel rule with
+  desaturation by the second-largest clip factor is continuous and
+  neutral. Fully clipped regions land at ~0.95 after the SDR sigmoid,
+  faintly textured by the lift; a white-point control would finish
+  them off.
+- Orientation: rawler reports Normal for Sony portrait files; the
+  EXIF tag is authoritative.
+- RCD costs nothing measurable: the whole develop is ~115 ms at 26 MP
+  including readback, so the GPU is not the bottleneck. Encoders are:
+  JPEG q92 1 s, 8-bit PNG 3 s, 16-bit PQ PNG far longer (zlib on
+  noisy 16-bit data; not tuned). EXR 0.7 s.
+- Sidecars work as `<raw>.idev.toml`; `--save-params` writes the
+  resolved parameters, later runs pick them up, flags override.
 
 ## Milestones
 

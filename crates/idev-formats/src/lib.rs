@@ -57,3 +57,47 @@ pub fn write_pgm16(path: &Path, width: u32, height: u32, data: &[u16]) -> Result
     out.write_all(&bytes)?;
     Ok(())
 }
+
+/// Write 16-bit RGB tagged as BT.2020 primaries with the PQ transfer
+/// (`cICP` 9/16/0/full-range), the HDR PNG browsers and achromat read.
+pub fn write_png_bt2020_pq16(path: &Path, width: u32, height: u32, rgb: &[u16]) -> Result<()> {
+    ensure!(
+        rgb.len() == (width * height * 3) as usize,
+        "png: pixel buffer size mismatch"
+    );
+    let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Sixteen);
+    let mut writer = enc.write_header().context("png header")?;
+    // Colour primaries BT.2020, transfer ST 2084, matrix identity, full range.
+    writer
+        .write_chunk(png::chunk::cICP, &[9, 16, 0, 1])
+        .context("png cICP")?;
+    let mut bytes = Vec::with_capacity(rgb.len() * 2);
+    for v in rgb {
+        bytes.extend_from_slice(&v.to_be_bytes());
+    }
+    writer.write_image_data(&bytes).context("png data")?;
+    Ok(())
+}
+
+/// Write 8-bit sRGB RGB as baseline JPEG.
+pub fn write_jpeg_srgb8(
+    path: &Path,
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+    quality: u8,
+) -> Result<()> {
+    ensure!(
+        rgb.len() == (width * height * 3) as usize,
+        "jpeg: pixel buffer size mismatch"
+    );
+    let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut enc =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(std::io::BufWriter::new(file), quality);
+    enc.encode(rgb, width, height, image::ExtendedColorType::Rgb8)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}

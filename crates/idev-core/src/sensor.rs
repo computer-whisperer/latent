@@ -186,6 +186,12 @@ pub fn unpack(path: &Path) -> Result<SensorFrame> {
     }
 
     let exif = &meta.exif;
+    // rawler's own orientation is Normal for Sony files whose EXIF says
+    // otherwise; the EXIF tag is authoritative when present.
+    let orientation = match exif.orientation {
+        Some(o @ 1..=8) => Orientation::from_u16(o),
+        _ => raw.orientation,
+    };
     let summary = ExifSummary {
         make: raw.clean_make.clone(),
         model: raw.clean_model.clone(),
@@ -206,7 +212,7 @@ pub fn unpack(path: &Path) -> Result<SensorFrame> {
         crop,
         wb_as_shot,
         matrices,
-        orientation: raw.orientation,
+        orientation,
         exif: summary,
         data,
     })

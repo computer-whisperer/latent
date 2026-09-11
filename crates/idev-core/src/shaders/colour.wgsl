@@ -44,19 +44,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         // Blend reconstruction. A channel at its clip level is a lower
         // bound on the truth; lift it to at least the brightest channel
-        // that is still valid. A pixel with every channel clipped has no
-        // colour information left: it becomes a neutral at the luminance
-        // of the per-channel-clamped value (above diffuse white, so the
-        // tone curve still has something to roll off).
+        // of the pixel. Once a second channel clips the colour is
+        // unknowable, so the pixel desaturates toward a neutral at its
+        // own luminance, driven by the second-most-clipped channel so the
+        // transition is continuous. Fully clipped pixels end up neutral at
+        // the highest clip level (red's, ~1.5 stops over diffuse white on
+        // a typical daylight balance), which the tone curve rolls off.
         let c = u.clip.xyz;
         let clamped = min(v, c);
         let f = smoothstep(c * 0.98, c, v);
-        let valid = clamped * (1.0 - f);
-        let m = max(valid.x, max(valid.y, valid.z));
+        let m = max(clamped.x, max(clamped.y, clamped.z));
         let lifted = mix(clamped, max(clamped, vec3<f32>(m)), f);
-        let all_clipped = min(f.x, min(f.y, f.z));
-        let y = dot(u.ylum_cam.xyz, clamped);
-        v = mix(lifted, vec3<f32>(y), all_clipped);
+        let f_max = max(f.x, max(f.y, f.z));
+        let f_min = min(f.x, min(f.y, f.z));
+        let f_mid = f.x + f.y + f.z - f_max - f_min;
+        let y = dot(u.ylum_cam.xyz, lifted);
+        v = mix(lifted, vec3<f32>(y), f_mid);
     }
 
     var w = vec3<f32>(dot(u.m0.xyz, v), dot(u.m1.xyz, v), dot(u.m2.xyz, v)) * u.tone.x;

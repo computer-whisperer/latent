@@ -676,6 +676,7 @@ dependencies = [
  "pollster",
  "rawler",
  "serde",
+ "toml 1.1.6+spec-1.1.0",
  "tracing",
  "wgpu",
 ]
@@ -687,6 +688,7 @@ dependencies = [
  "anyhow",
  "exr",
  "half",
+ "image",
  "png",
 ]
 
