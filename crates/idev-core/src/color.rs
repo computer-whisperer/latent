@@ -61,6 +61,67 @@ pub fn invert(m: &Mat3) -> Option<Mat3> {
     ])
 }
 
+/// A display's colour gamut, by its primaries (all D65).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gamut {
+    Srgb,
+    DisplayP3,
+    Bt2020,
+    AdobeRgb,
+}
+
+/// CIE 1931 xy chromaticities of (red, green, blue, white).
+type Chromaticities = [[f32; 2]; 4];
+
+const D65_XY: [f32; 2] = [0.3127, 0.3290];
+
+impl Gamut {
+    pub fn label(self) -> &'static str {
+        match self {
+            Gamut::Srgb => "sRGB",
+            Gamut::DisplayP3 => "P3",
+            Gamut::Bt2020 => "BT.2020",
+            Gamut::AdobeRgb => "Adobe RGB",
+        }
+    }
+
+    fn chromaticities(self) -> Chromaticities {
+        match self {
+            Gamut::Srgb => [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06], D65_XY],
+            Gamut::DisplayP3 => [[0.680, 0.320], [0.265, 0.690], [0.150, 0.060], D65_XY],
+            Gamut::Bt2020 => [[0.708, 0.292], [0.170, 0.797], [0.131, 0.046], D65_XY],
+            Gamut::AdobeRgb => [[0.64, 0.33], [0.21, 0.71], [0.15, 0.06], D65_XY],
+        }
+    }
+
+    /// Linear RGB in this gamut → CIE XYZ.
+    pub fn xyz_from(self) -> Mat3 {
+        xyz_from_chromaticities(self.chromaticities())
+    }
+
+    /// Linear BT.2020 → linear RGB in this gamut (negative or above-one
+    /// components mean the colour is outside it).
+    pub fn from_bt2020(self) -> Mat3 {
+        let from_xyz = invert(&self.xyz_from()).expect("gamut matrix is invertible");
+        mul(&from_xyz, &XYZ_FROM_BT2020)
+    }
+}
+
+/// RGB → XYZ for primaries and white given as xy, white scaled to Y = 1.
+fn xyz_from_chromaticities(c: Chromaticities) -> Mat3 {
+    let xyz = |[x, y]: [f32; 2]| [x / y, 1.0, (1.0 - x - y) / y];
+    let [r, g, b] = [xyz(c[0]), xyz(c[1]), xyz(c[2])];
+    let w = xyz(c[3]);
+    // Columns are the primaries' XYZ, scaled so their sum is the white.
+    let p: Mat3 = [[r[0], g[0], b[0]], [r[1], g[1], b[1]], [r[2], g[2], b[2]]];
+    let scale = apply(&invert(&p).expect("primaries are independent"), w);
+    [
+        [r[0] * scale[0], g[0] * scale[1], b[0] * scale[2]],
+        [r[1] * scale[0], g[1] * scale[1], b[1] * scale[2]],
+        [r[2] * scale[0], g[2] * scale[1], b[2] * scale[2]],
+    ]
+}
+
 /// Linear BT.2020 → linear sRGB primaries (values may go negative or
 /// exceed 1; that is the scRGB convention).
 pub fn srgb_from_bt2020() -> Mat3 {
@@ -80,6 +141,26 @@ pub fn srgb_oetf(v: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chromaticities_reproduce_the_constants() {
+        for (gamut, want) in [
+            (Gamut::Srgb, XYZ_FROM_SRGB),
+            (Gamut::Bt2020, XYZ_FROM_BT2020),
+        ] {
+            let got = gamut.xyz_from();
+            for i in 0..3 {
+                for j in 0..3 {
+                    assert!(
+                        (got[i][j] - want[i][j]).abs() < 2e-4,
+                        "{gamut:?}[{i}][{j}] = {} vs {}",
+                        got[i][j],
+                        want[i][j]
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn inverse_roundtrips() {

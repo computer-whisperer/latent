@@ -19,7 +19,7 @@ use bytemuck::{Pod, Zeroable};
 use half::f16;
 
 use crate::WorkingImage;
-use crate::color::{Mat3, XYZ_FROM_BT2020, srgb_from_bt2020};
+use crate::color::{Gamut, Mat3, XYZ_FROM_BT2020, srgb_from_bt2020};
 use crate::params::{
     DEFAULT_WHITE, Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sigmoid_constants,
 };
@@ -200,6 +200,12 @@ struct ColourUniforms {
     ca_r: [[f32; 4]; 4],
     ca_b: [[f32; 4]; 4],
     vig: [[f32; 4]; 4],
+    /// warning overlay enabled, pad
+    warn: [u32; 4],
+    /// working space → the panel's gamut, for the overlay
+    g0: [f32; 4],
+    g1: [f32; 4],
+    g2: [f32; 4],
 }
 
 /// Spread a correction table over the uniform's 16 slots, repeating
@@ -220,6 +226,18 @@ pub enum DisplayPrimaries {
     Bt2020,
     /// Linear sRGB primaries, scRGB convention (damascene's working space).
     Srgb,
+}
+
+/// How the colour pass renders: for what output, at what downscale,
+/// in which primaries, and whether to mark what the panel cannot show.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Render {
+    pub target: OutputTarget,
+    pub scale: u32,
+    pub display: DisplayPrimaries,
+    /// Zebra-mark pixels at the target peak (red) and outside this
+    /// gamut (cyan). A preview aid; never for exports.
+    pub warn: Option<Gamut>,
 }
 
 /// The expensive, parameter-stable half of a develop: the linearized
@@ -653,20 +671,23 @@ impl Developer {
     }
 
     /// Run the colour pass into `out` (an `Rgba16Float` storage texture
-    /// of [`Self::scaled_size`]) and submit it.
-    #[allow(clippy::too_many_arguments)]
+    /// of [`Self::scaled_size`] for `render.scale`) and submit it.
     pub fn colour(
         &self,
         gpu: &Gpu,
         prepared: &Prepared,
         params: &DevelopParams,
-        target: OutputTarget,
-        scale: u32,
-        display: DisplayPrimaries,
+        render: Render,
         out: &wgpu::TextureView,
     ) {
         let device = &gpu.device;
         let queue = &gpu.queue;
+        let Render {
+            target,
+            scale,
+            display,
+            warn,
+        } = render;
         let (out_w, out_h) = Self::scaled_size(prepared, scale);
         let gain = 2f32.powf(params.exposure_ev);
         let (tone_mode, contrast, hue_preservation, white) = match params.tone {
@@ -689,6 +710,11 @@ impl Developer {
         };
         let row = |r: [f32; 3]| [r[0], r[1], r[2], 0.0];
         let m = &prepared.to_working;
+        let g: Mat3 = warn.map(Gamut::from_bt2020).unwrap_or([
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]);
         let (cx, cy) = (prepared.width as f32 * 0.5, prepared.height as f32 * 0.5);
         let rf = 1.0 / (cx * cx + cy * cy).sqrt();
         let (lens_flags, knots, dist, ca_r, ca_b, vig) = match &prepared.lens {
@@ -748,6 +774,10 @@ impl Developer {
                 ca_r,
                 ca_b,
                 vig,
+                warn: [warn.is_some() as u32, 0, 0, 0],
+                g0: row(g[0]),
+                g1: row(g[1]),
+                g2: row(g[2]),
             },
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -868,9 +898,12 @@ impl Developer {
             gpu,
             prepared,
             params,
-            target,
-            scale,
-            DisplayPrimaries::Bt2020,
+            Render {
+                target,
+                scale,
+                display: DisplayPrimaries::Bt2020,
+                warn: None,
+            },
             &working.view,
         );
         let rgba = read_back_rgba16f(gpu, &working.texture, out_w, out_h)?;

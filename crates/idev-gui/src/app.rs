@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use damascene_core::color::Primaries;
 use damascene_core::prelude::*;
 use damascene_core::scroll::{self, ScrollAlignment, ScrollRequest};
 use damascene_core::surface::{AppTexture, SurfaceAlpha};
@@ -27,8 +28,9 @@ use damascene_core::widgets::number_scrubber::{self, ScrubDrag, ScrubberOpts};
 use damascene_core::widgets::{switch, tabs};
 use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent, UiEventKind};
 use damascene_winit_wgpu::{Wakeup, WinitWgpuApp};
+use idev_core::color::Gamut;
 use idev_core::gpu::{
-    Developer, DisplayPrimaries, Gpu, Histogram, HistogramReadback, OutputTarget, Prepared,
+    Developer, DisplayPrimaries, Gpu, Histogram, HistogramReadback, OutputTarget, Prepared, Render,
 };
 use idev_core::params::{
     DEFAULT_WHITE, Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sidecar_path,
@@ -143,7 +145,7 @@ struct GpuState {
     prepared: Option<Prepared>,
     preview: Option<Preview>,
     /// What the preview texture currently shows.
-    rendered: Option<(DevelopParams, f32, u32)>,
+    rendered: Option<(DevelopParams, Render)>,
     /// Histogram of the preview, in flight.
     histogram_pending: Option<HistogramReadback>,
 }
@@ -331,12 +333,17 @@ pub struct IdevApp {
     export_rx: Vec<Receiver<Result<PathBuf>>>,
     exports_running: usize,
     sdr_preview: bool,
+    /// Zebra overlay over pixels the panel cannot show.
+    warn: bool,
 
     // Read during build (immutable), consumed in before_paint.
     last_zoom: Cell<f32>,
     scale_factor: Cell<f32>,
     display_peak: Cell<f32>,
     hdr_output: Cell<bool>,
+    /// The panel's gamut as the compositor reports it (sRGB when
+    /// nothing is reported).
+    panel_gamut: Cell<Gamut>,
 
     // Control scratch state.
     exposure: Scrub,
@@ -405,10 +412,12 @@ impl IdevApp {
             export_rx: Vec::new(),
             exports_running: 0,
             sdr_preview: false,
+            warn: false,
             last_zoom: Cell::new(0.1),
             scale_factor: Cell::new(1.0),
             display_peak: Cell::new(1.0),
             hdr_output: Cell::new(false),
+            panel_gamut: Cell::new(Gamut::Srgb),
             exposure: Scrub::default(),
             contrast: Scrub::default(),
             hue: Scrub::default(),
@@ -738,8 +747,9 @@ impl IdevApp {
     // ----- build ---------------------------------------------------------
 
     fn color_mode_badge(&self) -> El {
+        let gamut = self.panel_gamut.get().label();
         if self.hdr_output.get() {
-            let b = badge(format!("HDR · {:.1}x", self.display_peak.get()));
+            let b = badge(format!("HDR · {:.1}x · {gamut}", self.display_peak.get()));
             if self.sdr_preview {
                 b.muted().tooltip("SDR preview (t)")
             } else {
@@ -747,9 +757,16 @@ impl IdevApp {
                     .tooltip("tone curve targets the panel headroom; t for SDR preview")
             }
         } else {
-            badge("SDR")
+            badge(format!("SDR · {gamut}"))
         }
         .key("color-mode")
+    }
+
+    fn warn_button(&self) -> El {
+        let b = button("Warn").key("warn").tooltip(
+            "zebra pixels at the output peak (red) or outside the panel's gamut (cyan); w",
+        );
+        if self.warn { b } else { b.ghost() }
     }
 
     fn grid(&self, cx: &BuildCx) -> El {
@@ -1127,6 +1144,7 @@ impl IdevApp {
                 text(readout).muted().tabular_numerals(),
                 button("Fit").key("fit").ghost(),
                 button("1:1").key("one").ghost(),
+                self.warn_button(),
                 self.color_mode_badge(),
             ])
             .gap(tokens::SPACE_3)
@@ -1151,6 +1169,11 @@ impl IdevApp {
                 key: "canvas".into(),
                 behavior: ViewportBehavior::Smooth,
             });
+            return;
+        }
+        if event.is_click_or_activate("warn") || event.is_hotkey("warn") {
+            self.warn = !self.warn;
+            wake(&self.wakeup);
             return;
         }
         if event.is_click_or_activate("export-jpg") || event.is_hotkey("export-jpg") {
@@ -1365,22 +1388,28 @@ impl App for IdevApp {
             self.scale_factor.set(diag.scale_factor.max(0.1));
             let hdr = diag.hdr_active();
             self.hdr_output.set(hdr);
-            let peak = if hdr {
-                match &diag.color_management {
-                    damascene_core::color::ColorManagementStatus::Available { targets, .. } => {
-                        let max = targets
-                            .target_max_luminance_nits
-                            .or(targets.max_luminance_nits)
-                            .unwrap_or(1000.0);
-                        let reference = targets.reference_luminance_nits.unwrap_or(203.0);
-                        (max / reference).max(1.0)
-                    }
-                    _ => 1.0,
+            let mut peak = 1.0;
+            let mut gamut = Gamut::Srgb;
+            if let damascene_core::color::ColorManagementStatus::Available { targets, .. } =
+                &diag.color_management
+            {
+                if hdr {
+                    let max = targets
+                        .target_max_luminance_nits
+                        .or(targets.max_luminance_nits)
+                        .unwrap_or(1000.0);
+                    let reference = targets.reference_luminance_nits.unwrap_or(203.0);
+                    peak = (max / reference).max(1.0);
                 }
-            } else {
-                1.0
-            };
+                gamut = match targets.preferred_primaries {
+                    Some(Primaries::DisplayP3) => Gamut::DisplayP3,
+                    Some(Primaries::Bt2020) => Gamut::Bt2020,
+                    Some(Primaries::AdobeRgb) => Gamut::AdobeRgb,
+                    Some(Primaries::Srgb) | None => Gamut::Srgb,
+                };
+            }
             self.display_peak.set(peak);
+            self.panel_gamut.set(gamut);
         }
         match (self.mode, &self.session) {
             (Mode::Develop, Some(s)) => self.develop(cx, s),
@@ -1411,6 +1440,7 @@ impl App for IdevApp {
                 (KeyChord::vim('f'), "fit".into()),
                 (KeyChord::vim('1'), "one".into()),
                 (KeyChord::vim('e'), "export-jpg".into()),
+                (KeyChord::vim('w'), "warn".into()),
             ]),
         }
         keys
@@ -1484,8 +1514,13 @@ impl WinitWgpuApp for IdevApp {
             return;
         };
         let params = s.params.clone();
-        let peak = self.peak();
-        let scale = self.wanted_scale();
+        let render = Render {
+            target: OutputTarget { peak: self.peak() },
+            scale: self.wanted_scale(),
+            display: DisplayPrimaries::Srgb,
+            warn: self.warn.then(|| self.panel_gamut.get()),
+        };
+        let scale = render.scale;
         let Some(g) = self.gpu.as_mut() else { return };
 
         if g.prepared.as_ref().is_none_or(|p| !p.matches(&params)) {
@@ -1532,23 +1567,21 @@ impl WinitWgpuApp for IdevApp {
         }
         let preview = g.preview.as_ref().expect("preview above");
 
-        let want = (params, peak, scale);
+        let want = (params, render);
         if g.rendered.as_ref() != Some(&want) {
-            g.dev.colour(
-                &g.gpu,
-                prepared,
-                &want.0,
-                OutputTarget { peak },
-                scale,
-                DisplayPrimaries::Srgb,
-                &preview.view,
-            );
+            g.dev
+                .colour(&g.gpu, prepared, &want.0, render, &preview.view);
             g.rendered = Some(want);
             // One histogram in flight at a time; a newer render just
-            // waits for the next frame.
-            if g.histogram_pending.is_none() {
+            // waits for the next frame. The zebra overlay would pollute
+            // it, so the last clean histogram stays while warning.
+            if g.histogram_pending.is_none() && render.warn.is_none() {
                 let (w, h) = Developer::scaled_size(prepared, scale);
-                g.histogram_pending = Some(g.dev.histogram(&g.gpu, &preview.view, w, h, peak));
+                g.histogram_pending =
+                    Some(
+                        g.dev
+                            .histogram(&g.gpu, &preview.view, w, h, render.target.peak),
+                    );
             }
         }
         if let Some(pending) = g.histogram_pending.as_mut()

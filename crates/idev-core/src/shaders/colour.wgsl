@@ -42,6 +42,12 @@ struct Uniforms {
     ca_r: array<vec4<f32>, 4>,
     ca_b: array<vec4<f32>, 4>,
     vig: array<vec4<f32>, 4>,
+    // warning overlay enabled, pad
+    warn: vec4<u32>,
+    // working space -> the panel's gamut
+    g0: vec4<f32>,
+    g1: vec4<f32>,
+    g2: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -186,6 +192,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let y = max(dot(Y2020, w), 1e-6);
         let by_luminance = min(w * (sigmoid(y, contrast, peak) / y), vec3<f32>(peak));
         w = mix(per_channel, by_luminance, u.tone.w);
+    }
+
+    if u.warn.x == 1u {
+        // Zebra over what the panel cannot show: red where a channel
+        // sits at the output peak, cyan where the colour leaves the
+        // panel's gamut. Markers at diffuse-white brightness.
+        let peak = u.tone.z;
+        let g = vec3<f32>(dot(u.g0.xyz, w), dot(u.g1.xyz, w), dot(u.g2.xyz, w));
+        let clipped = any(w >= vec3<f32>(peak * 0.995));
+        let outside = any(g < vec3<f32>(-0.002 * peak)) || any(g > vec3<f32>(peak * 1.005));
+        let stripe = ((gid.x + gid.y) / 6u) % 2u == 0u;
+        if stripe && clipped {
+            w = vec3<f32>(0.9, 0.04, 0.04);
+        } else if stripe && outside {
+            w = vec3<f32>(0.04, 0.7, 0.9);
+        }
     }
 
     let d = vec3<f32>(dot(u.d0.xyz, w), dot(u.d1.xyz, w), dot(u.d2.xyz, w));

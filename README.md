@@ -35,8 +35,9 @@ highlights and demosaic, switches for the lens corrections, export
 buttons; the sidecar is written
 (debounced) on every change. Keys: arrows or `hjkl` move (left/right
 also step files in the develop view), Enter open, Esc back to the grid,
-`o` open another folder, `f` fit, `1` 1:1, `t` SDR preview, `e` export
-JPEG.
+`o` open another folder, `f` fit, `1` 1:1, `t` SDR preview, `w` zebra
+warning for pixels at the panel's peak (red) or outside its gamut
+(cyan), `e` export JPEG.
 
 Crates:
 

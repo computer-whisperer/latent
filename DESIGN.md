@@ -462,6 +462,26 @@ soft-proof questions go back to the user.
 - `--format avif` (with `--hdr` for PQ) on the CLI; "AVIF" and "HDR
   AVIF" buttons in the GUI export group (not exercised).
 
+## Warning overlay results (2026-09-11)
+
+- `Render { target, scale, display, warn: Option<Gamut> }` replaces
+  the colour pass's loose arguments. With `warn`, the shader zebra-
+  marks (6 px diagonal stripes) pixels with a channel at the output
+  peak in red and pixels outside the panel's gamut in cyan, after the
+  tone curve and before the display matrix. `color::Gamut` derives
+  the BT.2020 → panel matrix from chromaticities (sRGB, Display P3,
+  BT.2020, Adobe RGB; a test checks the derivation against the
+  constants).
+- The panel's gamut comes from the compositor's preferred primaries
+  in damascene's colour-management diagnostics, sRGB when nothing is
+  reported; the badge shows it ("HDR · 2.0x · BT.2020"). prism
+  advertises BT.2020 on the HDR output, so the gamut half is vacuous
+  there and the peak half is what fires. `w` or the Warn button
+  toggles it; the histogram keeps its last clean reading while the
+  overlay is on.
+- Verified by screenshot with a sidecar at white 2.0: the clipped
+  window and sill show the red zebra; the rest is untouched.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700
