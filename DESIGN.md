@@ -161,6 +161,28 @@ decode stack. But `<name>-core` exposes `develop_default(path) ->
 achromat::DecodedImage` so achromat (feature-gated) or the gallery can
 later open raws with a sensible default rendering.
 
+## Milestone 1 results (2026-09-10)
+
+Pipeline proof done: rawler unpack → headless wgpu (linearize + WB +
+highlight clamp → bilinear demosaic + camera→BT.2020 matrix) → EXR/PNG.
+
+- rawler's Bayer plane vs libraw's `unprocessed_raw` on DSC00039.ARW:
+  same 6272x4168 raster, max abs difference 8 on a 16k scale, typical
+  difference 1 (ARW2 curve rounding). Decode is trustworthy.
+- rawler's a6700 profile: black 512, white 15360; decoded values reach
+  16634. libraw reaches 16628. Sites above the white level clamp to 1.0
+  after WB, so the profile's white only matters for the clamp threshold.
+  Revisit when doing highlight reconstruction.
+- Release timings on one 26 MP frame: unpack 75 ms, GPU init 45 ms,
+  develop 115 ms (both passes plus readback), EXR encode 0.6 s, PNG
+  encode 3 s (default zlib level; not tuned).
+- Without the highlight clamp, clipped neutrals rendered magenta (WB
+  gains 2.89 R / 1.40 B on clipped sites). The clamp is the dcraw
+  "clip" behaviour; real reconstruction is milestone 2.
+- Against the camera JPEG the render is darker and cooler: no tone
+  curve yet, and the D65 matrix is used unadapted regardless of the
+  shot's white point. Both are milestone 2 items.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

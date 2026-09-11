@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+authors = ["Christian Balcom"]
+
+[workspace.dependencies]
+anyhow = "1"
+bytemuck = { version = "1.21", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
+exr = "1.74"
+half = { version = "2.6", features = ["bytemuck"] }
+png = "0.18"
+pollster = "0.4"
+rawler = "0.8"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wgpu = "30"
+
+# Our own pixel loops and the codecs are hot even in dev runs; keep the
+# CLI/GUI crates unoptimised for debugging.
+[profile.dev.package.idev-core]
+opt-level = 2
+[profile.dev.package.idev-formats]
+opt-level = 2
+[profile.dev.package.rawler]
+opt-level = 3
+[profile.dev.package.exr]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.half]
+opt-level = 3
