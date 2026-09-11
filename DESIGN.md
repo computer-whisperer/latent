@@ -183,6 +183,44 @@ highlight clamp → bilinear demosaic + camera→BT.2020 matrix) → EXR/PNG.
   curve yet, and the D65 matrix is used unadapted regardless of the
   shot's white point. Both are milestone 2 items.
 
+## Milestone 2 arc (started 2026-09-10)
+
+Pipeline after this arc: linearize (no clamp) → demosaic (RCD, bilinear
+kept as the fast path) → colour pass (highlight reconstruction, camera
+matrix with Bradford adaptation, exposure, tone curve) → readback →
+CPU output transform (orientation, primaries, transfer) → encoder.
+
+- **White point.** As-shot WB multipliers give the camera neutral;
+  its XYZ comes from the inverse colour matrix, CCT from McCamy, the
+  matrix is interpolated between the profile's illuminants by inverse
+  CCT (DNG method, 3 iterations). The camera→working matrix is
+  `XYZ→BT.2020 · Bradford(white→D65) · inv(CM) · diag(neutral)`,
+  applied after WB, so neutrals hit working white exactly and
+  everything else is Bradford-adapted rather than sensor-space
+  von Kries. `WhiteBalance::Temperature { kelvin, tint }` maps through
+  the daylight/Planckian locus to a white and back to multipliers.
+- **Demosaic: RCD**, reimplemented from the published algorithm
+  (directional discrimination from squared second differences on
+  same-colour samples, ratio-corrected green from a 3x3 low-pass,
+  colour-difference R/B). Three GPU passes: VH+LPF, green, RB.
+- **Highlights: LCh blend**, per pixel after demosaic. Each channel
+  clamps at its own post-WB clip level, then the pixel blends toward
+  a neutral of its own luminance by the fraction of clipped channels,
+  with a 2% soft ramp under the clip. Clipped neutrals come out white
+  at ~1.5x diffuse white, giving the tone curve real headroom.
+- **Tone curve: sigmoid** in linear light, grey-anchored (0.18→0.18),
+  `contrast` sets the slope at grey, `skew` splits toe/shoulder
+  exponents, `peak` (relative to display white) comes from the output
+  target: 1.0 for SDR, master_nits/203 for PQ. Per-channel by default
+  with a `hue_preservation` blend toward the luminance-ratio result.
+  `ToneCurve::None` keeps the image scene-referred (EXR master).
+- **Formats.** JPEG (sRGB, quality param), PQ PNG (16-bit, BT.2020
+  primaries, PQ, `cICP` chunk, 203 nits = diffuse white), EXR and
+  sRGB PNG as before. Orientation applied on the CPU before encode.
+- **Sidecars** `<raw>.idev.toml` = `DevelopParams`; CLI flags
+  override; `--save-params` writes back. **Batch**: many inputs, one
+  GPU, one output directory, skip-existing.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

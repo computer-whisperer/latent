@@ -14,6 +14,9 @@ pub enum WhiteBalance {
     AsShot,
     /// Explicit RGB multipliers, green normalised to 1.
     Multipliers { red: f32, blue: f32 },
+    /// A scene white on the daylight/Planckian locus, offset by tint
+    /// (Duv x 1000, positive toward magenta).
+    Temperature { kelvin: f32, tint: f32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

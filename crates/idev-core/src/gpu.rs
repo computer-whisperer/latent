@@ -6,9 +6,10 @@ use bytemuck::{Pod, Zeroable};
 use half::f16;
 
 use crate::WorkingImage;
-use crate::color::{Mat3, bt2020_from_camera};
+use crate::color::Mat3;
 use crate::params::{DevelopParams, WhiteBalance};
 use crate::sensor::SensorFrame;
+use crate::whitepoint::{self, Temperature, xy_from_temperature};
 
 /// A device and queue the pipeline runs on.
 pub struct Gpu {
@@ -151,10 +152,22 @@ impl Developer {
         let queue = &gpu.queue;
 
         // --- CPU-side parameter resolution ---
-        let wb = match params.white_balance {
-            WhiteBalance::AsShot => frame.wb_as_shot,
-            WhiteBalance::Multipliers { red, blue } => [red, 1.0, blue],
-        };
+        let white = match params.white_balance {
+            WhiteBalance::AsShot => whitepoint::white_from_neutral(
+                &frame.matrices,
+                [1.0 / frame.wb_as_shot[0], 1.0, 1.0 / frame.wb_as_shot[2]],
+            ),
+            WhiteBalance::Multipliers { red, blue } => {
+                whitepoint::white_from_neutral(&frame.matrices, [1.0 / red, 1.0, 1.0 / blue])
+            }
+            WhiteBalance::Temperature { kelvin, tint } => whitepoint::white_from_xy(
+                &frame.matrices,
+                xy_from_temperature(Temperature { kelvin, tint }),
+            ),
+        }
+        .context("white balance does not resolve to a valid white")?;
+        let wb = white.multipliers();
+        tracing::debug!(?wb, temperature = ?white.temperature, "white balance");
         let mut black = [0.0f32; 4];
         let mut scale = [0.0f32; 4];
         for pos in 0..4 {
@@ -169,9 +182,9 @@ impl Developer {
             black[pos] = frame.black[pos];
             scale[pos] = wb[frame.cfa[pos] as usize] / range;
         }
-        let matrix = frame.matrix_d65().context("frame has no color matrix")?;
-        let to_working: Mat3 =
-            bt2020_from_camera(&matrix.xyz_to_cam).context("camera matrix is singular")?;
+        let to_working: Mat3 = white
+            .bt2020_from_camera_wb()
+            .context("camera matrix is singular")?;
         let gain = 2f32.powf(params.exposure_ev);
         let row = |r: [f32; 3]| [r[0] * gain, r[1] * gain, r[2] * gain, 0.0];
 

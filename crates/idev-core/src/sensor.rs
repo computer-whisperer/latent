@@ -75,12 +75,9 @@ impl SensorFrame {
         self.cfa[((y & 1) * 2 + (x & 1)) as usize]
     }
 
-    /// The D65 matrix if the profile has one, else the first available.
-    pub fn matrix_d65(&self) -> Option<&ColorMatrix> {
-        self.matrices
-            .iter()
-            .find(|m| m.illuminant == Illuminant::D65)
-            .or_else(|| self.matrices.first())
+    /// Camera-space neutral implied by the as-shot multipliers.
+    pub fn neutral_as_shot(&self) -> [f32; 3] {
+        [1.0 / self.wb_as_shot[0], 1.0, 1.0 / self.wb_as_shot[2]]
     }
 }
 

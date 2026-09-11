@@ -17,6 +17,7 @@ pub mod gpu;
 pub mod output;
 pub mod params;
 pub mod sensor;
+pub mod whitepoint;
 
 /// A developed frame in the working space: linear BT.2020, D65, RGBA
 /// f16, 1.0 = scene diffuse white, row-major, top-left origin.

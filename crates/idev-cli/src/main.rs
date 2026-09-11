@@ -29,6 +29,9 @@ enum Cmd {
         /// White balance multipliers "R,B" (green = 1); default as-shot.
         #[arg(long)]
         wb: Option<String>,
+        /// White balance as "kelvin" or "kelvin,tint".
+        #[arg(long)]
+        temp: Option<String>,
     },
     /// Dump the raw sensor plane as 16-bit PGM (for decoder cross-checks).
     DumpBayer {
@@ -51,7 +54,8 @@ fn main() -> Result<()> {
             out,
             exposure,
             wb,
-        } => develop(&file, &out, exposure, wb.as_deref()),
+            temp,
+        } => develop(&file, &out, exposure, wb.as_deref(), temp.as_deref()),
         Cmd::DumpBayer { file, out } => {
             let frame = sensor::unpack(&file)?;
             idev_formats::write_pgm16(&out, frame.width, frame.height, &frame.data)
@@ -100,6 +104,12 @@ fn inspect(file: &std::path::Path) -> Result<()> {
     println!("black        {:?}", f.black);
     println!("white        {:?}", f.white);
     println!("wb as shot   {:?}", f.wb_as_shot);
+    if let Some(w) = idev_core::whitepoint::white_from_neutral(&f.matrices, f.neutral_as_shot()) {
+        println!(
+            "white        {:.0} K  tint {:+.1}  xy ({:.4}, {:.4})",
+            w.temperature.kelvin, w.temperature.tint, w.xy.x, w.xy.y
+        );
+    }
     println!("orientation  {:?}", f.orientation);
     for m in &f.matrices {
         println!("xyz_to_cam   {:?}", m.illuminant);
@@ -123,6 +133,7 @@ fn develop(
     out: &std::path::Path,
     exposure: f32,
     wb: Option<&str>,
+    temp: Option<&str>,
 ) -> Result<()> {
     let mut params = DevelopParams {
         exposure_ev: exposure,
@@ -140,6 +151,24 @@ fn develop(
         params.white_balance = WhiteBalance::Multipliers {
             red: parts[0],
             blue: parts[1],
+        };
+    }
+    if let Some(s) = temp {
+        let parts: Vec<f32> = s
+            .split(',')
+            .map(|p| p.trim().parse::<f32>())
+            .collect::<Result<_, _>>()
+            .context("parse --temp")?;
+        params.white_balance = match parts.as_slice() {
+            [k] => WhiteBalance::Temperature {
+                kelvin: *k,
+                tint: 0.0,
+            },
+            [k, t] => WhiteBalance::Temperature {
+                kelvin: *k,
+                tint: *t,
+            },
+            _ => bail!("--temp expects \"K\" or \"K,tint\""),
         };
     }
 

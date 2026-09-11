@@ -61,29 +61,6 @@ pub fn invert(m: &Mat3) -> Option<Mat3> {
     ])
 }
 
-/// Camera RGB (white-balanced so that a neutral is `(1, 1, 1)`) → linear
-/// BT.2020, from a DNG-style XYZ→camera matrix.
-///
-/// The dcraw construction: express the camera response to BT.2020
-/// primaries, normalise each row so BT.2020 white maps to camera
-/// `(1, 1, 1)`, and invert. White balance is then applied to the raw
-/// values before this matrix, and neutrals stay neutral by construction.
-/// No chromatic adaptation between illuminants yet; the matrix is used
-/// as given (D65 preferred by the caller).
-pub fn bt2020_from_camera(xyz_to_cam: &Mat3) -> Option<Mat3> {
-    let mut cam_from_2020 = mul(xyz_to_cam, &XYZ_FROM_BT2020);
-    for row in cam_from_2020.iter_mut() {
-        let sum: f32 = row.iter().sum();
-        if sum.abs() < 1e-9 {
-            return None;
-        }
-        for v in row.iter_mut() {
-            *v /= sum;
-        }
-    }
-    invert(&cam_from_2020)
-}
-
 /// Linear BT.2020 → linear sRGB primaries (values may go negative or
 /// exceed 1; that is the scRGB convention).
 pub fn srgb_from_bt2020() -> Mat3 {
@@ -114,21 +91,6 @@ mod tests {
                 let want = if i == j { 1.0 } else { 0.0 };
                 assert!((v - want).abs() < 1e-5, "id[{i}][{j}] = {v}");
             }
-        }
-    }
-
-    #[test]
-    fn camera_white_maps_to_working_white() {
-        // The a6700 D65 matrix from rawler's profile.
-        let m = [
-            [0.6972, -0.2408, -0.06],
-            [-0.433, 1.2101, 0.2515],
-            [-0.0388, 0.1277, 0.5847],
-        ];
-        let to_2020 = bt2020_from_camera(&m).unwrap();
-        let w = apply(&to_2020, [1.0, 1.0, 1.0]);
-        for v in w {
-            assert!((v - 1.0).abs() < 1e-4, "white -> {w:?}");
         }
     }
 }
