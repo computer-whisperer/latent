@@ -10,13 +10,20 @@ use crate::color::{apply, srgb_from_bt2020, srgb_oetf};
 /// Output (x, y) → source (x, y) for one orientation.
 type PixelMap = Box<dyn Fn(usize, usize) -> (usize, usize)>;
 
-/// Rotate/flip the working image into viewing orientation.
-pub fn oriented(img: &WorkingImage, orientation: Orientation) -> WorkingImage {
-    let (w, h) = (img.width as usize, img.height as usize);
-    let src = |x: usize, y: usize| &img.rgba[(y * w + x) * 4..(y * w + x) * 4 + 4];
+/// Rotate/flip an interleaved `channels`-per-pixel raster into viewing
+/// orientation. Returns the output size and pixels.
+pub fn orient<T: Copy>(
+    width: u32,
+    height: u32,
+    channels: usize,
+    pixels: &[T],
+    orientation: Orientation,
+) -> (u32, u32, Vec<T>) {
+    let (w, h) = (width as usize, height as usize);
+    debug_assert_eq!(pixels.len(), w * h * channels);
     // (out width, out height, mapping from output (x, y) to source (x, y))
     let (ow, oh, map): (usize, usize, PixelMap) = match orientation {
-        Orientation::Normal | Orientation::Unknown => return img.clone(),
+        Orientation::Normal | Orientation::Unknown => return (width, height, pixels.to_vec()),
         Orientation::HorizontalFlip => (w, h, Box::new(move |x, y| (w - 1 - x, y))),
         Orientation::Rotate180 => (w, h, Box::new(move |x, y| (w - 1 - x, h - 1 - y))),
         Orientation::VerticalFlip => (w, h, Box::new(move |x, y| (x, h - 1 - y))),
@@ -26,16 +33,23 @@ pub fn oriented(img: &WorkingImage, orientation: Orientation) -> WorkingImage {
         Orientation::Transverse => (h, w, Box::new(move |x, y| (w - 1 - y, h - 1 - x))),
         Orientation::Rotate270 => (h, w, Box::new(move |x, y| (w - 1 - y, x))),
     };
-    let mut rgba = Vec::with_capacity(ow * oh * 4);
+    let mut out = Vec::with_capacity(ow * oh * channels);
     for y in 0..oh {
         for x in 0..ow {
             let (sx, sy) = map(x, y);
-            rgba.extend_from_slice(src(sx, sy));
+            let i = (sy * w + sx) * channels;
+            out.extend_from_slice(&pixels[i..i + channels]);
         }
     }
+    (ow as u32, oh as u32, out)
+}
+
+/// Rotate/flip the working image into viewing orientation.
+pub fn oriented(img: &WorkingImage, orientation: Orientation) -> WorkingImage {
+    let (width, height, rgba) = orient(img.width, img.height, 4, &img.rgba, orientation);
     WorkingImage {
-        width: ow as u32,
-        height: oh as u32,
+        width,
+        height,
         rgba,
     }
 }

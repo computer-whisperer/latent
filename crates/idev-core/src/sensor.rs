@@ -81,6 +81,42 @@ impl SensorFrame {
     }
 }
 
+/// The camera's own JPEG rendering embedded in the raw, as stored (not
+/// yet rotated by `orientation`).
+pub struct Preview {
+    pub width: u32,
+    pub height: u32,
+    /// sRGB-encoded RGB, three bytes per pixel.
+    pub rgb: Vec<u8>,
+    pub orientation: Orientation,
+}
+
+/// Read the embedded JPEG preview without decoding the raw data.
+pub fn embedded_preview(path: &Path) -> Result<Preview> {
+    let source = RawSource::new(path).with_context(|| format!("open {}", path.display()))?;
+    let decoder = rawler::get_decoder(&source)
+        .with_context(|| format!("no decoder for {}", path.display()))?;
+    let params = RawDecodeParams::default();
+    let image = decoder
+        .preview_image(&source, &params)
+        .with_context(|| format!("preview {}", path.display()))?
+        .with_context(|| format!("{}: no embedded preview", path.display()))?;
+    let meta = decoder
+        .raw_metadata(&source, &params)
+        .with_context(|| format!("metadata {}", path.display()))?;
+    let orientation = match meta.exif.orientation {
+        Some(o @ 1..=8) => Orientation::from_u16(o),
+        _ => Orientation::Normal,
+    };
+    let rgb = image.into_rgb8();
+    Ok(Preview {
+        width: rgb.width(),
+        height: rgb.height(),
+        rgb: rgb.into_raw(),
+        orientation,
+    })
+}
+
 pub fn unpack(path: &Path) -> Result<SensorFrame> {
     let source = RawSource::new(path).with_context(|| format!("open {}", path.display()))?;
     let decoder = rawler::get_decoder(&source)

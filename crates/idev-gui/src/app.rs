@@ -1,12 +1,15 @@
-//! The develop window: one raw, a pan/zoom preview, a control sidebar.
+//! The window: a folder's thumbnail grid (library mode) and a develop
+//! view for one raw (develop mode) with a pan/zoom preview and a control
+//! sidebar.
 //!
 //! GPU work happens in `before_paint` on the host's device: the
-//! demosaiced camera RGB stays resident (`Prepared`) and the colour pass
-//! re-renders into the preview texture whenever the parameters, the
-//! display peak, or the preview scale changed. The preview scale follows
-//! the viewport zoom so a fit-to-window preview costs a fraction of a
-//! full-resolution pass; at 1:1 the scale is 1. Exports run on their own
-//! thread with a headless device so the window never stalls.
+//! demosaiced camera RGB of the open raw stays resident (`Prepared`) and
+//! the colour pass re-renders into the preview texture whenever the
+//! parameters, the display peak, or the preview scale changed. The
+//! preview scale follows the viewport zoom so a fit-to-window preview
+//! costs a fraction of a full-resolution pass; at 1:1 the scale is 1.
+//! Thumbnails and exports run on their own threads with headless
+//! devices so the window never stalls.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -16,13 +19,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use damascene_core::prelude::*;
-use damascene_core::scroll;
+use damascene_core::scroll::{self, ScrollAlignment, ScrollRequest};
 use damascene_core::surface::{AppTexture, SurfaceAlpha};
 use damascene_core::toast::ToastSpec;
 use damascene_core::viewport::{FitPolicy, ViewportBehavior, ViewportRequest};
 use damascene_core::widgets::number_scrubber::{self, ScrubDrag, ScrubberOpts};
 use damascene_core::widgets::tabs;
-use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent};
+use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent, UiEventKind};
 use damascene_winit_wgpu::{Wakeup, WinitWgpuApp};
 use idev_core::gpu::{
     Developer, DisplayPrimaries, Gpu, Histogram, HistogramReadback, OutputTarget, Prepared,
@@ -34,10 +37,13 @@ use idev_core::sensor::{self, SensorFrame};
 use idev_core::whitepoint::{self, Temperature};
 use idev_core::{WorkingImage, output};
 
+use crate::library::{self, Loaded, Loader, LoaderResults};
+use crate::thumbs::{CACHE_BUDGET, ThumbCache, ThumbGpu};
+
 /// The host's redraw handle, filled in once the event loop exists.
 pub type SharedWakeup = Arc<Mutex<Option<Wakeup>>>;
 
-fn wake(w: &SharedWakeup) {
+pub fn wake(w: &SharedWakeup) {
     if let Some(w) = w.lock().unwrap().as_ref() {
         w.wake();
     }
@@ -99,7 +105,7 @@ impl SidecarWriter {
 impl Drop for SidecarWriter {
     /// Closing the channel makes the thread write whatever is pending
     /// and exit; joining it keeps the last change from being lost on
-    /// window close.
+    /// window close and lets a requeued thumbnail see the final file.
     fn drop(&mut self) {
         self.tx.take();
         if let Some(t) = self.thread.take() {
@@ -108,12 +114,26 @@ impl Drop for SidecarWriter {
     }
 }
 
+fn named(key: NamedKey) -> KeyChord {
+    KeyChord::named(LogicalKey::Named(key))
+}
+
 /// Peak nits a "HDR PNG" export is mastered for.
 const HDR_EXPORT_NITS: f32 = 1000.0;
 const SIDEBAR_WIDTH: f32 = 320.0;
 const FIT_PADDING: f32 = 8.0;
 const TABS_WIDTH: f32 = 170.0;
 const HISTOGRAM_HEIGHT: f32 = 90.0;
+
+/// Grid tile geometry (logical px): a 3:2 image area over a caption.
+const TILE_W: f32 = 240.0;
+const TILE_H: f32 = 160.0;
+const CAPTION_H: f32 = 22.0;
+const TILE_GAP: f32 = tokens::SPACE_2;
+const GRID_PAD: f32 = tokens::SPACE_4;
+/// Thumbnail workers. Camera previews are cheap; developed thumbnails
+/// serialise on the shared headless device anyway.
+const THUMB_WORKERS: usize = 3;
 
 struct GpuState {
     gpu: Gpu,
@@ -124,6 +144,16 @@ struct GpuState {
     rendered: Option<(DevelopParams, f32, u32)>,
     /// Histogram of the preview, in flight.
     histogram_pending: Option<HistogramReadback>,
+}
+
+impl GpuState {
+    /// Forget the open raw's resident data (a different file is opening).
+    fn clear(&mut self) {
+        self.prepared = None;
+        self.preview = None;
+        self.rendered = None;
+        self.histogram_pending = None;
+    }
 }
 
 struct Preview {
@@ -149,7 +179,85 @@ impl ExportKind {
     }
 }
 
-pub struct DevelopApp {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Library,
+    Develop,
+}
+
+/// The folder being browsed and everything the grid knows about it.
+struct Library {
+    dir: PathBuf,
+    files: Vec<PathBuf>,
+    names: Vec<String>,
+    thumbs: Vec<Option<Image>>,
+    developed: Vec<bool>,
+    errors: Vec<Option<String>>,
+    loader: Loader,
+    results: LoaderResults,
+    loaded: usize,
+}
+
+impl Library {
+    fn open(
+        dir: PathBuf,
+        files: Vec<PathBuf>,
+        wakeup: SharedWakeup,
+        cache: Arc<ThumbCache>,
+        gpu: Arc<ThumbGpu>,
+    ) -> Library {
+        let n = files.len();
+        let names = files
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let (loader, results) = Loader::spawn(files.clone(), THUMB_WORKERS, wakeup, cache, gpu);
+        Library {
+            dir,
+            files,
+            names,
+            thumbs: vec![None; n],
+            developed: vec![false; n],
+            errors: vec![None; n],
+            loader,
+            results,
+            loaded: 0,
+        }
+    }
+
+    fn drain(&mut self) -> bool {
+        let mut any = false;
+        for loaded in self.results.drain() {
+            any = true;
+            match loaded {
+                Loaded::Thumb { index, thumb } => {
+                    if self.thumbs[index].is_none() {
+                        self.loaded += 1;
+                    }
+                    self.thumbs[index] = Some(thumb.image);
+                    self.developed[index] = thumb.developed;
+                    self.errors[index] = None;
+                }
+                Loaded::Failed { index, error } => self.errors[index] = Some(error),
+            }
+        }
+        any
+    }
+}
+
+impl Drop for Library {
+    fn drop(&mut self) {
+        self.loader.shutdown();
+    }
+}
+
+/// The raw open in develop mode.
+struct Session {
+    index: usize,
     path: PathBuf,
     name: String,
     frame: Option<Arc<SensorFrame>>,
@@ -157,6 +265,60 @@ pub struct DevelopApp {
     load_error: Option<String>,
     params: DevelopParams,
     sidecar: SidecarWriter,
+    /// Parameters changed since opening: the grid thumbnail is stale.
+    edited: bool,
+}
+
+impl Session {
+    fn open(index: usize, path: PathBuf, wakeup: &SharedWakeup) -> Result<Session> {
+        let params = DevelopParams::for_raw(&path)?;
+        let (tx, load_rx) = channel();
+        {
+            let path = path.clone();
+            let wakeup = wakeup.clone();
+            std::thread::Builder::new()
+                .name("idev-unpack".into())
+                .spawn(move || {
+                    let t = Instant::now();
+                    let r = sensor::unpack(&path);
+                    tracing::info!("unpacked in {:.0?}", t.elapsed());
+                    let _ = tx.send(r);
+                    wake(&wakeup);
+                })
+                .context("spawn unpack thread")?;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let sidecar = SidecarWriter::spawn(sidecar_path(&path));
+        Ok(Session {
+            index,
+            path,
+            name,
+            frame: None,
+            load_rx,
+            load_error: None,
+            params,
+            sidecar,
+            edited: false,
+        })
+    }
+}
+
+pub struct IdevApp {
+    library: Library,
+    notice: Option<String>,
+    selected: usize,
+    cols: Cell<usize>,
+    scroll_requests: Vec<ScrollRequest>,
+    picker: Option<Receiver<Option<PathBuf>>>,
+    cache: Arc<ThumbCache>,
+    thumb_gpu: Arc<ThumbGpu>,
+    mode: Mode,
+    session: Option<Session>,
+    histogram: Option<Histogram>,
+
     gpu: Option<GpuState>,
     wakeup: SharedWakeup,
     toasts: Vec<ToastSpec>,
@@ -164,7 +326,6 @@ pub struct DevelopApp {
     export_rx: Vec<Receiver<Result<PathBuf>>>,
     exports_running: usize,
     sdr_preview: bool,
-    histogram: Option<Histogram>,
 
     // Read during build (immutable), consumed in before_paint.
     last_zoom: Cell<f32>,
@@ -197,37 +358,41 @@ impl Scrub {
     }
 }
 
-impl DevelopApp {
-    pub fn new(path: PathBuf, wakeup: SharedWakeup) -> Result<Self> {
-        let params = DevelopParams::for_raw(&path)?;
-        let (tx, load_rx) = channel();
+impl IdevApp {
+    /// Open `dir` in the library; if `file` is given (a raw inside
+    /// `dir`), start in develop mode on it.
+    pub fn new(dir: PathBuf, file: Option<PathBuf>, wakeup: SharedWakeup) -> Result<Self> {
+        let files = library::scan_dir(&dir)?;
+        let cache = Arc::new(
+            ThumbCache::standard().context("no cache directory (XDG_CACHE_HOME or HOME)")?,
+        );
         {
-            let path = path.clone();
-            let wakeup = wakeup.clone();
+            let cache = cache.clone();
             std::thread::Builder::new()
-                .name("idev-unpack".into())
+                .name("idev-thumb-sweep".into())
                 .spawn(move || {
-                    let t = Instant::now();
-                    let r = sensor::unpack(&path);
-                    tracing::info!("unpacked in {:.0?}", t.elapsed());
-                    let _ = tx.send(r);
-                    wake(&wakeup);
+                    cache.sweep(CACHE_BUDGET);
                 })
-                .context("spawn unpack thread")?;
+                .context("spawn cache sweep")?;
         }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let sidecar = SidecarWriter::spawn(sidecar_path(&path));
+        let thumb_gpu = Arc::new(ThumbGpu::default());
+        let selected = file
+            .as_ref()
+            .and_then(|f| files.iter().position(|p| p == f))
+            .unwrap_or(0);
+        let library = Library::open(dir, files, wakeup.clone(), cache.clone(), thumb_gpu.clone());
         let mut app = Self {
-            path,
-            name,
-            sidecar,
-            frame: None,
-            load_rx,
-            load_error: None,
-            params,
+            library,
+            notice: None,
+            selected,
+            cols: Cell::new(1),
+            scroll_requests: Vec::new(),
+            picker: None,
+            cache,
+            thumb_gpu,
+            mode: Mode::Library,
+            session: None,
+            histogram: None,
             gpu: None,
             wakeup,
             toasts: Vec::new(),
@@ -235,8 +400,7 @@ impl DevelopApp {
             export_rx: Vec::new(),
             exports_running: 0,
             sdr_preview: false,
-            histogram: None,
-            last_zoom: Cell::new(0.2),
+            last_zoom: Cell::new(0.1),
             scale_factor: Cell::new(1.0),
             display_peak: Cell::new(1.0),
             hdr_output: Cell::new(false),
@@ -247,15 +411,153 @@ impl DevelopApp {
             kelvin: Scrub::default(),
             tint: Scrub::default(),
         };
-        app.seed_controls();
+        if let Some(file) = file {
+            if app.library.files.get(selected) == Some(&file) {
+                app.open_selected();
+            } else {
+                anyhow::bail!(
+                    "{}: not a raw file in {}",
+                    file.display(),
+                    app.library.dir.display()
+                );
+            }
+        }
         Ok(app)
     }
+
+    // ----- library -------------------------------------------------------
+
+    fn open_collection(&mut self, dir: PathBuf, files: Vec<PathBuf>) {
+        self.close_session();
+        self.mode = Mode::Library;
+        self.selected = 0;
+        self.library = Library::open(
+            dir,
+            files,
+            self.wakeup.clone(),
+            self.cache.clone(),
+            self.thumb_gpu.clone(),
+        );
+    }
+
+    /// Launch the system folder picker on its own thread; the dialog
+    /// blocks until dismissed while the UI keeps rendering.
+    fn open_folder_dialog(&mut self) {
+        if self.picker.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        self.picker = Some(rx);
+        let wakeup = self.wakeup.clone();
+        let start = self.library.dir.clone();
+        std::thread::Builder::new()
+            .name("idev-folder-picker".into())
+            .spawn(move || {
+                let dialog = rfd::FileDialog::new()
+                    .set_title("Open folder")
+                    .set_directory(start);
+                let _ = tx.send(dialog.pick_folder());
+                wake(&wakeup);
+            })
+            .expect("spawn folder picker");
+    }
+
+    fn drain_picker(&mut self) {
+        let Some(rx) = &self.picker else { return };
+        let picked = match rx.try_recv() {
+            Ok(picked) => picked,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.picker = None;
+        let Some(dir) = picked else { return };
+        match library::scan_dir(&dir) {
+            Ok(files) => {
+                tracing::info!(count = files.len(), dir = %dir.display(), "folder opened");
+                self.notice = None;
+                self.open_collection(dir, files);
+            }
+            Err(e) => self.toasts.push(ToastSpec::error(format!("{e:#}"))),
+        }
+    }
+
+    fn select(&mut self, index: usize) {
+        self.selected = index.min(self.library.files.len().saturating_sub(1));
+        let cols = self.cols.get().max(1);
+        self.scroll_requests.push(ScrollRequest::new(
+            "grid",
+            self.selected / cols,
+            ScrollAlignment::Visible,
+        ));
+    }
+
+    /// Enter develop mode on the selected file.
+    fn open_selected(&mut self) {
+        let Some(path) = self.library.files.get(self.selected).cloned() else {
+            return;
+        };
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.index == self.selected)
+        {
+            self.mode = Mode::Develop;
+            return;
+        }
+        self.close_session();
+        match Session::open(self.selected, path, &self.wakeup) {
+            Ok(s) => {
+                self.session = Some(s);
+                self.mode = Mode::Develop;
+                self.histogram = None;
+                if let Some(g) = self.gpu.as_mut() {
+                    g.clear();
+                }
+                self.viewport_requests.push(ViewportRequest::FitContent {
+                    key: "canvas".into(),
+                    padding: FIT_PADDING,
+                    behavior: ViewportBehavior::Instant,
+                });
+                self.seed_controls();
+            }
+            Err(e) => self.toasts.push(ToastSpec::error(format!("{e:#}"))),
+        }
+    }
+
+    /// Drop the open session, flushing its sidecar, and requeue its
+    /// thumbnail if the parameters changed.
+    fn close_session(&mut self) {
+        if let Some(s) = self.session.take() {
+            let (index, edited) = (s.index, s.edited);
+            drop(s);
+            if edited {
+                self.library.loader.invalidate(index);
+            }
+        }
+    }
+
+    fn step(&mut self, delta: isize) {
+        let n = self.library.files.len();
+        if n == 0 {
+            return;
+        }
+        let i = (self.selected as isize + delta).clamp(0, n as isize - 1) as usize;
+        if i != self.selected {
+            self.select(i);
+            if self.mode == Mode::Develop {
+                self.open_selected();
+            }
+        }
+    }
+
+    // ----- develop -------------------------------------------------------
 
     /// Refresh the scrubber texts from the parameters (and the frame's
     /// as-shot white once it is known).
     fn seed_controls(&mut self) {
-        self.exposure.set(self.params.exposure_ev, 2);
-        let (c, h, w) = match self.params.tone {
+        let Some(s) = &self.session else { return };
+        self.exposure.set(s.params.exposure_ev, 2);
+        let (c, h, w) = match s.params.tone {
             ToneCurve::Sigmoid {
                 contrast,
                 hue_preservation,
@@ -266,7 +568,7 @@ impl DevelopApp {
         self.contrast.set(c, 2);
         self.hue.set(h, 2);
         self.white.set(w, 2);
-        let temp = match (self.params.white_balance, &self.frame) {
+        let temp = match (s.params.white_balance, &s.frame) {
             (WhiteBalance::Temperature { kelvin, tint }, _) => Some(Temperature { kelvin, tint }),
             (WhiteBalance::AsShot, Some(f)) => {
                 whitepoint::white_from_neutral(&f.matrices, f.neutral_as_shot())
@@ -285,29 +587,41 @@ impl DevelopApp {
     }
 
     fn params_changed(&mut self) {
-        self.sidecar.send(&self.params);
+        if let Some(s) = self.session.as_mut() {
+            s.sidecar.send(&s.params);
+            s.edited = true;
+        }
         wake(&self.wakeup);
     }
 
     fn reset_params(&mut self) {
-        self.params = DevelopParams::default();
+        if let Some(s) = self.session.as_mut() {
+            s.params = DevelopParams::default();
+        }
         self.seed_controls();
         self.params_changed();
     }
 
     fn set_temperature(&mut self) {
-        if let (Some(k), Some(t)) = (self.kelvin.value(), self.tint.value()) {
-            self.params.white_balance = WhiteBalance::Temperature { kelvin: k, tint: t };
+        if let (Some(k), Some(t), Some(s)) = (
+            self.kelvin.value(),
+            self.tint.value(),
+            self.session.as_mut(),
+        ) {
+            s.params.white_balance = WhiteBalance::Temperature { kelvin: k, tint: t };
             self.params_changed();
         }
     }
 
     fn set_tone_numbers(&mut self) {
-        if let ToneCurve::Sigmoid { .. } = self.params.tone
+        let Some(s) = self.session.as_mut() else {
+            return;
+        };
+        if let ToneCurve::Sigmoid { .. } = s.params.tone
             && let (Some(c), Some(h), Some(w)) =
                 (self.contrast.value(), self.hue.value(), self.white.value())
         {
-            self.params.tone = ToneCurve::Sigmoid {
+            s.params.tone = ToneCurve::Sigmoid {
                 contrast: c.max(0.1),
                 hue_preservation: h.clamp(0.0, 1.0),
                 white: w.max(1.0),
@@ -319,21 +633,18 @@ impl DevelopApp {
     /// Ask for a save path on a dialog thread, then develop and encode
     /// on a worker with its own headless device.
     fn export(&mut self, kind: ExportKind) {
-        let Some(frame) = self.frame.clone() else {
+        let Some(s) = &self.session else { return };
+        let Some(frame) = s.frame.clone() else {
             self.toasts.push(ToastSpec::info("still loading"));
             return;
         };
-        let params = self.params.clone();
-        let stem = self
+        let params = s.params.clone();
+        let stem = s
             .path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "image".into());
-        let dir = self
-            .path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
+        let dir = s.path.parent().map(Path::to_path_buf).unwrap_or_default();
         let (tx, rx) = channel();
         self.export_rx.push(rx);
         self.exports_running += 1;
@@ -362,15 +673,23 @@ impl DevelopApp {
     }
 
     fn poll_background(&mut self) {
-        if self.frame.is_none() {
-            match self.load_rx.try_recv() {
+        self.drain_picker();
+        self.library.drain();
+        let mut loaded = false;
+        if let Some(s) = self.session.as_mut()
+            && s.frame.is_none()
+        {
+            match s.load_rx.try_recv() {
                 Ok(Ok(frame)) => {
-                    self.frame = Some(Arc::new(frame));
-                    self.seed_controls();
+                    s.frame = Some(Arc::new(frame));
+                    loaded = true;
                 }
-                Ok(Err(e)) => self.load_error = Some(format!("{e:#}")),
+                Ok(Err(e)) => s.load_error = Some(format!("{e:#}")),
                 Err(_) => {}
             }
+        }
+        if loaded {
+            self.seed_controls();
         }
         let mut done = Vec::new();
         for (i, rx) in self.export_rx.iter().enumerate() {
@@ -411,27 +730,161 @@ impl DevelopApp {
         }
     }
 
-    fn control_panel(&self) -> El {
-        let tone_kind = match self.params.tone {
+    // ----- build ---------------------------------------------------------
+
+    fn color_mode_badge(&self) -> El {
+        if self.hdr_output.get() {
+            let b = badge(format!("HDR · {:.1}x", self.display_peak.get()));
+            if self.sdr_preview {
+                b.muted().tooltip("SDR preview (t)")
+            } else {
+                b.success()
+                    .tooltip("tone curve targets the panel headroom; t for SDR preview")
+            }
+        } else {
+            badge("SDR")
+        }
+        .key("color-mode")
+    }
+
+    fn grid(&self, cx: &BuildCx) -> El {
+        let lib = &self.library;
+        let vw = cx.viewport_width().unwrap_or(1280.0);
+        let avail = vw - 2.0 * (tokens::SPACE_4 + GRID_PAD) - 16.0;
+        let cols = (((avail + TILE_GAP) / (TILE_W + TILE_GAP)) as usize).max(1);
+        self.cols.set(cols);
+
+        // Snapshots for the 'static cell builder; Image clones are Arcs.
+        let thumbs = lib.thumbs.clone();
+        let developed = lib.developed.clone();
+        let errors = lib.errors.clone();
+        let names = lib.names.clone();
+        let selected = self.selected;
+        let ring = cx.theme().palette().ring;
+        let loader = lib.loader.clone();
+
+        let grid = virtual_grid(
+            lib.files.len(),
+            cols,
+            TILE_H + CAPTION_H,
+            TILE_GAP,
+            move |i| {
+                let mut tip = names[i].clone();
+                let picture = match (&thumbs[i], &errors[i]) {
+                    (Some(img), _) => image(img.clone())
+                        .image_fit(ImageFit::Contain)
+                        .dynamic_range_limit(DynamicRangeLimit::Standard),
+                    (None, Some(err)) => {
+                        tip = format!("{} — {err}", names[i]);
+                        column([icon("alert-circle")])
+                            .align(Align::Center)
+                            .justify(Justify::Center)
+                    }
+                    (None, None) => {
+                        loader.request(i);
+                        skeleton()
+                    }
+                };
+                let mut caption = vec![text(names[i].clone()).caption().muted()];
+                if developed[i] {
+                    caption.push(spacer());
+                    caption.push(
+                        column(Vec::<El>::new())
+                            .width(Size::Fixed(6.0))
+                            .height(Size::Fixed(6.0))
+                            .radius(3.0)
+                            .fill(tokens::PRIMARY),
+                    );
+                }
+                let mut cell = column([
+                    picture
+                        .width(Size::Fill(1.0))
+                        .height(Size::Fixed(TILE_H - tokens::SPACE_2))
+                        .fill(tokens::CARD)
+                        .radius(tokens::RADIUS_MD),
+                    row(caption)
+                        .height(Size::Fixed(CAPTION_H - tokens::SPACE_2))
+                        .align(Align::Center)
+                        .padding(Sides::x(tokens::SPACE_2)),
+                ])
+                .gap(tokens::SPACE_2 / 2.0)
+                .key(format!("thumb:{i}"))
+                .width(Size::Fill(1.0))
+                .height(Size::Fixed(TILE_H + CAPTION_H))
+                .padding(tokens::SPACE_2 / 2.0)
+                .radius(tokens::RADIUS_MD)
+                .focusable()
+                .tooltip(tip);
+                if i == selected {
+                    cell = cell.stroke(ring).stroke_width(2.0);
+                }
+                cell
+            },
+        );
+
+        let body = if lib.files.is_empty() {
+            column([
+                icon("folder"),
+                text(format!("no raw files in {}", lib.dir.display())).muted(),
+            ])
+            .gap(tokens::SPACE_3)
+            .align(Align::Center)
+            .justify(Justify::Center)
+            .fill_size()
+        } else {
+            grid.key("grid").padding(GRID_PAD).fill_size()
+        };
+
+        let dir_name = lib
+            .dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| lib.dir.display().to_string());
+        let mut bar = vec![
+            toolbar_title(dir_name),
+            toolbar_description(format!("{} raws · {} ready", lib.files.len(), lib.loaded)),
+            spacer(),
+        ];
+        if let Some(n) = &self.notice {
+            bar.push(badge(n.clone()).warning());
+        }
+        bar.push(self.color_mode_badge());
+        bar.push(
+            button_with_icon("folder", "Open folder")
+                .key("open-folder")
+                .tooltip("browse a different folder (o)"),
+        );
+        bar.push(text("Enter to develop · arrows to move").caption().muted());
+
+        page([
+            toolbar(bar)
+                .gap(tokens::SPACE_3)
+                .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2)),
+            card([body]).fill_size(),
+        ])
+    }
+
+    fn control_panel(&self, s: &Session) -> El {
+        let tone_kind = match s.params.tone {
             ToneCurve::None => "none",
             ToneCurve::Sigmoid { .. } => "sigmoid",
         };
-        let highlights = match self.params.highlights {
+        let highlights = match s.params.highlights {
             Highlights::Clip => "clip",
             Highlights::Blend => "blend",
         };
-        let demosaic = match self.params.demosaic {
+        let demosaic = match s.params.demosaic {
             Demosaic::Bilinear => "bilinear",
             Demosaic::Rcd => "rcd",
         };
-        let wb_label = match self.params.white_balance {
+        let wb_label = match s.params.white_balance {
             WhiteBalance::AsShot => "as shot",
             WhiteBalance::Multipliers { .. } => "multipliers",
             WhiteBalance::Temperature { .. } => "custom",
         };
 
         let mut info: Vec<El> = Vec::new();
-        if let Some(f) = &self.frame {
+        if let Some(f) = &s.frame {
             let e = &f.exif;
             info.push(text(format!("{} {}", e.make, e.model)).caption().muted());
             if let Some(l) = &e.lens {
@@ -477,7 +930,9 @@ impl DevelopApp {
                 ),
                 field_row("Contrast", number_scrubber("contrast", &self.contrast.text)),
                 field_row("Hue preservation", number_scrubber("hue", &self.hue.text)),
-                field_row("White", number_scrubber("white", &self.white.text)).tooltip("scene value mapped to the display peak; 1 = diffuse white, 4 = two stops above"),
+                field_row("White", number_scrubber("white", &self.white.text)).tooltip(
+                    "scene value mapped to the display peak; 1 = diffuse white, 4 = two stops above",
+                ),
             ]),
             sidebar_group([
                 sidebar_group_label("White balance"),
@@ -592,11 +1047,11 @@ impl DevelopApp {
             .fill(tokens::MUTED.with_alpha(0.3))
     }
 
-    fn canvas(&self) -> El {
-        let Some(frame) = &self.frame else {
-            let msg = match &self.load_error {
+    fn canvas(&self, s: &Session) -> El {
+        let Some(frame) = &s.frame else {
+            let msg = match &s.load_error {
                 Some(e) => text(e.clone()).text_color(tokens::DESTRUCTIVE),
-                None => text(format!("Unpacking {}…", self.name)).muted(),
+                None => text(format!("Unpacking {}…", s.name)).muted(),
             };
             return column([spinner(), msg])
                 .gap(tokens::SPACE_3)
@@ -625,31 +1080,8 @@ impl DevelopApp {
             .max_zoom(8.0)
             .fill(tokens::CARD)
     }
-}
 
-impl App for DevelopApp {
-    fn build(&self, cx: &BuildCx) -> El {
-        if let Some(diag) = cx.diagnostics() {
-            self.scale_factor.set(diag.scale_factor.max(0.1));
-            let hdr = diag.hdr_active();
-            self.hdr_output.set(hdr);
-            let peak = if hdr {
-                match &diag.color_management {
-                    damascene_core::color::ColorManagementStatus::Available { targets, .. } => {
-                        let max = targets
-                            .target_max_luminance_nits
-                            .or(targets.max_luminance_nits)
-                            .unwrap_or(1000.0);
-                        let reference = targets.reference_luminance_nits.unwrap_or(203.0);
-                        (max / reference).max(1.0)
-                    }
-                    _ => 1.0,
-                }
-            } else {
-                1.0
-            };
-            self.display_peak.set(peak);
-        }
+    fn develop(&self, cx: &BuildCx, s: &Session) -> El {
         let zoom = cx
             .viewport_view("canvas")
             .map_or(self.last_zoom.get(), |v| v.zoom);
@@ -668,46 +1100,31 @@ impl App for DevelopApp {
         } else {
             format!("{pct:.0}%")
         };
-        let mode = if self.hdr_output.get() {
-            let b = badge(format!("HDR · {:.1}x", self.display_peak.get()));
-            if self.sdr_preview {
-                b.muted().tooltip("SDR preview (t)")
-            } else {
-                b.success()
-                    .tooltip("tone curve targets the panel headroom; t for SDR preview")
-            }
-        } else {
-            badge("SDR")
-        }
-        .key("color-mode");
+        let position = format!("{} / {}", s.index + 1, self.library.files.len());
 
         page([
             toolbar([
-                toolbar_title(self.name.clone()),
+                button_with_icon("layout-dashboard", "Library")
+                    .key("back")
+                    .ghost()
+                    .tooltip("back to the folder (Esc)"),
+                toolbar_title(s.name.clone()),
+                toolbar_description(position),
                 spacer(),
                 text(readout).muted().tabular_numerals(),
                 button("Fit").key("fit").ghost(),
                 button("1:1").key("one").ghost(),
-                mode,
+                self.color_mode_badge(),
             ])
             .gap(tokens::SPACE_3)
             .padding(Sides::xy(tokens::SPACE_4, tokens::SPACE_2)),
-            row([self.canvas(), self.control_panel()])
+            row([self.canvas(s), self.control_panel(s)])
                 .gap(tokens::SPACE_3)
                 .height(Size::Fill(1.0)),
         ])
     }
 
-    fn hotkeys(&self) -> Vec<(KeyChord, String)> {
-        vec![
-            (KeyChord::vim('f'), "fit".into()),
-            (KeyChord::vim('1'), "one".into()),
-            (KeyChord::vim('t'), "sdr-preview".into()),
-            (KeyChord::vim('e'), "export-jpg".into()),
-        ]
-    }
-
-    fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
+    fn on_develop_event(&mut self, event: &UiEvent) {
         if event.is_click_or_activate("fit") || event.is_hotkey("fit") {
             self.viewport_requests.push(ViewportRequest::FitContent {
                 key: "canvas".into(),
@@ -721,11 +1138,6 @@ impl App for DevelopApp {
                 key: "canvas".into(),
                 behavior: ViewportBehavior::Smooth,
             });
-            return;
-        }
-        if event.is_hotkey("sdr-preview") || event.is_click_or_activate("color-mode") {
-            self.sdr_preview = !self.sdr_preview;
-            wake(&self.wakeup);
             return;
         }
         if event.is_click_or_activate("export-jpg") || event.is_hotkey("export-jpg") {
@@ -749,7 +1161,9 @@ impl App for DevelopApp {
             return;
         }
         if event.is_click_or_activate("wb-as-shot") {
-            self.params.white_balance = WhiteBalance::AsShot;
+            if let Some(s) = self.session.as_mut() {
+                s.params.white_balance = WhiteBalance::AsShot;
+            }
             self.seed_controls();
             self.params_changed();
             return;
@@ -766,10 +1180,10 @@ impl App for DevelopApp {
             &mut self.exposure.drag,
             "exposure",
             &ev,
-            &event,
+            event,
         ) {
-            if let Some(v) = self.exposure.value() {
-                self.params.exposure_ev = v;
+            if let (Some(v), Some(s)) = (self.exposure.value(), self.session.as_mut()) {
+                s.params.exposure_ev = v;
                 self.params_changed();
             }
             return;
@@ -785,7 +1199,7 @@ impl App for DevelopApp {
             &mut self.contrast.drag,
             "contrast",
             &contrast,
-            &event,
+            event,
         ) {
             self.set_tone_numbers();
             return;
@@ -796,7 +1210,7 @@ impl App for DevelopApp {
             .step(0.05)
             .sensitivity(4.0)
             .decimals(2);
-        if number_scrubber::apply_event(&mut self.hue.text, &mut self.hue.drag, "hue", &hue, &event)
+        if number_scrubber::apply_event(&mut self.hue.text, &mut self.hue.drag, "hue", &hue, event)
         {
             self.set_tone_numbers();
             return;
@@ -812,7 +1226,7 @@ impl App for DevelopApp {
             &mut self.white.drag,
             "white",
             &white,
-            &event,
+            event,
         ) {
             self.set_tone_numbers();
             return;
@@ -828,7 +1242,7 @@ impl App for DevelopApp {
             &mut self.kelvin.drag,
             "kelvin",
             &kelvin,
-            &event,
+            event,
         ) {
             self.set_temperature();
             return;
@@ -844,18 +1258,21 @@ impl App for DevelopApp {
             &mut self.tint.drag,
             "tint",
             &tint,
-            &event,
+            event,
         ) {
             self.set_temperature();
             return;
         }
 
+        let Some(s) = self.session.as_mut() else {
+            return;
+        };
         let mut tone_kind = String::new();
-        if tabs::apply_event(&mut tone_kind, &event, "tone", |s| Some(s.to_string())) {
-            self.params.tone = match tone_kind.as_str() {
+        if tabs::apply_event(&mut tone_kind, event, "tone", |s| Some(s.to_string())) {
+            s.params.tone = match tone_kind.as_str() {
                 "none" => ToneCurve::None,
-                _ => match self.params.tone {
-                    ToneCurve::Sigmoid { .. } => self.params.tone,
+                _ => match s.params.tone {
+                    ToneCurve::Sigmoid { .. } => s.params.tone,
                     ToneCurve::None => ToneCurve::default(),
                 },
             };
@@ -863,25 +1280,143 @@ impl App for DevelopApp {
             self.params_changed();
             return;
         }
-        if tabs::apply_event(
-            &mut self.params.highlights,
-            &event,
-            "highlights",
-            |s| match s {
-                "clip" => Some(Highlights::Clip),
-                "blend" => Some(Highlights::Blend),
-                _ => None,
-            },
-        ) {
+        if tabs::apply_event(&mut s.params.highlights, event, "highlights", |s| match s {
+            "clip" => Some(Highlights::Clip),
+            "blend" => Some(Highlights::Blend),
+            _ => None,
+        }) {
             self.params_changed();
             return;
         }
-        if tabs::apply_event(&mut self.params.demosaic, &event, "demosaic", |s| match s {
+        if tabs::apply_event(&mut s.params.demosaic, event, "demosaic", |s| match s {
             "bilinear" => Some(Demosaic::Bilinear),
             "rcd" => Some(Demosaic::Rcd),
             _ => None,
         }) {
             self.params_changed();
+        }
+    }
+
+    fn on_library_event(&mut self, event: &UiEvent) {
+        if let Some(key) = event.target_key()
+            && let Some(i) = key.strip_prefix("thumb:").and_then(|s| s.parse().ok())
+        {
+            if event.kind == UiEventKind::Click && event.click_count >= 2 {
+                self.select(i);
+                self.open_selected();
+                return;
+            }
+            if event.is_click_or_activate(key) {
+                self.select(i);
+                return;
+            }
+        }
+        let last = self.library.files.len().saturating_sub(1);
+        let cols = self.cols.get().max(1) as isize;
+        if event.is_hotkey("open") {
+            self.open_selected();
+        } else if event.is_hotkey("up") {
+            self.step(-cols);
+        } else if event.is_hotkey("down") {
+            self.step(cols);
+        } else if event.is_hotkey("home") {
+            self.select(0);
+        } else if event.is_hotkey("end") {
+            self.select(last);
+        }
+    }
+}
+
+impl App for IdevApp {
+    fn before_build(&mut self) {
+        self.poll_background();
+    }
+
+    fn build(&self, cx: &BuildCx) -> El {
+        if let Some(diag) = cx.diagnostics() {
+            self.scale_factor.set(diag.scale_factor.max(0.1));
+            let hdr = diag.hdr_active();
+            self.hdr_output.set(hdr);
+            let peak = if hdr {
+                match &diag.color_management {
+                    damascene_core::color::ColorManagementStatus::Available { targets, .. } => {
+                        let max = targets
+                            .target_max_luminance_nits
+                            .or(targets.max_luminance_nits)
+                            .unwrap_or(1000.0);
+                        let reference = targets.reference_luminance_nits.unwrap_or(203.0);
+                        (max / reference).max(1.0)
+                    }
+                    _ => 1.0,
+                }
+            } else {
+                1.0
+            };
+            self.display_peak.set(peak);
+        }
+        match (self.mode, &self.session) {
+            (Mode::Develop, Some(s)) => self.develop(cx, s),
+            _ => self.grid(cx),
+        }
+    }
+
+    fn hotkeys(&self) -> Vec<(KeyChord, String)> {
+        let mut keys = vec![
+            (KeyChord::vim('t'), "sdr-preview".into()),
+            (KeyChord::vim('o'), "open-folder".into()),
+            (named(NamedKey::ArrowLeft), "left".into()),
+            (named(NamedKey::ArrowRight), "right".into()),
+            (KeyChord::vim('h'), "left".into()),
+            (KeyChord::vim('l'), "right".into()),
+        ];
+        match self.mode {
+            Mode::Library => keys.extend([
+                (named(NamedKey::ArrowUp), "up".into()),
+                (named(NamedKey::ArrowDown), "down".into()),
+                (KeyChord::vim('j'), "down".into()),
+                (KeyChord::vim('k'), "up".into()),
+                (named(NamedKey::Home), "home".into()),
+                (named(NamedKey::End), "end".into()),
+                (named(NamedKey::Enter), "open".into()),
+            ]),
+            Mode::Develop => keys.extend([
+                (KeyChord::vim('f'), "fit".into()),
+                (KeyChord::vim('1'), "one".into()),
+                (KeyChord::vim('e'), "export-jpg".into()),
+            ]),
+        }
+        keys
+    }
+
+    fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
+        if event.is_click_or_activate("open-folder") || event.is_hotkey("open-folder") {
+            self.open_folder_dialog();
+            return;
+        }
+        if event.is_hotkey("sdr-preview") || event.is_click_or_activate("color-mode") {
+            self.sdr_preview = !self.sdr_preview;
+            wake(&self.wakeup);
+            return;
+        }
+        if event.is_hotkey("left") {
+            self.step(-1);
+            return;
+        }
+        if event.is_hotkey("right") {
+            self.step(1);
+            return;
+        }
+        match self.mode {
+            Mode::Develop => {
+                if event.kind == UiEventKind::Escape || event.is_click_or_activate("back") {
+                    self.mode = Mode::Library;
+                    self.close_session();
+                    self.select(self.selected);
+                    return;
+                }
+                self.on_develop_event(&event);
+            }
+            Mode::Library => self.on_library_event(&event),
         }
     }
 
@@ -892,9 +1427,13 @@ impl App for DevelopApp {
     fn drain_viewport_requests(&mut self) -> Vec<ViewportRequest> {
         std::mem::take(&mut self.viewport_requests)
     }
+
+    fn drain_scroll_requests(&mut self) -> Vec<scroll::ScrollRequest> {
+        std::mem::take(&mut self.scroll_requests)
+    }
 }
 
-impl WinitWgpuApp for DevelopApp {
+impl WinitWgpuApp for IdevApp {
     fn gpu_setup(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let gpu = Gpu::from_device(device.clone(), queue.clone());
         let dev = Developer::new(&gpu);
@@ -909,13 +1448,16 @@ impl WinitWgpuApp for DevelopApp {
     }
 
     fn before_paint(&mut self, _queue: &wgpu::Queue) {
-        self.poll_background();
-        let Some(frame) = self.frame.clone() else {
+        if self.mode != Mode::Develop {
+            return;
+        }
+        let Some(s) = &self.session else { return };
+        let Some(frame) = s.frame.clone() else {
             return;
         };
+        let params = s.params.clone();
         let peak = self.peak();
         let scale = self.wanted_scale();
-        let params = self.params.clone();
         let Some(g) = self.gpu.as_mut() else { return };
 
         if g.prepared.as_ref().is_none_or(|p| !p.matches(&params)) {

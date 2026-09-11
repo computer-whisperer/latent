@@ -19,13 +19,20 @@ Build with `cargo build --release`; the binary is `target/release/idev`.
 Parameters live in `<raw>.idev.toml` beside each raw; flags override,
 `--save-params` writes back.
 
-GUI: `cargo run --release -p idev-gui -- DSC00039.ARW` opens a develop
-window (damascene, HDR-aware on prism): pan/zoom preview, a per-channel
-histogram of the preview, scrubbers for exposure, contrast, hue
-preservation, white, temperature and tint, tabs for tone curve,
-highlights and demosaic, export buttons, and the sidecar is written
-(debounced) on every change. Keys: `f` fit, `1` 1:1, `t` SDR preview,
-`e` export JPEG.
+GUI: `cargo run --release -p idev-gui -- DIR` opens a folder of raws as
+a thumbnail grid (`idev-gui FILE.ARW` opens straight into that file;
+no argument means the current directory). Thumbnails come from the
+camera's embedded JPEG until a raw has a sidecar, then from a scaled
+develop with the sidecar's parameters (marked with a dot); they are
+cached under `~/.cache/idev/thumbs`. Enter or a double click opens the
+develop view (damascene, HDR-aware on prism): pan/zoom preview, a
+per-channel histogram of the preview, scrubbers for exposure, contrast,
+hue preservation, white, temperature and tint, tabs for tone curve,
+highlights and demosaic, export buttons; the sidecar is written
+(debounced) on every change. Keys: arrows or `hjkl` move (left/right
+also step files in the develop view), Enter open, Esc back to the grid,
+`o` open another folder, `f` fit, `1` 1:1, `t` SDR preview, `e` export
+JPEG.
 
 Crates:
 
@@ -33,6 +40,7 @@ Crates:
   `DevelopParams`, the wgpu compute pipeline, CPU output transforms.
 - `idev-formats` — encoders (EXR, PNG, PGM).
 - `idev-cli` — the `idev` binary.
-- `idev-gui` — the `idev-gui` develop window.
+- `idev-gui` — the `idev-gui` window: library grid, thumbnail cache,
+  develop view.
 
 `idev` is a placeholder prefix until the project is named.

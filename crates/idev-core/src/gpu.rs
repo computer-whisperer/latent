@@ -784,20 +784,21 @@ impl Developer {
         target: OutputTarget,
     ) -> Result<WorkingImage> {
         let prepared = self.prepare(gpu, frame, params)?;
-        self.develop_prepared(gpu, &prepared, params, target)
+        self.develop_prepared(gpu, &prepared, params, target, 1)
     }
 
-    /// Full-resolution colour pass over an existing [`Prepared`], read
-    /// back to the CPU.
+    /// Colour pass over an existing [`Prepared`] at an integer
+    /// downscale (see [`Self::colour`]), read back to the CPU.
     pub fn develop_prepared(
         &self,
         gpu: &Gpu,
         prepared: &Prepared,
         params: &DevelopParams,
         target: OutputTarget,
+        scale: u32,
     ) -> Result<WorkingImage> {
         let device = &gpu.device;
-        let (out_w, out_h) = (prepared.width, prepared.height);
+        let (out_w, out_h) = Self::scaled_size(prepared, scale);
         let working = texture(
             device,
             "idev::working",
@@ -814,7 +815,7 @@ impl Developer {
             prepared,
             params,
             target,
-            1,
+            scale,
             DisplayPrimaries::Bt2020,
             &working.view,
         );

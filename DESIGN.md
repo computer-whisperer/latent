@@ -321,6 +321,64 @@ screenshot: the preview renders through `surface()` inside a
   synchronous writes on a Ceph mount (20–70 ms each) starved the
   Wayland socket during drags and the compositor dropped the client.
 
+## Library arc (started 2026-09-11): folder grid + develop as a mode
+
+Decision (proposed in the chunk report, taken as ratified by "let's
+continue with the library view"): grid thumbnails come from the
+embedded camera JPEG when a raw has no sidecar, and from a scaled
+develop with the sidecar's parameters once one exists. The embedded
+preview is instant (1616×1080 JPEG, ~200 KB, in every a6700 ARW) and
+matches the camera's rendering; the developed thumbnail shows the edit.
+
+- **Entry point**: `idev-gui [PATH]`. A directory opens the library;
+  a file opens the develop view on it with its folder as the library;
+  no argument means the current directory. `o` picks another folder.
+- **App structure**: one `IdevApp` with `Mode::{Library, Develop}`.
+  The GPU state (device, developer, preview texture) lives on the app;
+  the per-file state (frame, params, sidecar writer, histogram) is a
+  `Session` swapped on open. Enter / double-click opens the selected
+  file, Escape returns to the grid, Left/Right in develop mode step
+  through the folder. Dropping a session joins its sidecar writer, so
+  the thumbnail requeued on return sees the final sidecar.
+- **Thumbnails**: `idev-gui::thumbs` is the explorer-thumbs design
+  (content-addressed by path + mtime + size, temp-and-rename, corrupt
+  = miss, LRU byte sweep) with two changes: the key also covers the
+  sidecar's mtime + size, and entries are sRGB RGBA8 at a 512 px long
+  edge rather than linear f16 (developed thumbs are rendered for the
+  SDR target, so nothing above diffuse white is lost). Cache root is
+  `$XDG_CACHE_HOME/idev/thumbs`.
+- **Producing a thumbnail**: no sidecar → rawler's `preview_image`
+  (the JPEGInterchangeFormat blob), box-downscaled in linear light and
+  rotated by the EXIF orientation. Sidecar → `unpack` + `prepare` +
+  the colour pass at the integer scale that lands the long edge at
+  or under 512 px, read back, oriented, encoded sRGB8. Developed
+  thumbs go through one headless device shared by the workers behind
+  a mutex (a full-resolution `prepare` holds ~0.5 GB of textures).
+- **Loader**: the gallery's pool, reduced to one job kind: a hot queue
+  (rows the grid realized) ahead of a sweep over the folder in file
+  order; `invalidate(index)` requeues one file after its session
+  closes. Results are drained in `before_build`.
+- **Grid**: damascene `virtual_grid` keyed `"grid"`, cells are the
+  thumbnail (`ImageFit::Contain` on a card background) over a caption
+  with the file name and a dot when a sidecar exists. Column count
+  from the build-time viewport width; selection ring; `ScrollRequest`
+  keeps the selection visible on keyboard navigation.
+- **Not in this arc**: ratings/filters, recursive scan, thumbnail
+  rendering at the display's HDR peak, gallery retirement.
+
+## Library arc results (2026-09-11)
+
+Verified by screenshot on the 239-file card folder: the grid fills
+within the first seconds (embedded previews; three workers), the
+selection ring and captions render, a raw given a sidecar with +1 EV
+shows the brighter developed thumbnail and the dot marker, and
+`idev-gui FILE` opens in develop mode (unpack 83 ms, prepare 68 ms on
+the host device). The thumbnail cache holds ~420 KB per entry (101 MB
+for the folder). The headless thumbnail device is created lazily on
+the first developed thumbnail. Not exercised by me: keyboard
+navigation, Escape back to the grid with the thumbnail requeue, the
+folder picker (no input injection on this desktop).
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700
