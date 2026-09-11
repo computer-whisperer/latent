@@ -507,9 +507,12 @@ image enters the working space and goes through the same colour pass.
   by up to 4 codes, which is zune-jpeg vs libjpeg IDCT, not the
   pipeline (the PNG test isolates that). A scene-referred EXR of a
   raw, developed again, matches the direct develop within 1 code.
-  Screenshots: the card folder lists 516 images with JPEG thumbnails
-  (portrait ones oriented), and a JPEG opens in the develop view with
-  the reduced sidebar and a live histogram.
+  Screenshots: the card folder lists 516 images with JPEG thumbnails,
+  and a JPEG opens in the develop view with the reduced sidebar and a
+  live histogram. (Correction 2026-09-11: this entry originally claimed
+  portrait JPEGs were oriented; they were not, since achromat applies
+  no EXIF orientation and `Source::orientation()` returned `Normal`
+  for images. Fixed by the metadata arc below.)
 - Cost: JPEG load 330 ms for 25 MP (decode plus conversion); the
   thumbnail sweep decodes each JPEG at full size, so a mixed folder
   fills slower than a raw-only one (embedded previews are ~30 ms).
@@ -519,6 +522,63 @@ image enters the working space and goes through the same colour pass.
 - Not done: raw + JPEG pairs from the same shot show as two entries;
   a stacking rule (same stem) is an obvious next step. Gallery
   retirement can proceed once the user has used this for a while.
+
+## Metadata arc, chunk 1: readout (2026-09-11)
+
+Survey: we carried eight fields per raw; an a6700 ARW holds 205 tags
+under exiv2 (133 standard, 72 Sony makernote), and rawler's `Exif`
+struct parses ~45 of the standard ones but skips the makernote.
+Exports carry no metadata at all (chunk 2). Non-raw sources got no
+metadata because achromat returns pixels only.
+
+Built:
+
+- `idev-core::metadata` — `Metadata { groups: [Group { name, fields:
+  [Field { name, value }] }] }`, rendered to strings at load time.
+  Groups: Camera, Exposure, Lens, Time, Image, GPS, Sony, Other.
+  Known tags have a name and a domain formatter (exposure as `1/80 s`,
+  APEX values as f-numbers and times, EXIF and Sony enums decoded, GPS
+  folded to signed decimal degrees, Sony lens spec from its BCD bytes);
+  every other IFD0 / Exif / makernote entry lands in Other as a short
+  numeric dump unless it is structural (offsets, previews, tone
+  tables) or enciphered (Sony 0x9xxx, Tag2010, ShotInfo). Sony tables
+  follow ExifTool's Sony.pm.
+- The raw path parses the TIFF once for lens tables and metadata (the
+  GPS IFD has to be requested from rawler explicitly). The image path
+  finds the EXIF block itself (JPEG APP1, PNG `eXIf`, WebP `EXIF`) and
+  runs the same reader over it, and now also fills `ExifSummary` and
+  the orientation for images, so `Source::exif()` is total and
+  portrait JPEGs rotate in thumbnails and exports.
+- CLI: `inspect --all` prints every group; `inspect` prints the camera
+  summary for images too. GUI: `i` or the Info button swaps the
+  sidebar for the metadata groups as name/value rows.
+
+Verified (DSC00039.ARW and its JPEG, now under the library at
+`2026/2026-09-10`; the camera_control download folder is gone):
+
+- Field-for-field against exiv2 on the ARW: every standard tag exiv2
+  lists is either shown or deliberately skipped (offsets, blank
+  strings, ComponentsConfiguration and the like); all 72 Sony tags
+  exiv2 decodes are shown with matching values, plus 24 unknown small
+  ones in Other. Two formatter bugs found by that comparison
+  (FocusFrameSize bytes read as shorts, APEX MaxApertureValue shown
+  raw) were fixed.
+- The JPEG path yields the identical group list to the ARW, down to
+  the Sony makernote (one unknown tag differs in value, as expected).
+- DSC00035.JPG (a portrait shot) now reports `Rotate270`.
+
+Not done / caveats:
+
+- Sony model ID table only knows the a6700; other bodies show the
+  number. LensID shows "E-mount or other" for 65535; the EXIF lens
+  name covers the rest.
+- Enciphered Sony blocks (shutter count lives in 0x9050) are skipped;
+  ExifTool's substitution cipher is documented and a candidate.
+- AVIF, JPEG XL, JPEG XR, EXR and Radiance HDR sources get no
+  metadata yet (no EXIF block extraction for those containers).
+- The develop canvas draws raws and images in stored orientation;
+  only thumbnails and exports rotate. Pre-existing; a candidate for
+  the crop/straighten tool since both touch the same geometry.
 
 ## Milestones
 

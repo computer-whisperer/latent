@@ -225,8 +225,13 @@ fn parse_floats(s: &str) -> Result<Vec<f32>> {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Print what the decoder learned about a raw file.
-    Inspect { file: PathBuf },
+    /// Print what the decoder learned about a raw or image file.
+    Inspect {
+        file: PathBuf,
+        /// Also list every metadata field (EXIF, GPS, makernote).
+        #[arg(long)]
+        all: bool,
+    },
     /// Develop raw files. One input with -o, or any number with --out-dir.
     Develop {
         files: Vec<PathBuf>,
@@ -274,7 +279,7 @@ fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     match Cli::parse().cmd {
-        Cmd::Inspect { file } => inspect(&file),
+        Cmd::Inspect { file, all } => inspect(&file, all),
         Cmd::Develop {
             files,
             out,
@@ -317,47 +322,50 @@ fn main() -> Result<()> {
     }
 }
 
-fn inspect(file: &Path) -> Result<()> {
+fn inspect(file: &Path, all: bool) -> Result<()> {
     let t = Instant::now();
     let source = Source::load(file)?;
     println!("{}  ({:.2?})", file.display(), t.elapsed());
+    let e = source.exif();
+    if !e.make.is_empty() || !e.model.is_empty() {
+        println!("camera       {} {}", e.make, e.model);
+    }
+    if let Some(l) = &e.lens {
+        println!("lens         {l}");
+    }
+    let exp = e
+        .exposure_time
+        .map(|(n, d)| format!("{n}/{d} s"))
+        .unwrap_or_default();
+    let fnum = e.f_number.map(|v| format!("f/{v:.1}")).unwrap_or_default();
+    let iso = e.iso.map(|v| format!("ISO {v}")).unwrap_or_default();
+    let fl = e
+        .focal_length_mm
+        .map(|v| format!("{v:.0} mm"))
+        .unwrap_or_default();
+    if !(exp.is_empty() && fnum.is_empty() && iso.is_empty() && fl.is_empty()) {
+        println!("exposure     {exp}  {fnum}  {iso}  {fl}");
+    }
+    if let Some(d) = &e.date_time_original {
+        println!("taken        {d}");
+    }
     let f = match &source {
         Source::Raw(f) => f,
         Source::Image(i) => {
             println!("image        {} x {}  {}", i.width, i.height, i.encoding);
+            println!("orientation  {:?}", i.orientation);
             let (max, mean) = output::stats(&WorkingImage {
                 width: i.width,
                 height: i.height,
                 rgba: i.rgba.clone(),
             });
             println!("max rgb      {:?}  mean luminance {:.4}", max, mean);
+            if all {
+                print_metadata(&source);
+            }
             return Ok(());
         }
     };
-    println!("camera       {} {}", f.exif.make, f.exif.model);
-    if let Some(l) = &f.exif.lens {
-        println!("lens         {l}");
-    }
-    let exp = f
-        .exif
-        .exposure_time
-        .map(|(n, d)| format!("{n}/{d} s"))
-        .unwrap_or_default();
-    let fnum = f
-        .exif
-        .f_number
-        .map(|v| format!("f/{v:.1}"))
-        .unwrap_or_default();
-    let iso = f.exif.iso.map(|v| format!("ISO {v}")).unwrap_or_default();
-    let fl = f
-        .exif
-        .focal_length_mm
-        .map(|v| format!("{v:.0} mm"))
-        .unwrap_or_default();
-    println!("exposure     {exp}  {fnum}  {iso}  {fl}");
-    if let Some(d) = &f.exif.date_time_original {
-        println!("taken        {d}");
-    }
     println!("raster       {} x {}", f.width, f.height);
     println!(
         "crop         {} x {} at ({}, {})",
@@ -406,7 +414,24 @@ fn inspect(file: &Path) -> Result<()> {
     if side.exists() {
         println!("sidecar      {}", side.display());
     }
+    if all {
+        print_metadata(&source);
+    }
     Ok(())
+}
+
+fn print_metadata(source: &Source) {
+    let meta = source.metadata();
+    if meta.is_empty() {
+        println!("\nno metadata");
+        return;
+    }
+    for group in &meta.groups {
+        println!("\n[{}]", group.name);
+        for field in &group.fields {
+            println!("{:<32} {}", field.name, field.value);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

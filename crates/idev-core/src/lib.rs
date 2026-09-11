@@ -14,6 +14,7 @@
 
 pub mod color;
 pub mod gpu;
+pub mod metadata;
 pub mod output;
 pub mod params;
 pub mod sensor;

@@ -10,6 +10,8 @@ use rawler::imgop::xyz::Illuminant;
 use rawler::rawsource::RawSource;
 use rawler::{Orientation, RawImageData};
 
+use crate::metadata::Metadata;
+
 /// CFA color of one sensor site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CfaColor {
@@ -48,6 +50,21 @@ pub struct ExifSummary {
     pub date_time_original: Option<String>,
 }
 
+impl ExifSummary {
+    pub fn from_exif(exif: &rawler::exif::Exif, make: String, model: String) -> ExifSummary {
+        ExifSummary {
+            make,
+            model,
+            lens: exif.lens_model.clone(),
+            exposure_time: exif.exposure_time.map(|r| (r.n, r.d)),
+            f_number: exif.fnumber.map(|r| r.as_f32()),
+            iso: exif.iso_speed_ratings.map(u32::from),
+            focal_length_mm: exif.focal_length.map(|r| r.as_f32()),
+            date_time_original: exif.date_time_original.clone(),
+        }
+    }
+}
+
 /// One unpacked raw file: the Bayer plane and how to interpret it.
 #[derive(Debug, Clone)]
 pub struct SensorFrame {
@@ -68,6 +85,8 @@ pub struct SensorFrame {
     pub matrices: Vec<ColorMatrix>,
     pub orientation: Orientation,
     pub exif: ExifSummary,
+    /// Everything readable from the file's EXIF and makernote.
+    pub metadata: Metadata,
     /// The camera's lens correction tables, when the file carries them.
     pub lens: Option<LensCorrection>,
     /// Raw sensor values, `width * height`, row-major.
@@ -93,12 +112,13 @@ pub struct LensCorrection {
 }
 
 const TAG_VIGNETTING_PARAMS: u16 = 0x7032;
+/// EXIF GPSInfo IFD pointer; rawler parses it only when asked.
+const GPS_IFD_TAG: u16 = 0x8825;
 const TAG_CA_PARAMS: u16 = 0x7035;
 const TAG_DISTORTION_PARAMS: u16 = 0x7037;
 
 /// Read the correction tables, if the file has consistent ones.
-fn lens_correction(source: &RawSource) -> Option<LensCorrection> {
-    let tiff = GenericTiffReader::new(&mut source.reader(), 0, 0, None, &[]).ok()?;
+fn lens_correction(tiff: &GenericTiffReader) -> Option<LensCorrection> {
     let root = tiff.root_ifd();
     let ints = |tag: u16| -> Option<Vec<i32>> {
         let e = root.get_entry_recursive(tag)?;
@@ -207,7 +227,10 @@ pub fn unpack(path: &Path) -> Result<SensorFrame> {
     let meta = decoder
         .raw_metadata(&source, &params)
         .with_context(|| format!("metadata {}", path.display()))?;
-    let lens = lens_correction(&source);
+    let tiff = GenericTiffReader::new(&mut source.reader(), 0, 0, None, &[GPS_IFD_TAG])
+        .with_context(|| format!("tiff structure {}", path.display()))?;
+    let lens = lens_correction(&tiff);
+    let metadata = Metadata::from_tiff(&tiff, &mut source.reader());
 
     if raw.cpp != 1 {
         bail!(
@@ -308,16 +331,10 @@ pub fn unpack(path: &Path) -> Result<SensorFrame> {
         Some(o @ 1..=8) => Orientation::from_u16(o),
         _ => raw.orientation,
     };
-    let summary = ExifSummary {
-        make: raw.clean_make.clone(),
-        model: raw.clean_model.clone(),
-        lens: meta.lens.as_ref().map(|l| l.lens_name.clone()),
-        exposure_time: exif.exposure_time.map(|r| (r.n, r.d)),
-        f_number: exif.fnumber.map(|r| r.as_f32()),
-        iso: exif.iso_speed_ratings.map(u32::from),
-        focal_length_mm: exif.focal_length.map(|r| r.as_f32()),
-        date_time_original: exif.date_time_original.clone(),
-    };
+    let mut summary = ExifSummary::from_exif(exif, raw.clean_make.clone(), raw.clean_model.clone());
+    if let Some(l) = &meta.lens {
+        summary.lens = Some(l.lens_name.clone());
+    }
 
     Ok(SensorFrame {
         width: raw.width as u32,
@@ -330,6 +347,7 @@ pub fn unpack(path: &Path) -> Result<SensorFrame> {
         matrices,
         orientation,
         exif: summary,
+        metadata,
         lens,
         data,
     })

@@ -13,6 +13,7 @@ use rawler::Orientation;
 use crate::color::{
     Gamut, Mat3, XYZ_FROM_BT2020, apply, invert, mul, pq_eotf, xyz_from_chromaticities,
 };
+use crate::metadata::{self, Metadata};
 use crate::sensor::{self, ExifSummary, SensorFrame};
 
 /// Camera raws the pipeline unpacks with rawler.
@@ -43,16 +44,21 @@ pub fn is_supported(path: &Path) -> bool {
 pub struct ImageSource {
     pub width: u32,
     pub height: u32,
-    /// Linear BT.2020 RGBA f16, alpha 1, in viewing orientation.
+    /// Linear BT.2020 RGBA f16, alpha 1, as stored (see `orientation`).
     pub rgba: Vec<f16>,
     /// The source encoding, for the UI ("PQ BT.2020 16-bit").
     pub encoding: String,
+    /// From the embedded EXIF; `Normal` when there is none.
+    pub orientation: Orientation,
+    pub exif: ExifSummary,
+    pub metadata: Metadata,
 }
 
 pub enum Source {
-    /// Boxed: a frame is a few hundred bytes of tables beside its data.
+    /// Both boxed: each carries a few hundred bytes of tables and
+    /// metadata beside its pixel data.
     Raw(Box<SensorFrame>),
-    Image(ImageSource),
+    Image(Box<ImageSource>),
 }
 
 impl Source {
@@ -62,7 +68,17 @@ impl Source {
         }
         let decoded =
             decode::load_straight(path).with_context(|| format!("decode {}", path.display()))?;
-        Ok(Source::Image(ImageSource::from_decoded(&decoded)))
+        let mut image = ImageSource::from_decoded(&decoded);
+        match metadata::from_image_file(path) {
+            Ok(Some(embedded)) => {
+                image.orientation = embedded.orientation;
+                image.exif = embedded.summary;
+                image.metadata = embedded.metadata;
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("{}: EXIF ignored: {e:#}", path.display()),
+        }
+        Ok(Source::Image(Box::new(image)))
     }
 
     /// Size of the developed image before orientation.
@@ -76,14 +92,21 @@ impl Source {
     pub fn orientation(&self) -> Orientation {
         match self {
             Source::Raw(f) => f.orientation,
-            Source::Image(_) => Orientation::Normal,
+            Source::Image(i) => i.orientation,
         }
     }
 
-    pub fn exif(&self) -> Option<&ExifSummary> {
+    pub fn exif(&self) -> &ExifSummary {
         match self {
-            Source::Raw(f) => Some(&f.exif),
-            Source::Image(_) => None,
+            Source::Raw(f) => &f.exif,
+            Source::Image(i) => &i.exif,
+        }
+    }
+
+    pub fn metadata(&self) -> &Metadata {
+        match self {
+            Source::Raw(f) => &f.metadata,
+            Source::Image(i) => &i.metadata,
         }
     }
 
@@ -170,6 +193,9 @@ impl ImageSource {
             height: img.height,
             rgba,
             encoding: format!("{tf} · {primaries} · {container}"),
+            orientation: Orientation::Normal,
+            exif: ExifSummary::default(),
+            metadata: Metadata::default(),
         }
     }
 }

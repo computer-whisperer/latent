@@ -335,6 +335,8 @@ pub struct IdevApp {
     sdr_preview: bool,
     /// Zebra overlay over pixels the panel cannot show.
     warn: bool,
+    /// Sidebar shows the file's metadata instead of the controls.
+    info: bool,
 
     // Read during build (immutable), consumed in before_paint.
     last_zoom: Cell<f32>,
@@ -413,6 +415,7 @@ impl IdevApp {
             exports_running: 0,
             sdr_preview: false,
             warn: false,
+            info: false,
             last_zoom: Cell::new(0.1),
             scale_factor: Cell::new(1.0),
             display_peak: Cell::new(1.0),
@@ -763,6 +766,13 @@ impl IdevApp {
         .key("color-mode")
     }
 
+    fn info_button(&self) -> El {
+        let b = button("Info")
+            .key("info")
+            .tooltip("show the file's metadata in the sidebar; i");
+        if self.info { b } else { b.ghost() }
+    }
+
     fn warn_button(&self) -> El {
         let b = button("Warn").key("warn").tooltip(
             "zebra pixels at the output peak (red) or outside the panel's gamut (cyan); w",
@@ -887,7 +897,39 @@ impl IdevApp {
         ])
     }
 
+    /// The sidebar in info mode: every metadata group as name/value rows.
+    fn metadata_panel(&self, s: &Session) -> El {
+        let mut sections: Vec<El> = Vec::new();
+        match &s.frame {
+            None => sections.push(sidebar_group([text("loading…").muted()])),
+            Some(f) if f.metadata().is_empty() => {
+                sections.push(sidebar_group([text("no metadata").muted()]))
+            }
+            Some(f) => {
+                for group in &f.metadata().groups {
+                    let mut rows: Vec<El> = vec![sidebar_group_label(group.name)];
+                    for field in &group.fields {
+                        rows.push(
+                            row([
+                                text(field.name.clone()).caption().muted(),
+                                spacer(),
+                                text(field.value.clone()).caption(),
+                            ])
+                            .gap(tokens::SPACE_3),
+                        );
+                    }
+                    sections.push(sidebar_group(rows));
+                }
+            }
+        }
+        sidebar([scroll([column(sections).gap(tokens::SPACE_4)]).scrollbar()])
+            .width(Size::Fixed(SIDEBAR_WIDTH))
+    }
+
     fn control_panel(&self, s: &Session) -> El {
+        if self.info {
+            return self.metadata_panel(s);
+        }
         let tone_kind = match s.params.tone {
             ToneCurve::None => "none",
             ToneCurve::Sigmoid { .. } => "sigmoid",
@@ -908,22 +950,24 @@ impl IdevApp {
 
         let mut info: Vec<El> = Vec::new();
         if let Some(f) = &s.frame {
-            match f.as_ref() {
-                Source::Raw(f) => {
-                    let e = &f.exif;
-                    info.push(text(format!("{} {}", e.make, e.model)).caption().muted());
-                    if let Some(l) = &e.lens {
-                        info.push(text(l.clone()).caption().muted());
-                    }
-                    let exp = e
-                        .exposure_time
-                        .map(|(n, d)| format!("{n}/{d} s"))
-                        .unwrap_or_default();
-                    let fnum = e.f_number.map(|v| format!("f/{v:.1}")).unwrap_or_default();
-                    let iso = e.iso.map(|v| format!("ISO {v}")).unwrap_or_default();
-                    info.push(text(format!("{exp}  {fnum}  {iso}")).caption().muted());
-                }
-                Source::Image(i) => info.push(text(i.encoding.clone()).caption().muted()),
+            if let Source::Image(i) = f.as_ref() {
+                info.push(text(i.encoding.clone()).caption().muted());
+            }
+            let e = f.exif();
+            if !e.make.is_empty() || !e.model.is_empty() {
+                info.push(text(format!("{} {}", e.make, e.model)).caption().muted());
+            }
+            if let Some(l) = &e.lens {
+                info.push(text(l.clone()).caption().muted());
+            }
+            let exp = e
+                .exposure_time
+                .map(|(n, d)| format!("{n}/{d} s"))
+                .unwrap_or_default();
+            let fnum = e.f_number.map(|v| format!("f/{v:.1}")).unwrap_or_default();
+            let iso = e.iso.map(|v| format!("ISO {v}")).unwrap_or_default();
+            if !(exp.is_empty() && fnum.is_empty() && iso.is_empty()) {
+                info.push(text(format!("{exp}  {fnum}  {iso}")).caption().muted());
             }
             let (w, h) = f.size();
             info.push(text(format!("{w} x {h}")).caption().muted());
@@ -1153,6 +1197,7 @@ impl IdevApp {
                 text(readout).muted().tabular_numerals(),
                 button("Fit").key("fit").ghost(),
                 button("1:1").key("one").ghost(),
+                self.info_button(),
                 self.warn_button(),
                 self.color_mode_badge(),
             ])
@@ -1182,6 +1227,11 @@ impl IdevApp {
         }
         if event.is_click_or_activate("warn") || event.is_hotkey("warn") {
             self.warn = !self.warn;
+            wake(&self.wakeup);
+            return;
+        }
+        if event.is_click_or_activate("info") || event.is_hotkey("info") {
+            self.info = !self.info;
             wake(&self.wakeup);
             return;
         }
@@ -1450,6 +1500,7 @@ impl App for IdevApp {
                 (KeyChord::vim('1'), "one".into()),
                 (KeyChord::vim('e'), "export-jpg".into()),
                 (KeyChord::vim('w'), "warn".into()),
+                (KeyChord::vim('i'), "info".into()),
             ]),
         }
         keys

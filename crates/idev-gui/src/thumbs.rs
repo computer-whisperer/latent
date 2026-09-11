@@ -32,7 +32,8 @@ pub const THUMB_EDGE: u32 = 512;
 
 /// Bumped whenever the entry encoding or the rendering changes; part of
 /// the key, so old entries age out through the sweep.
-const FORMAT_VERSION: u32 = 1;
+// 2: rendered images honour their EXIF orientation.
+const FORMAT_VERSION: u32 = 2;
 const MAGIC: [u8; 4] = *b"IDTH";
 const HEADER_LEN: usize = 4 + 4 + 4 + 4 + 1;
 const MAX_DIM: u32 = 16_384;

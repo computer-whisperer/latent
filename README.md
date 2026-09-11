@@ -6,6 +6,7 @@ damascene GUI. `DESIGN.md` is the plan and the decision record.
 
 ```
 idev inspect DSC00039.ARW                                 # raws and rendered images alike
+idev inspect DSC00039.ARW --all                           # plus every EXIF, GPS and Sony makernote field
 idev develop DSC00039.ARW -o out.jpg                      # sRGB JPEG, sidecar params if present
 idev develop DSC00039.ARW -o out.png --hdr 1000           # BT.2020 PQ 16-bit PNG for a 1000-nit master
 idev develop DSC00039.ARW -o out.avif --hdr 1000          # BT.2020 PQ 10-bit AVIF (pure-Rust rav1e; slow)
@@ -38,13 +39,16 @@ buttons; the sidecar is written
 also step files in the develop view), Enter open, Esc back to the grid,
 `o` open another folder, `f` fit, `1` 1:1, `t` SDR preview, `w` zebra
 warning for pixels at the panel's peak (red) or outside its gamut
-(cyan), `e` export JPEG.
+(cyan), `i` metadata in the sidebar (every EXIF, GPS and Sony makernote
+field the file carries), `e` export JPEG.
 
 Crates:
 
 - `idev-core` — rawler unpack into a `SensorFrame`, achromat decode into
-  the working space (`Source`), color matrices, `DevelopParams`, the
-  wgpu compute pipeline, CPU output transforms.
+  the working space (`Source`), metadata readout (EXIF, GPS, Sony
+  makernote; also from the EXIF block of JPEG, PNG and WebP files),
+  color matrices, `DevelopParams`, the wgpu compute pipeline, CPU
+  output transforms.
 - `idev-formats` — encoders (EXR, PNG, JPEG, AVIF, PGM).
 - `idev-cli` — the `idev` binary.
 - `idev-gui` — the `idev-gui` window: library grid, thumbnail cache,
