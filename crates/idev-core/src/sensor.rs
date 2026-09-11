@@ -4,6 +4,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use rawler::decoders::RawDecodeParams;
+use rawler::formats::tiff::GenericTiffReader;
+use rawler::formats::tiff::reader::TiffReader;
 use rawler::imgop::xyz::Illuminant;
 use rawler::rawsource::RawSource;
 use rawler::{Orientation, RawImageData};
@@ -66,8 +68,85 @@ pub struct SensorFrame {
     pub matrices: Vec<ColorMatrix>,
     pub orientation: Orientation,
     pub exif: ExifSummary,
+    /// The camera's lens correction tables, when the file carries them.
+    pub lens: Option<LensCorrection>,
     /// Raw sensor values, `width * height`, row-major.
     pub data: Vec<u16>,
+}
+
+/// Sony's in-body lens correction tables (raw SubIFD tags 0x7037,
+/// 0x7035, 0x7032), decoded the way RawTherapee's `lensmetadata.cc`
+/// does: `nc` knots at normalised radii `(i + 0.5) / (nc - 1)`, where
+/// 1.0 is the half-diagonal of the image, linear between knots and
+/// clamped outside.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LensCorrection {
+    pub knots: Vec<f32>,
+    /// Source radius over output radius (distortion).
+    pub distortion: Vec<f32>,
+    /// Additional radius factor for red and blue (lateral chromatic
+    /// aberration).
+    pub ca_red: Vec<f32>,
+    pub ca_blue: Vec<f32>,
+    /// Gain that flattens the vignetting.
+    pub vignetting: Vec<f32>,
+}
+
+const TAG_VIGNETTING_PARAMS: u16 = 0x7032;
+const TAG_CA_PARAMS: u16 = 0x7035;
+const TAG_DISTORTION_PARAMS: u16 = 0x7037;
+
+/// Read the correction tables, if the file has consistent ones.
+fn lens_correction(source: &RawSource) -> Option<LensCorrection> {
+    let tiff = GenericTiffReader::new(&mut source.reader(), 0, 0, None, &[]).ok()?;
+    let root = tiff.root_ifd();
+    let ints = |tag: u16| -> Option<Vec<i32>> {
+        let e = root.get_entry_recursive(tag)?;
+        (0..e.value.count())
+            .map(|i| e.value.get_i32(i).ok().flatten())
+            .collect()
+    };
+    let dist = ints(TAG_DISTORTION_PARAMS)?;
+    let ca = ints(TAG_CA_PARAMS)?;
+    let vig = ints(TAG_VIGNETTING_PARAMS)?;
+    let nc = *dist.first()? as usize;
+    if !(2..=16).contains(&nc)
+        || ca.first().copied() != Some(2 * nc as i32)
+        || vig.first().copied() != Some(nc as i32)
+        || dist.len() < 1 + nc
+        || ca.len() < 1 + 2 * nc
+        || vig.len() < 1 + nc
+    {
+        tracing::warn!(
+            ?dist,
+            ?ca,
+            ?vig,
+            "inconsistent lens correction tables, ignoring"
+        );
+        return None;
+    }
+    let knots = (0..nc)
+        .map(|i| (i as f32 + 0.5) / (nc as f32 - 1.0))
+        .collect();
+    Some(LensCorrection {
+        knots,
+        distortion: dist[1..=nc]
+            .iter()
+            .map(|&v| v as f32 * 2f32.powi(-14) + 1.0)
+            .collect(),
+        ca_red: ca[1..=nc]
+            .iter()
+            .map(|&v| v as f32 * 2f32.powi(-21) + 1.0)
+            .collect(),
+        ca_blue: ca[1 + nc..=2 * nc]
+            .iter()
+            .map(|&v| v as f32 * 2f32.powi(-21) + 1.0)
+            .collect(),
+        vignetting: vig[1..=nc]
+            .iter()
+            .map(|&v| 1.0 / 2f32.powf(0.5 - 2f32.powf(v as f32 * 2f32.powi(-13) - 1.0)))
+            .collect(),
+    })
 }
 
 impl SensorFrame {
@@ -128,6 +207,7 @@ pub fn unpack(path: &Path) -> Result<SensorFrame> {
     let meta = decoder
         .raw_metadata(&source, &params)
         .with_context(|| format!("metadata {}", path.display()))?;
+    let lens = lens_correction(&source);
 
     if raw.cpp != 1 {
         bail!(
@@ -250,6 +330,7 @@ pub fn unpack(path: &Path) -> Result<SensorFrame> {
         matrices,
         orientation,
         exif: summary,
+        lens,
         data,
     })
 }

@@ -102,6 +102,34 @@ pub fn sigmoid_constants(contrast: f32, white: f32, peak: f32) -> (f32, f32, f32
     (c, s.max(1e-6), white)
 }
 
+/// Which of the camera's lens correction tables to apply (no-ops when
+/// the file has none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LensParams {
+    pub distortion: bool,
+    pub chromatic_aberration: bool,
+    pub vignetting: bool,
+}
+
+impl Default for LensParams {
+    fn default() -> Self {
+        LensParams {
+            distortion: true,
+            chromatic_aberration: true,
+            vignetting: true,
+        }
+    }
+}
+
+impl LensParams {
+    pub const NONE: LensParams = LensParams {
+        distortion: false,
+        chromatic_aberration: false,
+        vignetting: false,
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DevelopParams {
@@ -113,6 +141,7 @@ pub struct DevelopParams {
     pub demosaic: Demosaic,
     pub highlights: Highlights,
     pub tone: ToneCurve,
+    pub lens: LensParams,
 }
 
 impl Default for DevelopParams {
@@ -124,6 +153,7 @@ impl Default for DevelopParams {
             demosaic: Demosaic::default(),
             highlights: Highlights::default(),
             tone: ToneCurve::default(),
+            lens: LensParams::default(),
         }
     }
 }

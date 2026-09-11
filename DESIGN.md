@@ -379,6 +379,71 @@ the first developed thumbnail. Not exercised by me: keyboard
 navigation, Escape back to the grid with the thumbnail requeue, the
 folder picker (no input injection on this desktop).
 
+## Milestone 4 arc (started 2026-09-11): polish
+
+Survey results that shape the order:
+
+- **Lens corrections.** Every a6700 ARW carries Sony's in-body tables
+  in the raw SubIFD: `0x7037` DistortionCorrParams, `0x7035`
+  ChromaticAberrationCorrParams, `0x7032` VignettingCorrParams. First
+  value is the knot count `nc` (11 on the FE 50 F1.8; CA carries `2nc`
+  values, red then blue). RawTherapee's `lensmetadata.cc` decodes them:
+  knots at normalised radius `(i + 0.5) / (nc − 1)` with 1.0 at the
+  half-diagonal, linear between; distortion factor `v·2⁻¹⁴ + 1`
+  (source radius over output radius), CA factor `v·2⁻²¹ + 1` per
+  channel, vignetting gain `1 / 2^(0.5 − 2^(v·2⁻¹³ − 1))`. On the
+  sample frames: −0.26 % radius at the corner, CA ±1 px, up to +7 %
+  gain at f/3.2. Applied in the colour pass: per-output-pixel source
+  coordinate per channel (bilinear at scale 1, block average at
+  preview scales), vignetting gain after highlight reconstruction so
+  clip detection stays on the sensor's levels. `DevelopParams.lens`
+  holds three booleans, default on (old sidecars pick them up).
+  Validation: the checkerboard frames against the camera JPEG, which
+  has the same corrections applied.
+- **Export formats.** `ravif` 0.13 encodes AVIF from 8-bit input only
+  (10-bit internally), so SDR AVIF is a few lines; HDR AVIF (10-bit PQ
+  BT.2020 with cICP) needs `rav1e` + `avif-serialize` directly.
+  `jpegxl-rs` 0.15 binds the system libjxl 0.12 and takes f32 input;
+  its colour-encoding surface needs checking for PQ/BT.2020.
+- **Soft-proof.** prism-ipc has `Request::Lut3d { output }` (the
+  effective 33³ calibration LUT: panel *command* per PQ-shaped
+  BT.2020 input, domain nits or drive) and `Request::GamutMesh` (the
+  measured reachable-colour boundary). A soft-proof against the LUT is
+  therefore a gamut/peak warning: where the command saturates, the
+  panel cannot show the colour. Semantics to agree with the user
+  before building.
+- **Gallery.** damascene-gallery views JXR/JXL/AVIF/EXR/PNG through
+  achromat; idev's library only lists raws. Retiring it needs a
+  non-raw path in the library (achromat decode → thumbnail → viewer).
+  Proposal: keep it until then.
+
+Order: lens corrections first (this chunk), then the format and
+soft-proof questions go back to the user.
+
+## Lens correction results (2026-09-11)
+
+- Uncorrected renders are byte-identical to before the sampling
+  rewrite (the identity path samples exactly); develop time unchanged
+  at ~106 ms full-resolution.
+- **Vignetting confirmed** against the camera JPEG of DSC00049 (the
+  camera applies shading compensation; tag 0x7031 = 272): after
+  matching tone curves on the centre, the JPEG's corners sit 4–5 %
+  above the uncorrected render and within 1–3 % of the corrected one;
+  the table predicts ×1.045 at that radius.
+- **Distortion not validated**: every card frame was shot with the
+  camera's distortion compensation off (tag 0x7036 = 0), so the JPEGs
+  match the uncorrected geometry to 0.00 px in all corners. Our
+  correction moves the corners 6 px inward on the FE 50 F1.8, per
+  RawTherapee's decoding. Needs a frame shot with "Distortion Comp."
+  on, or a straight-edge subject at the frame edge.
+- **CA not validated**: the shift is ~1 px, and every measurement on
+  demosaiced output is blind to it (colour-difference demosaicing
+  aligns R/B fine structure to G; phase correlation on the mosaic
+  planes is unreliable). Visual check at ISO 2500 was inconclusive.
+  Needs a low-ISO frame with a high-contrast edge near a corner,
+  toggled at 1:1 in the GUI.
+- GUI: a "Lens" sidebar group with three switches; not exercised.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

@@ -24,7 +24,7 @@ use damascene_core::surface::{AppTexture, SurfaceAlpha};
 use damascene_core::toast::ToastSpec;
 use damascene_core::viewport::{FitPolicy, ViewportBehavior, ViewportRequest};
 use damascene_core::widgets::number_scrubber::{self, ScrubDrag, ScrubberOpts};
-use damascene_core::widgets::tabs;
+use damascene_core::widgets::{switch, tabs};
 use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent, UiEventKind};
 use damascene_winit_wgpu::{Wakeup, WinitWgpuApp};
 use idev_core::gpu::{
@@ -967,6 +967,7 @@ impl IdevApp {
                     ),
                 ),
             ]),
+            sidebar_group(lens_group(s)),
             sidebar_group([
                 sidebar_group_label("Export"),
                 row([
@@ -1267,6 +1268,13 @@ impl IdevApp {
         let Some(s) = self.session.as_mut() else {
             return;
         };
+        if switch::apply_event(&mut s.params.lens.distortion, event, "lens-distortion")
+            || switch::apply_event(&mut s.params.lens.chromatic_aberration, event, "lens-ca")
+            || switch::apply_event(&mut s.params.lens.vignetting, event, "lens-vignetting")
+        {
+            self.params_changed();
+            return;
+        }
         let mut tone_kind = String::new();
         if tabs::apply_event(&mut tone_kind, event, "tone", |s| Some(s.to_string())) {
             s.params.tone = match tone_kind.as_str() {
@@ -1531,6 +1539,32 @@ impl WinitWgpuApp for IdevApp {
             wake(&self.wakeup);
         }
     }
+}
+
+/// The lens sidebar group: three switches, or a note when the file has
+/// no correction tables.
+fn lens_group(s: &Session) -> Vec<El> {
+    let mut items = vec![sidebar_group_label("Lens")];
+    match s.frame.as_ref().map(|f| f.lens.is_some()) {
+        Some(true) => {
+            let l = s.params.lens;
+            items.push(field_row(
+                "Distortion",
+                switch("lens-distortion", l.distortion),
+            ));
+            items.push(field_row(
+                "Chromatic aberration",
+                switch("lens-ca", l.chromatic_aberration),
+            ));
+            items.push(field_row(
+                "Vignetting",
+                switch("lens-vignetting", l.vignetting),
+            ));
+        }
+        Some(false) => items.push(text("no correction tables in this file").caption().muted()),
+        None => items.push(skeleton()),
+    }
+    items
 }
 
 /// Develop at full resolution on a private device and encode.

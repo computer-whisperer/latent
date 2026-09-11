@@ -1,8 +1,11 @@
 // Colour pass: camera RGB (white balanced, unclamped) -> output space.
-// Optional integer downscale (box average in camera-space linear light),
-// highlight handling, camera matrix (Bradford-adapted to D65), exposure,
-// tone curve, then the display primaries matrix (identity for exports,
-// BT.2020 -> sRGB for the damascene preview).
+// Each output pixel samples the camera RGB at its lens-corrected source
+// coordinate per channel (distortion, lateral CA): bilinear at scale 1,
+// a scale x scale box average in camera-space linear light otherwise.
+// Then highlight handling, the vignetting gain, camera matrix
+// (Bradford-adapted to D65), exposure, tone curve, and the display
+// primaries matrix (identity for exports, BT.2020 -> sRGB for the
+// damascene preview).
 
 struct Uniforms {
     width: u32,            // output size
@@ -27,6 +30,18 @@ struct Uniforms {
     tone: vec4<f32>,
     // sigmoid s, white, 1 / F(white), pad
     tone2: vec4<f32>,
+    // distortion, chromatic aberration, vignetting flags; knot count
+    lens: vec4<u32>,
+    // centre x, y (camera RGB pixels), 1 / half-diagonal, pad
+    centre: vec4<f32>,
+    // Correction tables over normalised radius: knot positions, then
+    // source/output radius (distortion), red and blue extra radius
+    // factors (CA), and gain (vignetting). Linear between knots.
+    knots: array<vec4<f32>, 4>,
+    dist: array<vec4<f32>, 4>,
+    ca_r: array<vec4<f32>, 4>,
+    ca_b: array<vec4<f32>, 4>,
+    vig: array<vec4<f32>, 4>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -43,29 +58,94 @@ fn sigmoid(x: f32, contrast: f32, peak: f32) -> f32 {
     return min(peak * f * u.tone2.z, peak);
 }
 
+fn table(which: u32, i: u32) -> f32 {
+    let j = i / 4u;
+    let k = i % 4u;
+    switch which {
+        case 0u: { return u.knots[j][k]; }
+        case 1u: { return u.dist[j][k]; }
+        case 2u: { return u.ca_r[j][k]; }
+        case 3u: { return u.ca_b[j][k]; }
+        default: { return u.vig[j][k]; }
+    }
+}
+
+// Table `which` at normalised radius r: linear between knots, clamped.
+fn spline(which: u32, r: f32) -> f32 {
+    let nc = u.lens.w;
+    if r <= table(0u, 0u) {
+        return table(which, 0u);
+    }
+    for (var i = 1u; i < nc; i++) {
+        let x0 = table(0u, i - 1u);
+        let x1 = table(0u, i);
+        if r <= x1 {
+            let t = (r - x0) / max(x1 - x0, 1e-6);
+            return mix(table(which, i - 1u), table(which, i), t);
+        }
+    }
+    return table(which, nc - 1u);
+}
+
+fn load(p: vec2<i32>, ch: u32) -> f32 {
+    let size = vec2<i32>(i32(u.src_width), i32(u.src_height));
+    let q = clamp(p, vec2<i32>(0), size - 1);
+    return textureLoad(cam_rgb, q, 0)[ch];
+}
+
+// Channel `ch` of the camera RGB at source coordinate `src` (pixel
+// centres at +0.5): bilinear at scale 1, else the mean of the scale x
+// scale block centred there.
+fn sample(src: vec2<f32>, ch: u32) -> f32 {
+    if u.scale <= 1u {
+        let q = src - 0.5;
+        let q0 = floor(q);
+        let f = q - q0;
+        let a = vec2<i32>(q0);
+        let top = mix(load(a, ch), load(a + vec2<i32>(1, 0), ch), f.x);
+        let bottom = mix(load(a + vec2<i32>(0, 1), ch), load(a + vec2<i32>(1, 1), ch), f.x);
+        return mix(top, bottom, f.y);
+    }
+    let s = i32(u.scale);
+    let size = vec2<i32>(i32(u.src_width), i32(u.src_height));
+    let b = clamp(vec2<i32>(round(src - f32(s) * 0.5)), vec2<i32>(0), max(size - s, vec2<i32>(0)));
+    let e = min(b + s, size);
+    var acc = 0.0;
+    var n = 0.0;
+    for (var y = b.y; y < e.y; y++) {
+        for (var x = b.x; x < e.x; x++) {
+            acc += load(vec2<i32>(x, y), ch);
+            n += 1.0;
+        }
+    }
+    return acc / max(n, 1.0);
+}
+
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if gid.x >= u.width || gid.y >= u.height {
         return;
     }
     let p = vec2<i32>(i32(gid.x), i32(gid.y));
-    var v = vec3<f32>(0.0);
-    if u.scale <= 1u {
-        v = textureLoad(cam_rgb, p, 0).rgb;
-    } else {
-        let x0 = gid.x * u.scale;
-        let y0 = gid.y * u.scale;
-        let x1 = min(x0 + u.scale, u.src_width);
-        let y1 = min(y0 + u.scale, u.src_height);
-        var n = 0.0;
-        for (var y = y0; y < y1; y++) {
-            for (var x = x0; x < x1; x++) {
-                v += textureLoad(cam_rgb, vec2<i32>(i32(x), i32(y)), 0).rgb;
-                n += 1.0;
-            }
-        }
-        v /= max(n, 1.0);
+    // This output pixel's centre in camera RGB pixels, and its offset
+    // from the image centre.
+    let out_c = (vec2<f32>(gid.xy) + 0.5) * f32(u.scale);
+    let off = out_c - u.centre.xy;
+    let rout = u.centre.z * length(off);
+    var f = vec3<f32>(1.0);
+    if u.lens.x == 1u {
+        f *= spline(1u, rout);
     }
+    if u.lens.y == 1u {
+        f.r *= spline(2u, rout);
+        f.b *= spline(3u, rout);
+    }
+    // An identity factor samples the pixel exactly (bit-identical to
+    // no correction) rather than through the rounding of c + (o - c).
+    let src_r = select(u.centre.xy + f.r * off, out_c, f.r == 1.0);
+    let src_g = select(u.centre.xy + f.g * off, out_c, f.g == 1.0);
+    let src_b = select(u.centre.xy + f.b * off, out_c, f.b == 1.0);
+    var v = vec3<f32>(sample(src_r, 0u), sample(src_g, 1u), sample(src_b, 2u));
 
     if u.highlight_mode == 0u {
         v = min(v, vec3<f32>(1.0));
@@ -88,6 +168,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let f_mid = f.x + f.y + f.z - f_max - f_min;
         let y = dot(u.ylum_cam.xyz, lifted);
         v = mix(lifted, vec3<f32>(y), f_mid);
+    }
+    if u.lens.z == 1u {
+        v *= spline(4u, rout);
     }
 
     var w = vec3<f32>(dot(u.m0.xyz, v), dot(u.m1.xyz, v), dot(u.m2.xyz, v)) * u.tone.x;

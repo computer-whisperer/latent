@@ -23,7 +23,7 @@ use crate::color::{Mat3, XYZ_FROM_BT2020, srgb_from_bt2020};
 use crate::params::{
     DEFAULT_WHITE, Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sigmoid_constants,
 };
-use crate::sensor::SensorFrame;
+use crate::sensor::{LensCorrection, SensorFrame};
 use crate::whitepoint::{self, Temperature, xy_from_temperature};
 
 /// A device and queue the pipeline runs on.
@@ -191,6 +191,26 @@ struct ColourUniforms {
     d2: [f32; 4],
     tone: [f32; 4],
     tone2: [f32; 4],
+    /// distortion, chromatic aberration, vignetting flags; knot count
+    lens: [u32; 4],
+    /// centre x, y (camera RGB pixels), 1 / half-diagonal, pad
+    centre: [f32; 4],
+    knots: [[f32; 4]; 4],
+    dist: [[f32; 4]; 4],
+    ca_r: [[f32; 4]; 4],
+    ca_b: [[f32; 4]; 4],
+    vig: [[f32; 4]; 4],
+}
+
+/// Spread a correction table over the uniform's 16 slots, repeating
+/// the last value (the spline clamps beyond the last knot anyway).
+fn lens_table(values: &[f32]) -> [[f32; 4]; 4] {
+    let mut out = [[0.0f32; 4]; 4];
+    let last = values.last().copied().unwrap_or(1.0);
+    for i in 0..16 {
+        out[i / 4][i % 4] = values.get(i).copied().unwrap_or(last);
+    }
+    out
 }
 
 /// Primaries the colour pass writes.
@@ -213,6 +233,7 @@ pub struct Prepared {
     wb: [f32; 3],
     to_working: Mat3,
     ylum_cam: [f32; 3],
+    lens: Option<LensCorrection>,
     cam_rgb: Tex,
 }
 
@@ -620,6 +641,7 @@ impl Developer {
             wb,
             to_working,
             ylum_cam,
+            lens: frame.lens.clone(),
             cam_rgb,
         })
     }
@@ -667,6 +689,31 @@ impl Developer {
         };
         let row = |r: [f32; 3]| [r[0], r[1], r[2], 0.0];
         let m = &prepared.to_working;
+        let (cx, cy) = (prepared.width as f32 * 0.5, prepared.height as f32 * 0.5);
+        let rf = 1.0 / (cx * cx + cy * cy).sqrt();
+        let (lens_flags, knots, dist, ca_r, ca_b, vig) = match &prepared.lens {
+            Some(l) => (
+                [
+                    params.lens.distortion as u32,
+                    params.lens.chromatic_aberration as u32,
+                    params.lens.vignetting as u32,
+                    l.knots.len() as u32,
+                ],
+                lens_table(&l.knots),
+                lens_table(&l.distortion),
+                lens_table(&l.ca_red),
+                lens_table(&l.ca_blue),
+                lens_table(&l.vignetting),
+            ),
+            None => (
+                [0, 0, 0, 1],
+                lens_table(&[1.0]),
+                lens_table(&[1.0]),
+                lens_table(&[1.0]),
+                lens_table(&[1.0]),
+                lens_table(&[1.0]),
+            ),
+        };
         let colour_u = uniform_buffer(
             device,
             queue,
@@ -694,6 +741,13 @@ impl Developer {
                 d2: row(d[2]),
                 tone: [gain, contrast, target.peak, hue_preservation],
                 tone2: [sig_s, white, 1.0 / f_white, 0.0],
+                lens: lens_flags,
+                centre: [cx, cy, rf, 0.0],
+                knots,
+                dist,
+                ca_r,
+                ca_b,
+                vig,
             },
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

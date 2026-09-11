@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use idev_core::gpu::{Developer, Gpu, OutputTarget};
 use idev_core::params::{
-    Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sidecar_path,
+    Demosaic, DevelopParams, Highlights, LensParams, ToneCurve, WhiteBalance, sidecar_path,
 };
 use idev_core::sensor::SensorFrame;
 use idev_core::{WorkingImage, output, sensor};
@@ -44,6 +44,13 @@ impl Format {
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum LensArg {
+    /// Apply the camera's distortion, CA and vignetting tables.
+    All,
+    None,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -98,6 +105,9 @@ struct Overrides {
     /// output peak.
     #[arg(long)]
     white: Option<f32>,
+    /// Lens corrections from the camera's tables.
+    #[arg(long)]
+    lens: Option<LensArg>,
 }
 
 impl Overrides {
@@ -130,6 +140,12 @@ impl Overrides {
                     tint: *t,
                 },
                 _ => bail!("--temp expects \"K\" or \"K,tint\""),
+            };
+        }
+        if let Some(l) = self.lens {
+            p.lens = match l {
+                LensArg::All => LensParams::default(),
+                LensArg::None => LensParams::NONE,
             };
         }
         if let Some(d) = self.demosaic {
@@ -340,6 +356,20 @@ fn inspect(file: &Path) -> Result<()> {
         );
     }
     println!("orientation  {:?}", f.orientation);
+    match &f.lens {
+        Some(l) => {
+            let last = |v: &[f32]| v.last().copied().unwrap_or(1.0);
+            println!(
+                "lens corr    {} knots; corner: distortion {:.4}, CA r {:+.2} px b {:+.2} px, vignetting x{:.3}",
+                l.knots.len(),
+                last(&l.distortion),
+                (last(&l.ca_red) - 1.0) * (f.crop.width as f32).hypot(f.crop.height as f32) * 0.5,
+                (last(&l.ca_blue) - 1.0) * (f.crop.width as f32).hypot(f.crop.height as f32) * 0.5,
+                last(&l.vignetting)
+            );
+        }
+        None => println!("lens corr    none"),
+    }
     for m in &f.matrices {
         println!("xyz_to_cam   {:?}", m.illuminant);
         for row in m.xyz_to_cam {

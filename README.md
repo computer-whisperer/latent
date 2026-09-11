@@ -17,7 +17,9 @@ idev dump-bayer DSC00039.ARW -o raw.pgm                   # decoder cross-checks
 
 Build with `cargo build --release`; the binary is `target/release/idev`.
 Parameters live in `<raw>.idev.toml` beside each raw; flags override,
-`--save-params` writes back.
+`--save-params` writes back. The camera's lens correction tables
+(distortion, lateral CA, vignetting; Sony SubIFD tags) are applied by
+default; `--lens none` disables them and `inspect` reports them.
 
 GUI: `cargo run --release -p idev-gui -- DIR` opens a folder of raws as
 a thumbnail grid (`idev-gui FILE.ARW` opens straight into that file;
@@ -28,7 +30,8 @@ cached under `~/.cache/idev/thumbs`. Enter or a double click opens the
 develop view (damascene, HDR-aware on prism): pan/zoom preview, a
 per-channel histogram of the preview, scrubbers for exposure, contrast,
 hue preservation, white, temperature and tint, tabs for tone curve,
-highlights and demosaic, export buttons; the sidecar is written
+highlights and demosaic, switches for the lens corrections, export
+buttons; the sidecar is written
 (debounced) on every change. Keys: arrows or `hjkl` move (left/right
 also step files in the develop view), Enter open, Esc back to the grid,
 `o` open another folder, `f` fit, `1` 1:1, `t` SDR preview, `e` export
