@@ -214,6 +214,8 @@ struct ColourUniforms {
     geo_m: [f32; 4],
     /// view → sensor: tx, ty; crop origin x, y (view pixels)
     geo_t: [f32; 4],
+    /// dim outside this view rectangle: x, y, w, h (w = 0: off)
+    dim: [f32; 4],
 }
 
 /// Spread a correction table over the uniform's 16 slots, repeating
@@ -246,6 +248,9 @@ pub struct Render {
     /// Zebra-mark pixels at the target peak (red) and outside this
     /// gamut (cyan). A preview aid; never for exports.
     pub warn: Option<Gamut>,
+    /// Dim everything outside this rectangle (view pixels: x, y, w, h)
+    /// — the crop being drawn over the full frame. A preview aid.
+    pub dim_outside: Option<[f32; 4]>,
 }
 
 /// The expensive, parameter-stable half of a develop: the linearized
@@ -762,6 +767,7 @@ impl Developer {
             scale,
             display,
             warn,
+            dim_outside,
         } = render;
         let layout = Self::layout(prepared, params);
         let (out_w, out_h) = layout.scaled(scale);
@@ -862,6 +868,7 @@ impl Developer {
                     layout.m[1][1],
                 ],
                 geo_t: [layout.t[0], layout.t[1], layout.crop[0], layout.crop[1]],
+                dim: dim_outside.unwrap_or([0.0; 4]),
             },
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -987,6 +994,7 @@ impl Developer {
                 scale,
                 display: DisplayPrimaries::Bt2020,
                 warn: None,
+                dim_outside: None,
             },
             &working.view,
         );

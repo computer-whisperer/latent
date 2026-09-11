@@ -653,6 +653,49 @@ Not done: burst / sequence grouping (Sony SequenceNumber lives in the
 makernote, not in `ExifSummary`); persisting the sort/filter across
 folders; a date range syntax beyond prefix matching.
 
+## Processing arc, step 1: crop and straighten (2026-09-11)
+
+Design: EXIF orientation, the straighten angle and the crop are one
+affine map from output pixels to camera RGB pixels (`geometry.rs`),
+applied in the colour shader before the lens sampling, so the image is
+resampled exactly once and the CPU orientation step after the develop
+is gone (CLI, GUI export, developed thumbnails). Frames: sensor →
+oriented → view (turned about the centre, same size) → output (the
+crop). `Geometry { angle_deg, crop: Option<[x, y, w, h]> }` in the
+sidecar; `None` is the largest same-aspect rectangle inside the turned
+content, `k = min(W / (W cos θ + H sin θ), H / (W sin θ + H cos θ))`.
+Identity geometry maps each output pixel to exactly its own sensor
+coordinate, so the uncorrected render stays bit-identical.
+
+GUI: Geometry group with a Straighten scrubber, Crop toggle (`c`),
+aspect tabs (free, 3:2, 4:3, 1:1, 16:9) and Reset. Crop mode renders
+the full frame (crop forced to the whole view) with the colour pass
+dimming everything outside the real crop three stops
+(`Render::dim_outside`), and draws the outline as a stroked box in a
+`stack` over the surface; plain drag on the image sets the rectangle
+(anchor from `PointerDown`, `Drag` with the target rect for
+fractions), the viewport pans on middle-drag meanwhile.
+
+Verified: the geometry map agrees with `output::orient` for all eight
+orientations (unit test over every pixel of a 5×3 image); a sample raw
+with identity geometry produces a PNG with zero pixel difference to
+the pre-change export, and the portrait raw's JPEG pixels are
+identical to the CPU-oriented one; `--rotate 3` gives 5749×3832 with
+no empty corners, `--crop 0.25,0.25,0.5,0.5` 3096×2064; screenshots
+show the crop mode with the outline and the dimmed surround on a
+rotated frame.
+
+Found on the way: translucent fills composited over an app surface
+lighten instead of darken in damascene (tried a token scrim, a plain
+sRGB black with alpha and a linear black with alpha; an opaque fill
+composites correctly). Filed on the damascene repo; the shader
+dimming is the workaround.
+
+Not done: dragging the edges/corners of an existing crop (a drag
+always starts a new rectangle); a straighten guide (grid or a
+two-point horizon line); the crop is not clamped to the turned
+content, so a rectangle pulled past the edge shows black.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

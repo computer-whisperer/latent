@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use damascene_core::color::Primaries;
+use damascene_core::event::PointerButton;
 use damascene_core::prelude::*;
 use damascene_core::scroll::{self, ScrollAlignment, ScrollRequest};
 use damascene_core::surface::{AppTexture, SurfaceAlpha};
@@ -405,6 +406,15 @@ pub struct IdevApp {
     /// nothing is reported).
     panel_gamut: Cell<Gamut>,
 
+    // Crop / straighten.
+    /// Drawing the crop on the canvas: the full frame shows, plain
+    /// drag sets the rectangle, middle-drag pans.
+    crop_mode: bool,
+    crop_aspect: Aspect,
+    /// Anchor of the drag in progress, as view fractions.
+    crop_anchor: Option<(f32, f32)>,
+    angle: Scrub,
+
     // Control scratch state.
     exposure: Scrub,
     contrast: Scrub,
@@ -419,6 +429,55 @@ pub struct IdevApp {
 struct Scrub {
     text: String,
     drag: ScrubDrag,
+}
+
+/// Aspect lock for the crop rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Aspect {
+    Free,
+    R3x2,
+    R4x3,
+    R1x1,
+    R16x9,
+}
+
+impl Aspect {
+    const ALL: [Aspect; 5] = [
+        Aspect::Free,
+        Aspect::R3x2,
+        Aspect::R4x3,
+        Aspect::R1x1,
+        Aspect::R16x9,
+    ];
+
+    fn key(self) -> &'static str {
+        match self {
+            Aspect::Free => "free",
+            Aspect::R3x2 => "3:2",
+            Aspect::R4x3 => "4:3",
+            Aspect::R1x1 => "1:1",
+            Aspect::R16x9 => "16:9",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        self.key()
+    }
+
+    fn parse(s: &str) -> Option<Aspect> {
+        Aspect::ALL.into_iter().find(|a| a.key() == s)
+    }
+
+    /// Width over height, `None` for free.
+    fn ratio(self) -> Option<f32> {
+        match self {
+            Aspect::Free => None,
+            Aspect::R3x2 => Some(3.0 / 2.0),
+            Aspect::R4x3 => Some(4.0 / 3.0),
+            Aspect::R1x1 => Some(1.0),
+            Aspect::R16x9 => Some(16.0 / 9.0),
+        }
+    }
 }
 
 impl Scrub {
@@ -479,6 +538,10 @@ impl IdevApp {
             display_peak: Cell::new(1.0),
             hdr_output: Cell::new(false),
             panel_gamut: Cell::new(Gamut::Srgb),
+            crop_mode: false,
+            crop_aspect: Aspect::Free,
+            crop_anchor: None,
+            angle: Scrub::default(),
             exposure: Scrub::default(),
             contrast: Scrub::default(),
             hue: Scrub::default(),
@@ -641,6 +704,7 @@ impl IdevApp {
     /// as-shot white once it is known).
     fn seed_controls(&mut self) {
         let Some(s) = &self.session else { return };
+        self.angle.set(s.params.geometry.angle_deg, 2);
         self.exposure.set(s.params.exposure_ev, 2);
         let (c, h, w) = match s.params.tone {
             ToneCurve::Sigmoid {
@@ -1147,6 +1211,31 @@ impl IdevApp {
             ]));
             sections.push(sidebar_group(lens_group(s)));
         }
+        let crop_button = button("Crop")
+            .key("crop")
+            .tooltip("draw the crop on the image (drag; middle-drag pans); c");
+        sections.push(sidebar_group([
+            sidebar_group_label("Geometry"),
+            field_row("Straighten (°)", number_scrubber("angle", &self.angle.text)),
+            field_row(
+                "Crop",
+                row([
+                    if self.crop_mode {
+                        crop_button
+                    } else {
+                        crop_button.ghost()
+                    },
+                    button("Reset").key("crop-reset").ghost(),
+                ])
+                .gap(tokens::SPACE_2),
+            ),
+            tabs_list(
+                "aspect",
+                &self.crop_aspect.key(),
+                Aspect::ALL.map(|a| (a.key().to_string(), a.label().to_string())),
+            )
+            .width(Size::Fill(1.0)),
+        ]));
         sections.extend([
             sidebar_group([
                 sidebar_group_label("Export"),
@@ -1246,8 +1335,12 @@ impl IdevApp {
                 .justify(Justify::Center)
                 .fill_size();
         };
-        let layout = geometry::layout(frame.size(), frame.orientation(), &s.params.geometry);
-        let (w, h) = (layout.width as f32, layout.height as f32);
+        let shown = geometry::layout(
+            frame.size(),
+            frame.orientation(),
+            &self.preview_params(s).geometry,
+        );
+        let (w, h) = (shown.width as f32, shown.height as f32);
         let content = match self.gpu.as_ref().and_then(|g| g.preview.as_ref()) {
             Some(p) => surface(p.texture.clone())
                 .width(Size::Fixed(w))
@@ -1259,14 +1352,104 @@ impl IdevApp {
                 .height(Size::Fixed(h))
                 .fill(tokens::MUTED),
         };
+        let content = content.key("image");
+        let content = if self.crop_mode {
+            // The crop outline over the full frame, in content pixels.
+            // The dimming outside it is done by the colour pass
+            // (`Render::dim_outside`): translucent fills over an app
+            // surface do not composite darker in damascene 0.8.
+            let real = geometry::layout(frame.size(), frame.orientation(), &s.params.geometry);
+            let [cx, cy, cw, ch] = real.crop;
+            let gap = || column(Vec::<El>::new());
+            let overlay = column([
+                gap().width(Size::Fill(1.0)).height(Size::Fixed(cy)),
+                row([
+                    gap().width(Size::Fixed(cx)).height(Size::Fill(1.0)),
+                    gap()
+                        .width(Size::Fixed(cw))
+                        .height(Size::Fill(1.0))
+                        .stroke(tokens::PRIMARY)
+                        .stroke_width(2.0),
+                    gap().width(Size::Fill(1.0)).height(Size::Fill(1.0)),
+                ])
+                .height(Size::Fixed(ch)),
+                gap().width(Size::Fill(1.0)).height(Size::Fill(1.0)),
+            ])
+            .width(Size::Fixed(w))
+            .height(Size::Fixed(h));
+            stack([content, overlay])
+                .width(Size::Fixed(w))
+                .height(Size::Fixed(h))
+        } else {
+            content
+        };
+        let pan = if self.crop_mode {
+            PointerButton::Middle
+        } else {
+            PointerButton::Primary
+        };
         viewport([content])
             .key("canvas")
             .fit_policy(FitPolicy::Contain {
                 padding: FIT_PADDING,
             })
+            .pan_button(pan)
             .min_zoom(0.02)
             .max_zoom(8.0)
             .fill(tokens::CARD)
+    }
+
+    /// The parameters the preview renders with: in crop mode the whole
+    /// straightened frame, so the crop can be drawn over it.
+    fn preview_params(&self, s: &Session) -> DevelopParams {
+        let mut p = s.params.clone();
+        if self.crop_mode {
+            p.geometry.crop = Some([0.0, 0.0, 1.0, 1.0]);
+        }
+        p
+    }
+
+    /// A pointer position as fractions of the image node's rect.
+    fn image_fraction(event: &UiEvent) -> Option<(f32, f32)> {
+        let (px, py) = event.pointer?;
+        let r = event.target.as_ref()?.rect;
+        if r.w <= 0.0 || r.h <= 0.0 {
+            return None;
+        }
+        Some((
+            ((px - r.x) / r.w).clamp(0.0, 1.0),
+            ((py - r.y) / r.h).clamp(0.0, 1.0),
+        ))
+    }
+
+    /// The crop rectangle from the drag anchor to `to`, honouring the
+    /// aspect lock (in view pixels, so `view` matters).
+    fn crop_from_drag(&self, anchor: (f32, f32), to: (f32, f32), view: (u32, u32)) -> [f32; 4] {
+        let (vw, vh) = (view.0 as f32, view.1 as f32);
+        let mut w = (to.0 - anchor.0).abs().max(0.02);
+        let mut h = (to.1 - anchor.1).abs().max(0.02);
+        if let Some(r) = self.crop_aspect.ratio() {
+            // Keep the longer drag axis, derive the other from the ratio.
+            let h_for_w = w * vw / (r * vh);
+            if h_for_w <= h {
+                h = h_for_w;
+            } else {
+                w = h * vh * r / vw;
+            }
+        }
+        let x = if to.0 >= anchor.0 {
+            anchor.0
+        } else {
+            anchor.0 - w
+        };
+        let y = if to.1 >= anchor.1 {
+            anchor.1
+        } else {
+            anchor.1 - h
+        };
+        let x = x.clamp(0.0, 1.0 - w.min(1.0));
+        let y = y.clamp(0.0, 1.0 - h.min(1.0));
+        [x, y, w.min(1.0 - x), h.min(1.0 - y)]
     }
 
     fn develop(&self, cx: &BuildCx, s: &Session) -> El {
@@ -1366,6 +1549,91 @@ impl IdevApp {
         }
         if event.is_click_or_activate("reset") {
             self.reset_params();
+            return;
+        }
+        if event.is_click_or_activate("crop") || event.is_hotkey("crop") {
+            self.crop_mode = !self.crop_mode;
+            self.crop_anchor = None;
+            wake(&self.wakeup);
+            return;
+        }
+        if event.is_click_or_activate("crop-reset") {
+            if let Some(s) = self.session.as_mut() {
+                s.params.geometry = idev_core::params::Geometry::default();
+            }
+            self.seed_controls();
+            self.params_changed();
+            return;
+        }
+        let mut aspect = self.crop_aspect;
+        if tabs::apply_event(&mut aspect, event, "aspect", Aspect::parse) {
+            self.crop_aspect = aspect;
+            // Refit an existing crop to the new ratio about its centre.
+            if let Some(r) = aspect.ratio()
+                && let Some(s) = self.session.as_mut()
+                && let (Some(frame), Some([x, y, w, h])) = (&s.frame, s.params.geometry.crop)
+            {
+                let view = geometry::oriented_size(frame.size(), frame.orientation());
+                let (vw, vh) = (view.0 as f32, view.1 as f32);
+                let mut nw = w;
+                let mut nh = w * vw / (r * vh);
+                if nh > 1.0 {
+                    nh = 1.0;
+                    nw = nh * vh * r / vw;
+                }
+                let nx = (x + w * 0.5 - nw * 0.5).clamp(0.0, 1.0 - nw);
+                let ny = (y + h * 0.5 - nh * 0.5).clamp(0.0, 1.0 - nh);
+                s.params.geometry.crop = Some([nx, ny, nw, nh]);
+                self.params_changed();
+            }
+            wake(&self.wakeup);
+            return;
+        }
+        if self.crop_mode && event.is_route("image") {
+            match event.kind {
+                UiEventKind::PointerDown => {
+                    self.crop_anchor = Self::image_fraction(event);
+                    return;
+                }
+                UiEventKind::Drag => {
+                    if let (Some(anchor), Some(to)) =
+                        (self.crop_anchor, Self::image_fraction(event))
+                        && let Some(s) = self.session.as_mut()
+                        && let Some(frame) = &s.frame
+                    {
+                        let view = geometry::oriented_size(frame.size(), frame.orientation());
+                        let rect = self.crop_from_drag(anchor, to, view);
+                        if let Some(s) = self.session.as_mut() {
+                            s.params.geometry.crop = Some(rect);
+                        }
+                        self.params_changed();
+                    }
+                    return;
+                }
+                UiEventKind::PointerUp => {
+                    self.crop_anchor = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let angle = ScrubberOpts::default()
+            .min(-45.0)
+            .max(45.0)
+            .step(0.1)
+            .sensitivity(4.0)
+            .decimals(2);
+        if number_scrubber::apply_event(
+            &mut self.angle.text,
+            &mut self.angle.drag,
+            "angle",
+            &angle,
+            event,
+        ) {
+            if let (Some(v), Some(s)) = (self.angle.value(), self.session.as_mut()) {
+                s.params.geometry.angle_deg = v.clamp(-45.0, 45.0);
+                self.params_changed();
+            }
             return;
         }
         if event.is_click_or_activate("wb-as-shot") {
@@ -1640,6 +1908,7 @@ impl App for IdevApp {
                 (KeyChord::vim('e'), "export-jpg".into()),
                 (KeyChord::vim('w'), "warn".into()),
                 (KeyChord::vim('i'), "info".into()),
+                (KeyChord::vim('c'), "crop".into()),
             ]),
         }
         keys
@@ -1712,12 +1981,16 @@ impl WinitWgpuApp for IdevApp {
         let Some(frame) = s.frame.clone() else {
             return;
         };
-        let params = s.params.clone();
+        let params = self.preview_params(s);
+        let dim_outside = self
+            .crop_mode
+            .then(|| geometry::layout(frame.size(), frame.orientation(), &s.params.geometry).crop);
         let render = Render {
             target: OutputTarget { peak: self.peak() },
             scale: self.wanted_scale(),
             display: DisplayPrimaries::Srgb,
             warn: self.warn.then(|| self.panel_gamut.get()),
+            dim_outside,
         };
         let scale = render.scale;
         let Some(g) = self.gpu.as_mut() else { return };

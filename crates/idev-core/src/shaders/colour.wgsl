@@ -54,6 +54,8 @@ struct Uniforms {
     geo_m: vec4<f32>,
     // view -> sensor: tx, ty; crop origin x, y (view pixels)
     geo_t: vec4<f32>,
+    // dim outside this view rectangle: x, y, w, h (w = 0: off)
+    dim: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -226,6 +228,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    // Outside the crop being drawn: three stops down (linear light,
+    // so still legible on an HDR panel).
+    if u.dim.z > 0.0 && (any(view_c < u.dim.xy) || any(view_c > u.dim.xy + u.dim.zw)) {
+        w *= 0.12;
+    }
     let d = vec3<f32>(dot(u.d0.xyz, w), dot(u.d1.xyz, w), dot(u.d2.xyz, w));
     textureStore(out_tex, p, vec4<f32>(d, 1.0));
 }
