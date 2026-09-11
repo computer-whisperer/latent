@@ -10,9 +10,9 @@
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use damascene_core::prelude::*;
@@ -38,6 +38,71 @@ pub type SharedWakeup = Arc<Mutex<Option<Wakeup>>>;
 fn wake(w: &SharedWakeup) {
     if let Some(w) = w.lock().unwrap().as_ref() {
         w.wake();
+    }
+}
+
+/// Sidecar writes are coalesced: the writer thread waits this long after
+/// the last change before writing, so a slider drag produces one write,
+/// not hundreds. (The raw may live on a network mount where each write
+/// costs tens of milliseconds; doing that on the UI thread per drag
+/// event starved the Wayland socket and the compositor dropped us.)
+const SIDECAR_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Debounced, latest-wins sidecar writer on its own thread.
+struct SidecarWriter {
+    tx: Option<Sender<DevelopParams>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SidecarWriter {
+    fn spawn(path: PathBuf) -> SidecarWriter {
+        let (tx, rx) = channel::<DevelopParams>();
+        let thread = std::thread::Builder::new()
+            .name("idev-sidecar".into())
+            .spawn(move || {
+                while let Ok(mut latest) = rx.recv() {
+                    // Absorb further changes until the stream goes quiet.
+                    loop {
+                        match rx.recv_timeout(SIDECAR_DEBOUNCE) {
+                            Ok(p) => latest = p,
+                            Err(RecvTimeoutError::Timeout) => break,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                write(&path, &latest);
+                                return;
+                            }
+                        }
+                    }
+                    write(&path, &latest);
+                }
+            })
+            .expect("spawn sidecar writer");
+        fn write(path: &Path, params: &DevelopParams) {
+            if let Err(e) = params.save(path) {
+                tracing::warn!("sidecar: {e:#}");
+            }
+        }
+        SidecarWriter {
+            tx: Some(tx),
+            thread: Some(thread),
+        }
+    }
+
+    fn send(&self, params: &DevelopParams) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(params.clone());
+        }
+    }
+}
+
+impl Drop for SidecarWriter {
+    /// Closing the channel makes the thread write whatever is pending
+    /// and exit; joining it keeps the last change from being lost on
+    /// window close.
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
 
@@ -86,6 +151,7 @@ pub struct DevelopApp {
     load_rx: Receiver<Result<SensorFrame>>,
     load_error: Option<String>,
     params: DevelopParams,
+    sidecar: SidecarWriter,
     gpu: Option<GpuState>,
     wakeup: SharedWakeup,
     toasts: Vec<ToastSpec>,
@@ -146,9 +212,11 @@ impl DevelopApp {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let sidecar = SidecarWriter::spawn(sidecar_path(&path));
         let mut app = Self {
             path,
             name,
+            sidecar,
             frame: None,
             load_rx,
             load_error: None,
@@ -206,9 +274,7 @@ impl DevelopApp {
     }
 
     fn params_changed(&mut self) {
-        if let Err(e) = self.params.save(&sidecar_path(&self.path)) {
-            tracing::warn!("sidecar: {e:#}");
-        }
+        self.sidecar.send(&self.params);
         wake(&self.wakeup);
     }
 
