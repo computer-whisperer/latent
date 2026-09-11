@@ -19,9 +19,11 @@ use anyhow::{Context, Result};
 use rawler::Orientation;
 use rawler::formats::tiff::ifd::OffsetMode;
 use rawler::formats::tiff::reader::TiffReader;
-use rawler::formats::tiff::{GenericTiffReader, IFD, Value};
+use rawler::formats::tiff::writer::{DirectoryWriter, TiffWriter};
+use rawler::formats::tiff::{GenericTiffReader, IFD, TiffAscii, Value};
 use rawler::tags::{ExifGpsTag, ExifTag};
 
+use crate::params::DevelopParams;
 use crate::sensor::ExifSummary;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,9 +38,20 @@ pub struct Group {
     pub fields: Vec<Field>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Metadata {
     pub groups: Vec<Group>,
+    /// The parsed tags kept for re-export into developed files.
+    pub tags: Tags,
+}
+
+/// IFD0, Exif IFD and GPS IFD entries as parsed (structural and bulky
+/// tags left out), the input to [`exif_for_output`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tags {
+    pub ifd0: Vec<(u16, Value)>,
+    pub exif: Vec<(u16, Value)>,
+    pub gps: Vec<(u16, Value)>,
 }
 
 impl Metadata {
@@ -56,6 +69,21 @@ impl Metadata {
         });
 
         let mut out = Metadata::default();
+        let keep = |dir: Option<&IFD>| -> Vec<(u16, Value)> {
+            dir.map(|d| {
+                d.entries()
+                    .iter()
+                    .filter(|(tag, _)| !SKIP_STANDARD.contains(tag))
+                    .map(|(tag, e)| (*tag, e.value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+        };
+        out.tags = Tags {
+            ifd0: keep(Some(root)),
+            exif: keep(exif),
+            gps: keep(gps),
+        };
         let mut other = Vec::new();
         let dirs: Vec<&IFD> = [Some(root), exif].into_iter().flatten().collect();
         for group in STANDARD_GROUPS {
@@ -147,6 +175,102 @@ impl Metadata {
             self.groups.push(Group { name, fields });
         }
     }
+}
+
+/// What a developed file is, for the EXIF block written into it.
+pub struct Output<'a> {
+    pub width: u32,
+    pub height: u32,
+    /// sRGB output (`ColorSpace` 1); otherwise uncalibrated, the
+    /// container's own colour tags (cICP) describe it.
+    pub srgb: bool,
+    /// Free text for `UserComment`; see [`develop_note`].
+    pub note: &'a str,
+}
+
+/// IFD0 tags carried over as they are.
+const IFD0_KEPT: &[u16] = &[
+    0x010e, 0x010f, 0x0110, 0x011a, 0x011b, 0x0128, 0x0132, 0x013b, 0x8298,
+];
+/// Exif IFD tags not carried over: replaced by the output's own values,
+/// or specific to the source encoding.
+const EXIF_REPLACED: &[u16] = &[
+    0x9101, 0x9102, 0x9286, 0x927c, 0xa001, 0xa002, 0xa003, 0xa005,
+];
+
+/// The `UserComment` text for a developed file: what made it, from
+/// what, with which parameters (the sidecar TOML, so the render is
+/// reproducible from the output alone).
+pub fn develop_note(source_name: &str, params: &DevelopParams) -> String {
+    let toml = toml::to_string_pretty(params).unwrap_or_default();
+    format!(
+        "Developed by idev {} from {source_name}\n\n{toml}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// A TIFF-structured EXIF block for a developed file: the source's
+/// camera, exposure, lens, time and GPS tags, with orientation reset to
+/// normal (the pixels are rotated), the output's dimensions and colour
+/// space, and `Software` naming us. Fits a JPEG APP1 segment.
+pub fn exif_for_output(tags: &Tags, out: &Output) -> Result<Vec<u8>> {
+    let tiff_err = |e: rawler::formats::tiff::TiffError| anyhow::anyhow!("exif: {e}");
+    let mut tiff = TiffWriter::new(Cursor::new(Vec::new())).map_err(tiff_err)?;
+
+    let mut exif = DirectoryWriter::new();
+    for (tag, value) in &tags.exif {
+        if !EXIF_REPLACED.contains(tag) {
+            exif.add_untyped_tag(*tag, value.clone());
+        }
+    }
+    if !exif.contains(0x9000u16) {
+        exif.add_untyped_tag(0x9000, Value::Undefined(b"0232".to_vec()));
+    }
+    exif.add_untyped_tag(
+        0xa001,
+        Value::Short(vec![if out.srgb { 1 } else { 0xffff }]),
+    );
+    exif.add_untyped_tag(0xa002, Value::Long(vec![out.width]));
+    exif.add_untyped_tag(0xa003, Value::Long(vec![out.height]));
+    let mut comment = b"ASCII\0\0\0".to_vec();
+    comment.extend_from_slice(out.note.as_bytes());
+    exif.add_untyped_tag(0x9286, Value::Undefined(comment));
+    let exif_offset = exif.build(&mut tiff).map_err(tiff_err)?;
+
+    let gps_offset = if tags.gps.is_empty() {
+        None
+    } else {
+        let mut gps = DirectoryWriter::new();
+        for (tag, value) in &tags.gps {
+            gps.add_untyped_tag(*tag, value.clone());
+        }
+        Some(gps.build(&mut tiff).map_err(tiff_err)?)
+    };
+
+    let mut root = DirectoryWriter::new();
+    for (tag, value) in &tags.ifd0 {
+        if IFD0_KEPT.contains(tag) && (*tag != 0x010e || text(value).is_some()) {
+            root.add_untyped_tag(*tag, value.clone());
+        }
+    }
+    root.add_untyped_tag(0x0112, Value::Short(vec![1]));
+    root.add_untyped_tag(
+        0x0131,
+        Value::Ascii(TiffAscii::new(format!(
+            "idev {}",
+            env!("CARGO_PKG_VERSION")
+        ))),
+    );
+    root.add_untyped_tag(0x8769, Value::Long(vec![exif_offset]));
+    if let Some(offset) = gps_offset {
+        root.add_untyped_tag(0x8825, Value::Long(vec![offset]));
+    }
+    // `TiffWriter::build` consumes the writer; patch the IFD0 offset
+    // into the header (bytes 4..8, native order like the rest) by hand.
+    let root_offset = root.build(&mut tiff).map_err(tiff_err)?;
+    let mut bytes = tiff.writer.into_inner();
+    bytes[4..8].copy_from_slice(&root_offset.to_ne_bytes());
+    Ok(bytes)
 }
 
 /// What a rendered image's EXIF block yields.
@@ -361,6 +485,9 @@ enum Fmt {
     LensSpec,
     /// EXIF Flash bit field.
     Flash,
+    /// EXIF UserComment: an 8-byte charset code then text; multi-line
+    /// text is cut to its first line with a line count.
+    UserComment,
     /// Whatever the value is, compactly (unknown tags).
     Raw,
     // Sony makernote specifics.
@@ -471,6 +598,24 @@ impl Fmt {
                     parts.push("red-eye reduction");
                 }
                 parts.join(", ")
+            }
+            Fmt::UserComment => {
+                let d = v.get_data();
+                let body = match d.get(..8) {
+                    Some(b"ASCII\0\0\0") | Some(b"\0\0\0\0\0\0\0\0") => &d[8..],
+                    Some(b"UNICODE\0") => return None,
+                    _ => d,
+                };
+                let s = String::from_utf8_lossy(body);
+                let s = s.trim_end_matches('\0').trim();
+                if s.is_empty() {
+                    return None;
+                }
+                let lines = s.lines().count();
+                match s.lines().next() {
+                    Some(first) if lines > 1 => format!("{first} (+{} lines)", lines - 1),
+                    _ => s.to_string(),
+                }
             }
             Fmt::Raw => {
                 if let Some(s) = text(v) {
@@ -779,7 +924,7 @@ const STANDARD_GROUPS: &[GroupSpec] = &[
             spec(0x013b, "Artist", Fmt::Text),
             spec(0x8298, "Copyright", Fmt::Text),
             spec(0x010e, "Description", Fmt::Text),
-            spec(0x9286, "User comment", Fmt::Text),
+            spec(0x9286, "User comment", Fmt::UserComment),
         ],
     },
     GroupSpec {
@@ -1486,6 +1631,73 @@ mod tests {
             render(Fmt::SonyPixelShift, Value::Undefined(vec![0; 6])).as_deref(),
             Some("None")
         );
+    }
+
+    #[test]
+    fn output_block_round_trips() {
+        use rawler::formats::tiff::Rational;
+        let tags = Tags {
+            ifd0: vec![
+                (0x010f, Value::Ascii(TiffAscii::new("SONY"))),
+                (0x0112, Value::Short(vec![8])),
+                (0x010e, Value::Ascii(TiffAscii::new("   "))),
+                (0x0100, Value::Long(vec![6272])),
+            ],
+            exif: vec![
+                (0x829a, Value::Rational(vec![Rational::new(1, 80)])),
+                (0xa002, Value::Long(vec![6192])),
+                (0x927c, Value::Undefined(vec![1, 2, 3])),
+            ],
+            gps: vec![
+                (0x0001, Value::Ascii(TiffAscii::new("N"))),
+                (
+                    0x0002,
+                    Value::Rational(vec![
+                        Rational::new(28, 1),
+                        Rational::new(10, 1),
+                        Rational::new(2152, 100),
+                    ]),
+                ),
+            ],
+        };
+        let out = Output {
+            width: 3096,
+            height: 2064,
+            srgb: true,
+            note: "Developed by idev\nexposure = 0.5\n",
+        };
+        let block = exif_for_output(&tags, &out).unwrap();
+        assert!(block.len() < 65_000);
+
+        let mut cursor = Cursor::new(&block);
+        let tiff =
+            GenericTiffReader::new(&mut cursor, 0, 0, None, &[ExifTag::GPSInfo as u16]).unwrap();
+        let meta = Metadata::from_tiff(&tiff, &mut cursor);
+        assert_eq!(meta.get("Camera", "Make"), Some("SONY"));
+        assert_eq!(meta.get("Image", "Orientation"), Some("Normal"));
+        assert_eq!(meta.get("Image", "Width"), Some("3096"));
+        assert_eq!(meta.get("Image", "Height"), Some("2064"));
+        assert_eq!(meta.get("Image", "Colour space"), Some("sRGB"));
+        assert_eq!(meta.get("Exposure", "Exposure time"), Some("1/80 s"));
+        assert_eq!(meta.get("GPS", "Latitude"), Some("28.172644"));
+        assert!(meta.get("Camera", "Software").unwrap().starts_with("idev "));
+        assert!(meta.get("Camera", "Description").is_none());
+        assert_eq!(
+            meta.get("Camera", "User comment"),
+            Some("Developed by idev (+1 lines)")
+        );
+        let root = tiff.root_ifd();
+        assert!(
+            root.get_entry(0x0100u16).is_none(),
+            "ImageWidth must not be copied"
+        );
+        let exif = root.get_sub_ifd(ExifTag::ExifOffset).unwrap();
+        assert!(
+            exif.get_entry(0x927cu16).is_none(),
+            "MakerNote must not be copied"
+        );
+        let comment = exif.get_entry(0x9286u16).unwrap().value.get_data();
+        assert!(comment.starts_with(b"ASCII\0\0\0Developed by idev"));
     }
 
     #[test]

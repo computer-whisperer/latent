@@ -4,6 +4,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use idev_core::gpu::{Developer, Gpu, OutputTarget};
+use idev_core::metadata;
 use idev_core::params::{
     Demosaic, DevelopParams, Highlights, LensParams, ToneCurve, WhiteBalance, sidecar_path,
 };
@@ -542,7 +543,21 @@ fn develop_one(
     let img: WorkingImage = dev.develop(gpu, &source, &params, target)?;
     let t2 = Instant::now();
     let img = output::oriented(&img, source.orientation());
-    encode(&img, output_path, fmt, hdr, quality)?;
+    let name = input
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let note = metadata::develop_note(&name, &params);
+    let exif = metadata::exif_for_output(
+        &source.metadata().tags,
+        &metadata::Output {
+            width: img.width,
+            height: img.height,
+            srgb: hdr.is_none(),
+            note: &note,
+        },
+    )?;
+    encode(&img, output_path, fmt, hdr, quality, &exif)?;
     let t3 = Instant::now();
     if save_params {
         params.save(&sidecar_path(input))?;
@@ -560,26 +575,31 @@ fn develop_one(
     Ok(())
 }
 
+/// Encode with the EXIF block in every container that has a place for
+/// it (EXR has none).
 fn encode(
     img: &WorkingImage,
     path: &Path,
     fmt: Format,
     hdr: Option<f32>,
     quality: u8,
+    exif: &[u8],
 ) -> Result<()> {
+    let exif = Some(exif);
     match (fmt, hdr) {
         (Format::Exr, _) => {
             let rgb = output::scrgb_linear_f32(img);
             idev_formats::write_exr_rgb_f32(path, img.width, img.height, &rgb)
         }
         (Format::Png, None) => {
-            idev_formats::write_png_srgb8(path, img.width, img.height, &output::srgb8(img))
+            idev_formats::write_png_srgb8(path, img.width, img.height, &output::srgb8(img), exif)
         }
         (Format::Png, Some(_)) => idev_formats::write_png_bt2020_pq16(
             path,
             img.width,
             img.height,
             &output::bt2020_pq16(img),
+            exif,
         ),
         (Format::Jpg, None) => idev_formats::write_jpeg_srgb8(
             path,
@@ -587,6 +607,7 @@ fn encode(
             img.height,
             &output::srgb8(img),
             quality,
+            exif,
         ),
         (Format::Jpg, Some(_)) => {
             bail!("JPEG has no HDR encoding; use png, avif or exr with --hdr")
@@ -597,6 +618,7 @@ fn encode(
             img.height,
             &output::srgb8(img),
             quality,
+            exif,
         ),
         (Format::Avif, Some(_)) => idev_formats::write_avif_bt2020_pq10(
             path,
@@ -604,6 +626,7 @@ fn encode(
             img.height,
             &output::bt2020_pq16(img),
             quality,
+            exif,
         ),
     }
 }

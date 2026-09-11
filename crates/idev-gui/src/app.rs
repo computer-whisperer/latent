@@ -32,6 +32,7 @@ use idev_core::color::Gamut;
 use idev_core::gpu::{
     Developer, DisplayPrimaries, Gpu, Histogram, HistogramReadback, OutputTarget, Prepared, Render,
 };
+use idev_core::metadata;
 use idev_core::params::{
     DEFAULT_WHITE, Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sidecar_path,
 };
@@ -663,6 +664,7 @@ impl IdevApp {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "image".into());
         let dir = s.path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let name = s.name.clone();
         let (tx, rx) = channel();
         self.export_rx.push(rx);
         self.exports_running += 1;
@@ -682,7 +684,7 @@ impl IdevApp {
                     .save_file();
                 let result = match picked {
                     None => Err(anyhow::anyhow!("cancelled")),
-                    Some(path) => export_to(&frame, &params, &kind, &path).map(|()| path),
+                    Some(path) => export_to(&frame, &name, &params, &kind, &path).map(|()| path),
                 };
                 let _ = tx.send(result);
                 wake(&wakeup);
@@ -1685,7 +1687,13 @@ fn lens_group(s: &Session) -> Vec<El> {
 }
 
 /// Develop at full resolution on a private device and encode.
-fn export_to(frame: &Source, params: &DevelopParams, kind: &ExportKind, path: &Path) -> Result<()> {
+fn export_to(
+    frame: &Source,
+    source_name: &str,
+    params: &DevelopParams,
+    kind: &ExportKind,
+    path: &Path,
+) -> Result<()> {
     let t = Instant::now();
     let gpu = Gpu::headless()?;
     let dev = Developer::new(&gpu);
@@ -1695,6 +1703,17 @@ fn export_to(frame: &Source, params: &DevelopParams, kind: &ExportKind, path: &P
     };
     let img: WorkingImage = dev.develop(&gpu, frame, params, target)?;
     let img = output::oriented(&img, frame.orientation());
+    let note = metadata::develop_note(source_name, params);
+    let exif = metadata::exif_for_output(
+        &frame.metadata().tags,
+        &metadata::Output {
+            width: img.width,
+            height: img.height,
+            srgb: matches!(kind, ExportKind::Jpeg | ExportKind::Png | ExportKind::Avif),
+            note: &note,
+        },
+    )?;
+    let exif = Some(exif.as_slice());
     match kind {
         ExportKind::Jpeg => idev_formats::write_jpeg_srgb8(
             path,
@@ -1702,15 +1721,17 @@ fn export_to(frame: &Source, params: &DevelopParams, kind: &ExportKind, path: &P
             img.height,
             &output::srgb8(&img),
             EXPORT_QUALITY,
+            exif,
         )?,
         ExportKind::Png => {
-            idev_formats::write_png_srgb8(path, img.width, img.height, &output::srgb8(&img))?
+            idev_formats::write_png_srgb8(path, img.width, img.height, &output::srgb8(&img), exif)?
         }
         ExportKind::HdrPng => idev_formats::write_png_bt2020_pq16(
             path,
             img.width,
             img.height,
             &output::bt2020_pq16(&img),
+            exif,
         )?,
         ExportKind::Avif => idev_formats::write_avif_srgb8(
             path,
@@ -1718,6 +1739,7 @@ fn export_to(frame: &Source, params: &DevelopParams, kind: &ExportKind, path: &P
             img.height,
             &output::srgb8(&img),
             EXPORT_QUALITY,
+            exif,
         )?,
         ExportKind::HdrAvif => idev_formats::write_avif_bt2020_pq10(
             path,
@@ -1725,6 +1747,7 @@ fn export_to(frame: &Source, params: &DevelopParams, kind: &ExportKind, path: &P
             img.height,
             &output::bt2020_pq16(&img),
             EXPORT_QUALITY,
+            exif,
         )?,
         ExportKind::Exr => idev_formats::write_exr_rgb_f32(
             path,

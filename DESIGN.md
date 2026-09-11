@@ -580,6 +580,40 @@ Not done / caveats:
   only thumbnails and exports rotate. Pre-existing; a candidate for
   the crop/straighten tool since both touch the same geometry.
 
+## Metadata arc, chunk 2: metadata into exports (2026-09-11)
+
+Built: `metadata::Tags` keeps the parsed IFD0 / Exif / GPS entries on
+every `Source` (structural and bulky tags dropped at load), and
+`metadata::exif_for_output` writes a TIFF block from them with
+rawler's writer: IFD0 whitelist (make, model, description, artist,
+copyright, resolution, modify date) plus `Orientation` = 1, `Software`
+= "idev x.y.z", pointers to the Exif and GPS IFDs; the Exif IFD copied
+whole except MakerNote, the source's colour space and dimensions, and
+the JPEG-encoding tags, with the output's `PixelX/YDimension`,
+`ColorSpace` (sRGB, or Uncalibrated for the PQ outputs where cICP is
+the truth) and a `UserComment` (`metadata::develop_note`: source name
+and the parameter TOML); GPS IFD copied whole. Containers: JPEG APP1
+spliced after the JFIF APP0 (image's encoder has no EXIF hook), PNG
+`eXIf` before IDAT, AVIF `Exif` item via avif-serialize's `set_exif`.
+EXR gets nothing. Both CLI and GUI exports pass the block.
+
+Verified on DSC00039.ARW developed five ways (JPEG, PNG, PQ PNG, AVIF,
+PQ AVIF): exiv2 reads 59 tags from the JPEG and both PNGs with the
+expected values (Software, orientation top-left, output dimensions,
+sRGB vs Uncalibrated, exposure, lens, GPS, the user comment). exiv2
+reads nothing from the AVIFs even with BMFF enabled, but libheif does:
+`heif-info` lists the 1354-byte Exif item, `heif-convert` carries it
+into a JPEG from which exiv2 reads the same 59 tags, and a direct iloc
+parse shows the item as the 4-byte offset prefix plus the TIFF block.
+The block round-trips through our own reader (`inspect --all` on the
+output). A portrait raw (DSC00063) exports as 4128 × 6192 pixels with
+orientation 1. The block is ~1.3 KB, far under the 64 KB APP1 limit.
+
+Not done: EXIF in EXR (no standard slot; string attributes would be
+the analogue), XMP, ICC profiles (the PNG has sRGB/cICP chunks and the
+AVIF its colr box, which is what readers use), and reading EXIF back
+out of AVIF/HEIF sources.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

@@ -19,7 +19,12 @@ idev dump-bayer DSC00039.ARW -o raw.pgm                   # decoder cross-checks
 
 Build with `cargo build --release`; the binary is `target/release/idev`.
 Parameters live in `<raw>.idev.toml` beside each raw; flags override,
-`--save-params` writes back. The camera's lens correction tables
+`--save-params` writes back. Every JPEG, PNG and AVIF output carries an
+EXIF block: the source's camera, exposure, lens, time and GPS tags,
+orientation reset (pixels are rotated), the output size and colour
+space, `Software` = idev, and a `UserComment` holding the source name
+and the parameters as TOML, so a render is reproducible from the
+output alone. EXR has no EXIF slot and carries none. The camera's lens correction tables
 (distortion, lateral CA, vignetting; Sony SubIFD tags) are applied by
 default; `--lens none` disables them and `inspect` reports them.
 

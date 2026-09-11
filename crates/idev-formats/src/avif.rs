@@ -19,13 +19,15 @@ use v_frame::plane::PlaneOffset;
 /// than a native libaom at the same preset.
 const SPEED: u8 = 6;
 
-/// sRGB 8-bit RGB, three bytes per pixel. `quality` 1..=100.
+/// sRGB 8-bit RGB, three bytes per pixel. `quality` 1..=100. `exif` is
+/// a TIFF-structured EXIF block, stored as an `Exif` item.
 pub fn write_avif_srgb8(
     path: &Path,
     width: u32,
     height: u32,
     rgb: &[u8],
     quality: u8,
+    exif: Option<&[u8]>,
 ) -> Result<()> {
     ensure!(
         rgb.len() == (width * height * 3) as usize,
@@ -52,17 +54,19 @@ pub fn write_avif_srgb8(
         height,
         ColorPrimaries::Bt709,
         TransferCharacteristics::Srgb,
+        exif,
     )
 }
 
 /// BT.2020 primaries, PQ transfer, 16-bit samples (as `output::bt2020_pq16`
-/// produces), three per pixel. `quality` 1..=100.
+/// produces), three per pixel. `quality` 1..=100. `exif` as above.
 pub fn write_avif_bt2020_pq10(
     path: &Path,
     width: u32,
     height: u32,
     rgb: &[u16],
     quality: u8,
+    exif: Option<&[u8]>,
 ) -> Result<()> {
     ensure!(
         rgb.len() == (width * height * 3) as usize,
@@ -89,6 +93,7 @@ pub fn write_avif_bt2020_pq10(
         height,
         ColorPrimaries::Bt2020,
         TransferCharacteristics::Smpte2084,
+        exif,
     )
 }
 
@@ -210,6 +215,7 @@ fn write_container(
     height: u32,
     primaries: ColorPrimaries,
     transfer: TransferCharacteristics,
+    exif: Option<&[u8]>,
 ) -> Result<()> {
     let mut aviffy = avif_serialize::Aviffy::new();
     aviffy
@@ -217,6 +223,9 @@ fn write_container(
         .set_transfer_characteristics(transfer)
         .set_matrix_coefficients(MatrixCoefficients::Rgb)
         .set_full_color_range(true);
+    if let Some(exif) = exif {
+        aviffy.set_exif(exif.to_vec());
+    }
     let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
     aviffy
         .write(std::io::BufWriter::new(file), av1, None, width, height, 10)
