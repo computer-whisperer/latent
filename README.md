@@ -19,11 +19,19 @@ Build with `cargo build --release`; the binary is `target/release/idev`.
 Parameters live in `<raw>.idev.toml` beside each raw; flags override,
 `--save-params` writes back.
 
+GUI: `cargo run --release -p idev-gui -- DSC00039.ARW` opens a develop
+window (damascene, HDR-aware on prism): pan/zoom preview, scrubbers for
+exposure, contrast, hue preservation, temperature and tint, tabs for
+tone curve, highlights and demosaic, export buttons, and the sidecar is
+written on every change. Keys: `f` fit, `1` 1:1, `t` SDR preview,
+`e` export JPEG.
+
 Crates:
 
 - `idev-core` — rawler unpack into a `SensorFrame`, color matrices,
   `DevelopParams`, the wgpu compute pipeline, CPU output transforms.
 - `idev-formats` — encoders (EXR, PNG, PGM).
 - `idev-cli` — the `idev` binary.
+- `idev-gui` — the `idev-gui` develop window.
 
 `idev` is a placeholder prefix until the project is named.

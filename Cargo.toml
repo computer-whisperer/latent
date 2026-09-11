@@ -24,6 +24,10 @@ toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wgpu = "30"
+damascene-core = "0.8"
+damascene-wgpu = "0.8"
+damascene-winit-wgpu = "0.8"
+rfd = "0.17"
 
 # Our own pixel loops and the codecs are hot even in dev runs; keep the
 # CLI/GUI crates unoptimised for debugging.
@@ -42,4 +46,27 @@ opt-level = 3
 [profile.dev.package.zune-jpeg]
 opt-level = 3
 [profile.dev.package.half]
+opt-level = 3
+
+# damascene's text stack is ~500x slower unoptimised (its own profile
+# guidance; overrides only apply at the consuming workspace root).
+[profile.dev.package.fdsm]
+opt-level = 3
+[profile.dev.package.fdsm-ttf-parser]
+opt-level = 3
+[profile.dev.package.nalgebra]
+opt-level = 3
+[profile.dev.package.simba]
+opt-level = 3
+[profile.dev.package.ttf-parser]
+opt-level = 3
+[profile.dev.package.cosmic-text]
+opt-level = 3
+[profile.dev.package.swash]
+opt-level = 3
+[profile.dev.package.skrifa]
+opt-level = 3
+[profile.dev.package.zeno]
+opt-level = 3
+[profile.dev.package.fontdb]
 opt-level = 3

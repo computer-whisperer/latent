@@ -1,12 +1,18 @@
-// Colour pass: camera RGB (white balanced, unclamped) -> working space.
-// Highlight handling, camera matrix (Bradford-adapted to D65), exposure,
-// tone curve.
+// Colour pass: camera RGB (white balanced, unclamped) -> output space.
+// Optional integer downscale (box average in camera-space linear light),
+// highlight handling, camera matrix (Bradford-adapted to D65), exposure,
+// tone curve, then the display primaries matrix (identity for exports,
+// BT.2020 -> sRGB for the damascene preview).
 
 struct Uniforms {
-    width: u32,
+    width: u32,            // output size
     height: u32,
     highlight_mode: u32,   // 0 clip, 1 blend
     tone_mode: u32,        // 0 none, 1 sigmoid
+    src_width: u32,        // camera RGB size
+    src_height: u32,
+    scale: u32,            // output pixel = scale x scale source pixels
+    pad0: u32,
     // Post-WB clip level per camera channel (the WB multiplier).
     clip: vec4<f32>,
     // Luminance weights in camera WB space (sum to 1).
@@ -14,6 +20,9 @@ struct Uniforms {
     m0: vec4<f32>,
     m1: vec4<f32>,
     m2: vec4<f32>,
+    d0: vec4<f32>,
+    d1: vec4<f32>,
+    d2: vec4<f32>,
     // exposure gain, contrast, peak, hue preservation
     tone: vec4<f32>,
 };
@@ -37,7 +46,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let p = vec2<i32>(i32(gid.x), i32(gid.y));
-    var v = textureLoad(cam_rgb, p, 0).rgb;
+    var v = vec3<f32>(0.0);
+    if u.scale <= 1u {
+        v = textureLoad(cam_rgb, p, 0).rgb;
+    } else {
+        let x0 = gid.x * u.scale;
+        let y0 = gid.y * u.scale;
+        let x1 = min(x0 + u.scale, u.src_width);
+        let y1 = min(y0 + u.scale, u.src_height);
+        var n = 0.0;
+        for (var y = y0; y < y1; y++) {
+            for (var x = x0; x < x1; x++) {
+                v += textureLoad(cam_rgb, vec2<i32>(i32(x), i32(y)), 0).rgb;
+                n += 1.0;
+            }
+        }
+        v /= max(n, 1.0);
+    }
 
     if u.highlight_mode == 0u {
         v = min(v, vec3<f32>(1.0));
@@ -77,5 +102,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         w = mix(per_channel, by_luminance, u.tone.w);
     }
 
-    textureStore(out_tex, p, vec4<f32>(w, 1.0));
+    let d = vec3<f32>(dot(u.d0.xyz, w), dot(u.d1.xyz, w), dot(u.d2.xyz, w));
+    textureStore(out_tex, p, vec4<f32>(d, 1.0));
 }

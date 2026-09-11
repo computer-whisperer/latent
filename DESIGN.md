@@ -251,6 +251,55 @@ Everything in the arc landed; the CLI is usable for real batches.
 - Sidecars work as `<raw>.idev.toml`; `--save-params` writes the
   resolved parameters, later runs pick them up, flags override.
 
+## Milestone 3 arc (started 2026-09-10): single-image develop window
+
+Decisions: preview-scale pipeline for slider drags, full resolution at
+1:1 and on export; single-image window first, library view later.
+
+- **Crate `idev-gui`**, binary `idev-gui <raw>`. damascene
+  `WinitWgpuApp` host: `gpu_setup` wraps the host device in `Gpu`,
+  `before_paint` reruns whatever is dirty.
+- **Pipeline split for interactivity.** The full-resolution linearize
+  plane and demosaiced camera RGB stay resident on the GPU and are
+  recomputed only when white balance or the demosaic choice changes.
+  The colour pass (highlights, matrix, exposure, tone) is what sliders
+  touch; it renders into the display texture and takes an integer
+  `scale` that box-averages scale×scale camera-RGB pixels, so a
+  fit-to-window preview costs a few ms and 1:1 uses scale 1 at full
+  resolution. Averaging happens in camera-space linear light before
+  highlight reconstruction, which is the right place for it.
+- **Display texture** is an `AppTexture` (`Rgba16Float`, opaque) shown
+  through `surface()` inside a `viewport()` with `FitPolicy::Contain`.
+  damascene's working space is scRGB linear, so the colour pass gets a
+  `display_primaries` switch: identity (BT.2020, exports) or the
+  BT.2020→sRGB matrix (GUI). The tone curve peak follows the host's
+  negotiated headroom: 1.0 on SDR, the reported headroom on HDR.
+- **Controls**: exposure, temperature, tint, contrast, hue
+  preservation, highlights, demosaic; export (JPEG / PNG / PQ PNG /
+  EXR via an rfd save dialog, full-resolution readback through the
+  existing `develop`), reset. Sidecar written on every change.
+- **Not in this arc**: histogram, library grid, noise reduction.
+
+## Milestone 3 results (2026-09-10)
+
+The single-image window works on prism's HDR output. Verified by
+screenshot: the preview renders through `surface()` inside a
+`viewport()`, the badge reports the negotiated headroom (2.0x on the
+400-nit-advertised output), and the sidecar round-trips.
+
+- Preview scale converges within two frames (the zoom is read in
+  `build`, consumed in `before_paint`; a mismatch wakes one more
+  frame). At fit the preview is ~1240 px wide; 1:1 allocates a
+  full-resolution texture.
+- `prepare` (linearize + RCD) submits in ~30 ms; the colour pass per
+  slider event is a few ms. Not measured precisely yet.
+- Exports run on a thread with a private headless device, so the
+  window never blocks on readback or encode.
+- Not done: histogram, library view, keyboard focus polish on the
+  scrubbers, a white-point tone control. Interaction (drag, tabs,
+  export dialog) was not exercised by me; it is wired through
+  damascene's documented `apply_event` folds.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

@@ -7,15 +7,19 @@
 //!    balance applied, unclamped.
 //! 2. demosaic → camera RGB over the crop. Either `bilinear` (one pass)
 //!    or RCD (`rcd_vh` discrimination + low-pass, `rcd_green`, `rcd_rb`).
-//! 3. `colour`: highlights, camera→BT.2020 matrix (Bradford-adapted),
-//!    exposure, tone curve → the working image.
+//! 3. `colour`: optional box downscale, highlights, camera→BT.2020
+//!    matrix (Bradford-adapted), exposure, tone curve, display primaries.
+//!
+//! Passes 1–2 are [`Developer::prepare`] and stay resident as a
+//! [`Prepared`]; pass 3 is [`Developer::colour`], cheap enough to rerun
+//! per slider event. [`Developer::develop`] chains both with a readback.
 
 use anyhow::{Context, Result, anyhow};
 use bytemuck::{Pod, Zeroable};
 use half::f16;
 
 use crate::WorkingImage;
-use crate::color::{Mat3, XYZ_FROM_BT2020};
+use crate::color::{Mat3, XYZ_FROM_BT2020, srgb_from_bt2020};
 use crate::params::{Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance};
 use crate::sensor::SensorFrame;
 use crate::whitepoint::{self, Temperature, xy_from_temperature};
@@ -116,12 +120,49 @@ struct ColourUniforms {
     height: u32,
     highlight_mode: u32,
     tone_mode: u32,
+    src_width: u32,
+    src_height: u32,
+    scale: u32,
+    _pad: u32,
     clip: [f32; 4],
     ylum_cam: [f32; 4],
     m0: [f32; 4],
     m1: [f32; 4],
     m2: [f32; 4],
+    d0: [f32; 4],
+    d1: [f32; 4],
+    d2: [f32; 4],
     tone: [f32; 4],
+}
+
+/// Primaries the colour pass writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayPrimaries {
+    /// The working space, linear BT.2020 (exports).
+    Bt2020,
+    /// Linear sRGB primaries, scRGB convention (damascene's working space).
+    Srgb,
+}
+
+/// The expensive, parameter-stable half of a develop: the linearized
+/// plane and demosaiced camera RGB, resident on the GPU. Rebuilt only
+/// when white balance or the demosaic choice changes.
+pub struct Prepared {
+    pub width: u32,
+    pub height: u32,
+    pub white_balance: WhiteBalance,
+    pub demosaic: Demosaic,
+    wb: [f32; 3],
+    to_working: Mat3,
+    ylum_cam: [f32; 3],
+    cam_rgb: Tex,
+}
+
+impl Prepared {
+    /// Whether `params` would need a fresh [`Developer::prepare`].
+    pub fn matches(&self, params: &DevelopParams) -> bool {
+        self.white_balance == params.white_balance && self.demosaic == params.demosaic
+    }
 }
 
 // ---- pipelines ----
@@ -292,18 +333,17 @@ impl Developer {
         }
     }
 
-    /// Run the pipeline and read the working image back to the CPU.
-    pub fn develop(
+    /// Linearize and demosaic `frame` for the white balance and demosaic
+    /// in `params`; the result stays on the GPU.
+    pub fn prepare(
         &self,
         gpu: &Gpu,
         frame: &SensorFrame,
         params: &DevelopParams,
-        target: OutputTarget,
-    ) -> Result<WorkingImage> {
+    ) -> Result<Prepared> {
         let device = &gpu.device;
         let queue = &gpu.queue;
 
-        // --- CPU-side parameter resolution ---
         let white = match params.white_balance {
             WhiteBalance::AsShot => {
                 whitepoint::white_from_neutral(&frame.matrices, frame.neutral_as_shot())
@@ -346,23 +386,10 @@ impl Developer {
             }
             w
         };
-        let gain = 2f32.powf(params.exposure_ev);
-        let (tone_mode, contrast, hue_preservation) = match params.tone {
-            ToneCurve::None => (0u32, 1.0, 0.0),
-            ToneCurve::Sigmoid {
-                contrast,
-                hue_preservation,
-            } => (1u32, contrast, hue_preservation),
-        };
-        let highlight_mode = match params.highlights {
-            Highlights::Clip => 0u32,
-            Highlights::Blend => 1u32,
-        };
         let cfa = frame.cfa.map(|c| c as u32);
         let crop = frame.crop;
         let (out_w, out_h) = (crop.width, crop.height);
 
-        // --- resources ---
         let raw_words: &[u8] = bytemuck::cast_slice(&frame.data);
         // Storage buffers need 4-byte size alignment; an odd pixel count
         // would leave a dangling u16.
@@ -409,13 +436,6 @@ impl Developer {
             wgpu::TextureFormat::Rgba16Float,
             intermediate,
         );
-        let working = texture(
-            device,
-            "idev::working",
-            cropped,
-            wgpu::TextureFormat::Rgba16Float,
-            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
-        );
 
         let lin_u = uniform_buffer(
             device,
@@ -452,37 +472,9 @@ impl Developer {
                 cfa,
             },
         );
-        let colour_u = uniform_buffer(
-            device,
-            queue,
-            &ColourUniforms {
-                width: out_w,
-                height: out_h,
-                highlight_mode,
-                tone_mode,
-                clip: [wb[0], wb[1], wb[2], 0.0],
-                ylum_cam: [ylum_cam[0], ylum_cam[1], ylum_cam[2], 0.0],
-                m0: [to_working[0][0], to_working[0][1], to_working[0][2], 0.0],
-                m1: [to_working[1][0], to_working[1][1], to_working[1][2], 0.0],
-                m2: [to_working[2][0], to_working[2][1], to_working[2][2], 0.0],
-                tone: [gain, contrast, target.peak, hue_preservation],
-            },
-        );
 
-        let bytes_per_px = 8u32;
-        let unpadded = out_w * bytes_per_px;
-        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let padded_row = unpadded.div_ceil(align) * align;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("idev::readback"),
-            size: (padded_row * out_h) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        // --- encode ---
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("idev::develop"),
+            label: Some("idev::prepare"),
         });
         let bg = self.linearize.bind(
             device,
@@ -547,60 +539,221 @@ impl Developer {
                 self.rcd_rb.dispatch(&mut encoder, &bg, out_w, out_h);
             }
         }
-
-        let bg = self.colour.bind(
-            device,
-            &[colour_u.as_entire_binding(), tex(&cam_rgb), tex(&working)],
-        );
-        self.colour.dispatch(&mut encoder, &bg, out_w, out_h);
-
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &working.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_row),
-                    rows_per_image: Some(out_h),
-                },
-            },
-            cropped,
-        );
         queue.submit([encoder.finish()]);
 
-        // --- map ---
-        let slice = readback.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .context("poll device")?;
-        rx.recv()
-            .context("map callback dropped")?
-            .context("map readback")?;
-        let mapped = slice.get_mapped_range().context("mapped range")?;
-        let mut rgba = Vec::with_capacity((out_w * out_h * 4) as usize);
-        for y in 0..out_h as usize {
-            let start = y * padded_row as usize;
-            let row = &mapped[start..start + unpadded as usize];
-            rgba.extend_from_slice(bytemuck::cast_slice::<u8, f16>(row));
-        }
-        drop(mapped);
-        readback.unmap();
+        Ok(Prepared {
+            width: out_w,
+            height: out_h,
+            white_balance: params.white_balance,
+            demosaic: params.demosaic,
+            wb,
+            to_working,
+            ylum_cam,
+            cam_rgb,
+        })
+    }
 
+    /// Output size of the colour pass for a downscale factor.
+    pub fn scaled_size(prepared: &Prepared, scale: u32) -> (u32, u32) {
+        let s = scale.max(1);
+        (prepared.width.div_ceil(s), prepared.height.div_ceil(s))
+    }
+
+    /// Run the colour pass into `out` (an `Rgba16Float` storage texture
+    /// of [`Self::scaled_size`]) and submit it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn colour(
+        &self,
+        gpu: &Gpu,
+        prepared: &Prepared,
+        params: &DevelopParams,
+        target: OutputTarget,
+        scale: u32,
+        display: DisplayPrimaries,
+        out: &wgpu::TextureView,
+    ) {
+        let device = &gpu.device;
+        let queue = &gpu.queue;
+        let (out_w, out_h) = Self::scaled_size(prepared, scale);
+        let gain = 2f32.powf(params.exposure_ev);
+        let (tone_mode, contrast, hue_preservation) = match params.tone {
+            ToneCurve::None => (0u32, 1.0, 0.0),
+            ToneCurve::Sigmoid {
+                contrast,
+                hue_preservation,
+            } => (1u32, contrast, hue_preservation),
+        };
+        let highlight_mode = match params.highlights {
+            Highlights::Clip => 0u32,
+            Highlights::Blend => 1u32,
+        };
+        let d: Mat3 = match display {
+            DisplayPrimaries::Bt2020 => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            DisplayPrimaries::Srgb => srgb_from_bt2020(),
+        };
+        let row = |r: [f32; 3]| [r[0], r[1], r[2], 0.0];
+        let m = &prepared.to_working;
+        let colour_u = uniform_buffer(
+            device,
+            queue,
+            &ColourUniforms {
+                width: out_w,
+                height: out_h,
+                highlight_mode,
+                tone_mode,
+                src_width: prepared.width,
+                src_height: prepared.height,
+                scale: scale.max(1),
+                _pad: 0,
+                clip: [prepared.wb[0], prepared.wb[1], prepared.wb[2], 0.0],
+                ylum_cam: [
+                    prepared.ylum_cam[0],
+                    prepared.ylum_cam[1],
+                    prepared.ylum_cam[2],
+                    0.0,
+                ],
+                m0: row(m[0]),
+                m1: row(m[1]),
+                m2: row(m[2]),
+                d0: row(d[0]),
+                d1: row(d[1]),
+                d2: row(d[2]),
+                tone: [gain, contrast, target.peak, hue_preservation],
+            },
+        );
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("idev::colour"),
+        });
+        let bg = self.colour.bind(
+            device,
+            &[
+                colour_u.as_entire_binding(),
+                tex(&prepared.cam_rgb),
+                wgpu::BindingResource::TextureView(out),
+            ],
+        );
+        self.colour.dispatch(&mut encoder, &bg, out_w, out_h);
+        queue.submit([encoder.finish()]);
+    }
+
+    /// Full-resolution develop with CPU readback (the CLI path).
+    pub fn develop(
+        &self,
+        gpu: &Gpu,
+        frame: &SensorFrame,
+        params: &DevelopParams,
+        target: OutputTarget,
+    ) -> Result<WorkingImage> {
+        let prepared = self.prepare(gpu, frame, params)?;
+        self.develop_prepared(gpu, &prepared, params, target)
+    }
+
+    /// Full-resolution colour pass over an existing [`Prepared`], read
+    /// back to the CPU.
+    pub fn develop_prepared(
+        &self,
+        gpu: &Gpu,
+        prepared: &Prepared,
+        params: &DevelopParams,
+        target: OutputTarget,
+    ) -> Result<WorkingImage> {
+        let device = &gpu.device;
+        let (out_w, out_h) = (prepared.width, prepared.height);
+        let working = texture(
+            device,
+            "idev::working",
+            wgpu::Extent3d {
+                width: out_w,
+                height: out_h,
+                depth_or_array_layers: 1,
+            },
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        );
+        self.colour(
+            gpu,
+            prepared,
+            params,
+            target,
+            1,
+            DisplayPrimaries::Bt2020,
+            &working.view,
+        );
+        let rgba = read_back_rgba16f(gpu, &working.texture, out_w, out_h)?;
         Ok(WorkingImage {
             width: out_w,
             height: out_h,
             rgba,
         })
     }
+}
+
+/// Copy an `Rgba16Float` texture to the CPU.
+fn read_back_rgba16f(
+    gpu: &Gpu,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) -> Result<Vec<f16>> {
+    let device = &gpu.device;
+    let queue = &gpu.queue;
+    let bytes_per_px = 8u32;
+    let unpadded = width * bytes_per_px;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded_row = unpadded.div_ceil(align) * align;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("idev::readback"),
+        size: (padded_row * height) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("idev::readback"),
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .context("poll device")?;
+    rx.recv()
+        .context("map callback dropped")?
+        .context("map readback")?;
+    let mapped = slice.get_mapped_range().context("mapped range")?;
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height as usize {
+        let start = y * padded_row as usize;
+        let row = &mapped[start..start + unpadded as usize];
+        rgba.extend_from_slice(bytemuck::cast_slice::<u8, f16>(row));
+    }
+    drop(mapped);
+    readback.unmap();
+    Ok(rgba)
 }
 
 struct Tex {
