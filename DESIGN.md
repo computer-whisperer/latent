@@ -203,11 +203,14 @@ CPU output transform (orientation, primaries, transfer) → encoder.
   (directional discrimination from squared second differences on
   same-colour samples, ratio-corrected green from a 3x3 low-pass,
   colour-difference R/B). Three GPU passes: VH+LPF, green, RB.
-- **Highlights: LCh blend**, per pixel after demosaic. Each channel
-  clamps at its own post-WB clip level, then the pixel blends toward
-  a neutral of its own luminance by the fraction of clipped channels,
-  with a 2% soft ramp under the clip. Clipped neutrals come out white
-  at ~1.5x diffuse white, giving the tone curve real headroom.
+- **Highlights: blend**, per pixel after demosaic. Each channel clamps
+  at its own post-WB clip level (a clipped value is a lower bound), a
+  clipped channel is lifted to at least the brightest still-valid
+  channel, and a fully clipped pixel becomes a neutral at the
+  luminance of the clamped value (~1.5x diffuse white on this camera),
+  with a 2% soft ramp under the clip. Rejected: desaturating by the
+  fraction of clipped channels; green clips first on this sensor and
+  that left near-white walls pink.
 - **Tone curve: sigmoid** in linear light, grey-anchored (0.18→0.18),
   `contrast` sets the slope at grey, `skew` splits toe/shoulder
   exponents, `peak` (relative to display white) comes from the output

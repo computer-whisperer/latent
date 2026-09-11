@@ -22,8 +22,49 @@ pub enum WhiteBalance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Demosaic {
-    #[default]
+    /// Fast, soft; the preview path.
     Bilinear,
+    /// Ratio Corrected Demosaicing; the quality path.
+    #[default]
+    Rcd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Highlights {
+    /// Clamp every channel at green's clip level. Clipped areas go
+    /// flat white at exactly diffuse white.
+    Clip,
+    /// A clipped channel is a lower bound; lift it to the brightest
+    /// still-valid channel. Fully clipped pixels become a neutral at
+    /// the luminance of the per-channel-clamped value, above diffuse
+    /// white, so the tone curve has headroom to roll off.
+    #[default]
+    Blend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ToneCurve {
+    /// Scene-referred output, no curve.
+    None,
+    /// Grey-anchored sigmoid in linear light: 0.18 maps to 0.18, the
+    /// slope at grey scales with `contrast`, and the curve approaches
+    /// the output target's peak asymptotically. `hue_preservation`
+    /// blends from per-channel (0) toward a luminance-ratio result (1).
+    Sigmoid {
+        contrast: f32,
+        hue_preservation: f32,
+    },
+}
+
+impl Default for ToneCurve {
+    fn default() -> Self {
+        ToneCurve::Sigmoid {
+            contrast: 1.6,
+            hue_preservation: 0.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,6 +76,8 @@ pub struct DevelopParams {
     pub exposure_ev: f32,
     pub white_balance: WhiteBalance,
     pub demosaic: Demosaic,
+    pub highlights: Highlights,
+    pub tone: ToneCurve,
 }
 
 impl Default for DevelopParams {
@@ -43,7 +86,9 @@ impl Default for DevelopParams {
             schema: SCHEMA_VERSION,
             exposure_ev: 0.0,
             white_balance: WhiteBalance::AsShot,
-            demosaic: Demosaic::Bilinear,
+            demosaic: Demosaic::default(),
+            highlights: Highlights::default(),
+            tone: ToneCurve::default(),
         }
     }
 }

@@ -1,13 +1,22 @@
 //! The wgpu compute pipeline. One implementation serves the CLI (headless
 //! device) and the GUI (device shared with damascene).
+//!
+//! Passes, all 16x16 workgroups:
+//!
+//! 1. `linearize`: raw u16 → f32 plane, black/white levels and white
+//!    balance applied, unclamped.
+//! 2. demosaic → camera RGB over the crop. Either `bilinear` (one pass)
+//!    or RCD (`rcd_vh` discrimination + low-pass, `rcd_green`, `rcd_rb`).
+//! 3. `colour`: highlights, camera→BT.2020 matrix (Bradford-adapted),
+//!    exposure, tone curve → the working image.
 
 use anyhow::{Context, Result, anyhow};
 use bytemuck::{Pod, Zeroable};
 use half::f16;
 
 use crate::WorkingImage;
-use crate::color::Mat3;
-use crate::params::{DevelopParams, WhiteBalance};
+use crate::color::{Mat3, XYZ_FROM_BT2020};
+use crate::params::{Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance};
 use crate::sensor::SensorFrame;
 use crate::whitepoint::{self, Temperature, xy_from_temperature};
 
@@ -48,6 +57,26 @@ impl Gpu {
     }
 }
 
+/// What the developed image is destined for; the tone curve targets it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutputTarget {
+    /// Display peak relative to diffuse white (1.0 for SDR; nits / 203
+    /// for HDR).
+    pub peak: f32,
+}
+
+impl OutputTarget {
+    pub const SDR: OutputTarget = OutputTarget { peak: 1.0 };
+
+    pub fn hdr_nits(peak_nits: f32) -> OutputTarget {
+        OutputTarget {
+            peak: peak_nits / 203.0,
+        }
+    }
+}
+
+// ---- uniform blocks (WGSL std140-compatible layouts) ----
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct LinearizeUniforms {
@@ -60,7 +89,16 @@ struct LinearizeUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct DemosaicUniforms {
+struct PlaneUniforms {
+    width: u32,
+    height: u32,
+    _pad: [u32; 2],
+    cfa: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CropUniforms {
     src_width: u32,
     src_height: u32,
     crop_x: u32,
@@ -69,75 +107,188 @@ struct DemosaicUniforms {
     out_height: u32,
     _pad: [u32; 2],
     cfa: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ColourUniforms {
+    width: u32,
+    height: u32,
+    highlight_mode: u32,
+    tone_mode: u32,
+    clip: [f32; 4],
+    ylum_cam: [f32; 4],
     m0: [f32; 4],
     m1: [f32; 4],
     m2: [f32; 4],
+    tone: [f32; 4],
 }
 
-/// Compiled pipelines. Build once per device, develop many frames.
-pub struct Developer {
-    linearize: wgpu::ComputePipeline,
-    linearize_layout: wgpu::BindGroupLayout,
-    demosaic: wgpu::ComputePipeline,
-    demosaic_layout: wgpu::BindGroupLayout,
+// ---- pipelines ----
+
+/// One compute pass: pipeline plus its bind group layout.
+struct Pass {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
 }
 
-const WG: u32 = 16;
+/// What a binding slot holds, for building layouts tersely.
+#[derive(Clone, Copy)]
+enum Slot {
+    Uniform,
+    StorageBuffer,
+    Texture,
+    StorageTexture(wgpu::TextureFormat),
+}
 
-impl Developer {
-    pub fn new(gpu: &Gpu) -> Developer {
-        let device = &gpu.device;
-        let lin_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("idev::linearize"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/linearize.wgsl").into()),
+impl Pass {
+    fn new(device: &wgpu::Device, label: &str, wgsl: &str, slots: &[Slot]) -> Pass {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
         });
-        let dem_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("idev::demosaic_bilinear"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/demosaic_bilinear.wgsl").into()),
-        });
-
-        let linearize_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("idev::linearize"),
-            entries: &[
-                uniform_entry(0),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = slots
+            .iter()
+            .enumerate()
+            .map(|(i, slot)| wgpu::BindGroupLayoutEntry {
+                binding: i as u32,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: match slot {
+                    Slot::Uniform => wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    Slot::StorageBuffer => wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
-                    count: None,
-                },
-                storage_texture_entry(2, wgpu::TextureFormat::R32Float),
-            ],
-        });
-        let demosaic_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("idev::demosaic"),
-            entries: &[
-                uniform_entry(0),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
+                    Slot::Texture => wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
-                    count: None,
+                    Slot::StorageTexture(format) => wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: *format,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
                 },
-                storage_texture_entry(2, wgpu::TextureFormat::Rgba16Float),
-            ],
+                count: None,
+            })
+            .collect();
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(label),
+            entries: &entries,
         });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(label),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Pass { pipeline, layout }
+    }
 
-        let linearize = make_pipeline(device, "idev::linearize", &linearize_layout, &lin_module);
-        let demosaic = make_pipeline(device, "idev::demosaic", &demosaic_layout, &dem_module);
+    fn bind(
+        &self,
+        device: &wgpu::Device,
+        resources: &[wgpu::BindingResource<'_>],
+    ) -> wgpu::BindGroup {
+        let entries: Vec<wgpu::BindGroupEntry> = resources
+            .iter()
+            .enumerate()
+            .map(|(i, r)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: r.clone(),
+            })
+            .collect();
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.layout,
+            entries: &entries,
+        })
+    }
+
+    fn dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bind_group: &wgpu::BindGroup,
+        width: u32,
+        height: u32,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.dispatch_workgroups(width.div_ceil(WG), height.div_ceil(WG), 1);
+    }
+}
+
+const WG: u32 = 16;
+
+/// Compiled pipelines. Build once per device, develop many frames.
+pub struct Developer {
+    linearize: Pass,
+    bilinear: Pass,
+    rcd_vh: Pass,
+    rcd_green: Pass,
+    rcd_rb: Pass,
+    colour: Pass,
+}
+
+impl Developer {
+    pub fn new(gpu: &Gpu) -> Developer {
+        use Slot::*;
+        use wgpu::TextureFormat::{R32Float, Rg32Float, Rgba16Float};
+        let d = &gpu.device;
         Developer {
-            linearize,
-            linearize_layout,
-            demosaic,
-            demosaic_layout,
+            linearize: Pass::new(
+                d,
+                "idev::linearize",
+                include_str!("shaders/linearize.wgsl"),
+                &[Uniform, StorageBuffer, StorageTexture(R32Float)],
+            ),
+            bilinear: Pass::new(
+                d,
+                "idev::bilinear",
+                include_str!("shaders/demosaic_bilinear.wgsl"),
+                &[Uniform, Texture, StorageTexture(Rgba16Float)],
+            ),
+            rcd_vh: Pass::new(
+                d,
+                "idev::rcd_vh",
+                include_str!("shaders/rcd_vh.wgsl"),
+                &[Uniform, Texture, StorageTexture(Rg32Float)],
+            ),
+            rcd_green: Pass::new(
+                d,
+                "idev::rcd_green",
+                include_str!("shaders/rcd_green.wgsl"),
+                &[Uniform, Texture, Texture, StorageTexture(R32Float)],
+            ),
+            rcd_rb: Pass::new(
+                d,
+                "idev::rcd_rb",
+                include_str!("shaders/rcd_rb.wgsl"),
+                &[Uniform, Texture, Texture, StorageTexture(Rgba16Float)],
+            ),
+            colour: Pass::new(
+                d,
+                "idev::colour",
+                include_str!("shaders/colour.wgsl"),
+                &[Uniform, Texture, StorageTexture(Rgba16Float)],
+            ),
         }
     }
 
@@ -147,16 +298,16 @@ impl Developer {
         gpu: &Gpu,
         frame: &SensorFrame,
         params: &DevelopParams,
+        target: OutputTarget,
     ) -> Result<WorkingImage> {
         let device = &gpu.device;
         let queue = &gpu.queue;
 
         // --- CPU-side parameter resolution ---
         let white = match params.white_balance {
-            WhiteBalance::AsShot => whitepoint::white_from_neutral(
-                &frame.matrices,
-                [1.0 / frame.wb_as_shot[0], 1.0, 1.0 / frame.wb_as_shot[2]],
-            ),
+            WhiteBalance::AsShot => {
+                whitepoint::white_from_neutral(&frame.matrices, frame.neutral_as_shot())
+            }
             WhiteBalance::Multipliers { red, blue } => {
                 whitepoint::white_from_neutral(&frame.matrices, [1.0 / red, 1.0, 1.0 / blue])
             }
@@ -185,17 +336,36 @@ impl Developer {
         let to_working: Mat3 = white
             .bt2020_from_camera_wb()
             .context("camera matrix is singular")?;
+        // Luminance weights in camera WB space: Y row of XYZ←BT.2020
+        // composed with camera→BT.2020.
+        let ylum_cam = {
+            let y2020 = XYZ_FROM_BT2020[1];
+            let mut w = [0.0f32; 3];
+            for (j, wj) in w.iter_mut().enumerate() {
+                *wj = (0..3).map(|i| y2020[i] * to_working[i][j]).sum();
+            }
+            w
+        };
         let gain = 2f32.powf(params.exposure_ev);
-        let row = |r: [f32; 3]| [r[0] * gain, r[1] * gain, r[2] * gain, 0.0];
-
+        let (tone_mode, contrast, hue_preservation) = match params.tone {
+            ToneCurve::None => (0u32, 1.0, 0.0),
+            ToneCurve::Sigmoid {
+                contrast,
+                hue_preservation,
+            } => (1u32, contrast, hue_preservation),
+        };
+        let highlight_mode = match params.highlights {
+            Highlights::Clip => 0u32,
+            Highlights::Blend => 1u32,
+        };
+        let cfa = frame.cfa.map(|c| c as u32);
         let crop = frame.crop;
-        let out_w = crop.width;
-        let out_h = crop.height;
+        let (out_w, out_h) = (crop.width, crop.height);
 
         // --- resources ---
         let raw_words: &[u8] = bytemuck::cast_slice(&frame.data);
         // Storage buffers need 4-byte size alignment; an odd pixel count
-        // would leave a dangling u16. Pad by copying only in that case.
+        // would leave a dangling u16.
         let padded;
         let raw_bytes: &[u8] = if raw_words.len().is_multiple_of(4) {
             raw_words
@@ -213,99 +383,92 @@ impl Developer {
         });
         queue.write_buffer(&raw_buf, 0, raw_bytes);
 
-        let plane = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("idev::plane"),
-            size: wgpu::Extent3d {
-                width: frame.width,
-                height: frame.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let plane_view = plane.create_view(&Default::default());
-
-        let out_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("idev::working"),
-            size: wgpu::Extent3d {
-                width: out_w,
-                height: out_h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let out_view = out_tex.create_view(&Default::default());
-
-        let lin_uniforms = LinearizeUniforms {
+        let full = wgpu::Extent3d {
             width: frame.width,
             height: frame.height,
-            _pad: [0; 2],
-            black,
-            scale,
+            depth_or_array_layers: 1,
         };
-        let lin_ubuf = uniform_buffer(device, queue, "idev::linearize::uniforms", &lin_uniforms);
-        let dem_uniforms = DemosaicUniforms {
-            src_width: frame.width,
-            src_height: frame.height,
-            crop_x: crop.x,
-            crop_y: crop.y,
-            out_width: out_w,
-            out_height: out_h,
-            _pad: [0; 2],
-            cfa: frame.cfa.map(|c| c as u32),
-            m0: row(to_working[0]),
-            m1: row(to_working[1]),
-            m2: row(to_working[2]),
+        let cropped = wgpu::Extent3d {
+            width: out_w,
+            height: out_h,
+            depth_or_array_layers: 1,
         };
-        let dem_ubuf = uniform_buffer(device, queue, "idev::demosaic::uniforms", &dem_uniforms);
+        let intermediate =
+            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
+        let plane = texture(
+            device,
+            "idev::plane",
+            full,
+            wgpu::TextureFormat::R32Float,
+            intermediate,
+        );
+        let cam_rgb = texture(
+            device,
+            "idev::cam_rgb",
+            cropped,
+            wgpu::TextureFormat::Rgba16Float,
+            intermediate,
+        );
+        let working = texture(
+            device,
+            "idev::working",
+            cropped,
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        );
 
-        let lin_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("idev::linearize"),
-            layout: &self.linearize_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: lin_ubuf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: raw_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&plane_view),
-                },
-            ],
-        });
-        let dem_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("idev::demosaic"),
-            layout: &self.demosaic_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: dem_ubuf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&plane_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&out_view),
-                },
-            ],
-        });
+        let lin_u = uniform_buffer(
+            device,
+            queue,
+            &LinearizeUniforms {
+                width: frame.width,
+                height: frame.height,
+                _pad: [0; 2],
+                black,
+                scale,
+            },
+        );
+        let plane_u = uniform_buffer(
+            device,
+            queue,
+            &PlaneUniforms {
+                width: frame.width,
+                height: frame.height,
+                _pad: [0; 2],
+                cfa,
+            },
+        );
+        let crop_u = uniform_buffer(
+            device,
+            queue,
+            &CropUniforms {
+                src_width: frame.width,
+                src_height: frame.height,
+                crop_x: crop.x,
+                crop_y: crop.y,
+                out_width: out_w,
+                out_height: out_h,
+                _pad: [0; 2],
+                cfa,
+            },
+        );
+        let colour_u = uniform_buffer(
+            device,
+            queue,
+            &ColourUniforms {
+                width: out_w,
+                height: out_h,
+                highlight_mode,
+                tone_mode,
+                clip: [wb[0], wb[1], wb[2], 0.0],
+                ylum_cam: [ylum_cam[0], ylum_cam[1], ylum_cam[2], 0.0],
+                m0: [to_working[0][0], to_working[0][1], to_working[0][2], 0.0],
+                m1: [to_working[1][0], to_working[1][1], to_working[1][2], 0.0],
+                m2: [to_working[2][0], to_working[2][1], to_working[2][2], 0.0],
+                tone: [gain, contrast, target.peak, hue_preservation],
+            },
+        );
 
-        // --- readback buffer ---
         let bytes_per_px = 8u32;
         let unpadded = out_w * bytes_per_px;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -321,27 +484,79 @@ impl Developer {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("idev::develop"),
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("idev::linearize"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.linearize);
-            pass.set_bind_group(0, &lin_bg, &[]);
-            pass.dispatch_workgroups(frame.width.div_ceil(WG), frame.height.div_ceil(WG), 1);
+        let bg = self.linearize.bind(
+            device,
+            &[
+                lin_u.as_entire_binding(),
+                raw_buf.as_entire_binding(),
+                tex(&plane),
+            ],
+        );
+        self.linearize
+            .dispatch(&mut encoder, &bg, frame.width, frame.height);
+
+        match params.demosaic {
+            Demosaic::Bilinear => {
+                let bg = self.bilinear.bind(
+                    device,
+                    &[crop_u.as_entire_binding(), tex(&plane), tex(&cam_rgb)],
+                );
+                self.bilinear.dispatch(&mut encoder, &bg, out_w, out_h);
+            }
+            Demosaic::Rcd => {
+                let vhlpf = texture(
+                    device,
+                    "idev::rcd_vhlpf",
+                    full,
+                    wgpu::TextureFormat::Rg32Float,
+                    intermediate,
+                );
+                let green = texture(
+                    device,
+                    "idev::rcd_green",
+                    full,
+                    wgpu::TextureFormat::R32Float,
+                    intermediate,
+                );
+                let bg = self.rcd_vh.bind(
+                    device,
+                    &[plane_u.as_entire_binding(), tex(&plane), tex(&vhlpf)],
+                );
+                self.rcd_vh
+                    .dispatch(&mut encoder, &bg, frame.width, frame.height);
+                let bg = self.rcd_green.bind(
+                    device,
+                    &[
+                        plane_u.as_entire_binding(),
+                        tex(&plane),
+                        tex(&vhlpf),
+                        tex(&green),
+                    ],
+                );
+                self.rcd_green
+                    .dispatch(&mut encoder, &bg, frame.width, frame.height);
+                let bg = self.rcd_rb.bind(
+                    device,
+                    &[
+                        crop_u.as_entire_binding(),
+                        tex(&plane),
+                        tex(&green),
+                        tex(&cam_rgb),
+                    ],
+                );
+                self.rcd_rb.dispatch(&mut encoder, &bg, out_w, out_h);
+            }
         }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("idev::demosaic"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.demosaic);
-            pass.set_bind_group(0, &dem_bg, &[]);
-            pass.dispatch_workgroups(out_w.div_ceil(WG), out_h.div_ceil(WG), 1);
-        }
+
+        let bg = self.colour.bind(
+            device,
+            &[colour_u.as_entire_binding(), tex(&cam_rgb), tex(&working)],
+        );
+        self.colour.dispatch(&mut encoder, &bg, out_w, out_h);
+
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &out_tex,
+                texture: &working.texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -354,11 +569,7 @@ impl Developer {
                     rows_per_image: Some(out_h),
                 },
             },
-            wgpu::Extent3d {
-                width: out_w,
-                height: out_h,
-                depth_or_array_layers: 1,
-            },
+            cropped,
         );
         queue.submit([encoder.finish()]);
 
@@ -392,61 +603,39 @@ impl Developer {
     }
 }
 
-fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
+struct Tex {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
 }
 
-fn storage_texture_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::StorageTexture {
-            access: wgpu::StorageTextureAccess::WriteOnly,
-            format,
-            view_dimension: wgpu::TextureViewDimension::D2,
-        },
-        count: None,
-    }
-}
-
-fn make_pipeline(
+fn texture(
     device: &wgpu::Device,
     label: &str,
-    layout: &wgpu::BindGroupLayout,
-    module: &wgpu::ShaderModule,
-) -> wgpu::ComputePipeline {
-    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+    size: wgpu::Extent3d,
+    format: wgpu::TextureFormat,
+    usage: wgpu::TextureUsages,
+) -> Tex {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
-        bind_group_layouts: &[Some(layout)],
-        immediate_size: 0,
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
     });
-    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(label),
-        layout: Some(&pl),
-        module,
-        entry_point: Some("main"),
-        compilation_options: Default::default(),
-        cache: None,
-    })
+    let view = texture.create_view(&Default::default());
+    Tex { texture, view }
 }
 
-fn uniform_buffer<T: Pod>(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    label: &str,
-    value: &T,
-) -> wgpu::Buffer {
+fn tex(t: &Tex) -> wgpu::BindingResource<'_> {
+    wgpu::BindingResource::TextureView(&t.view)
+}
+
+fn uniform_buffer<T: Pod>(device: &wgpu::Device, queue: &wgpu::Queue, value: &T) -> wgpu::Buffer {
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
+        label: Some("idev::uniforms"),
         size: std::mem::size_of::<T>() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,

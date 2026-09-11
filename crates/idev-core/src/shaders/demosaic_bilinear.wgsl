@@ -1,5 +1,6 @@
-// Pass 2: bilinear demosaic of the linear plane over the crop rectangle,
-// then camera RGB -> working space (linear BT.2020) with exposure gain.
+// Bilinear demosaic of the linear plane over the crop rectangle. Output is
+// camera RGB after white balance, unclamped. The fast path; RCD is the
+// quality path.
 //
 // Bilinear on a 2x2 Bayer mosaic: a site keeps its own color; every other
 // color is the mean of the same-colored sites in its 3x3 neighbourhood
@@ -17,10 +18,6 @@ struct Uniforms {
     // CFA color (0 = R, 1 = G, 2 = B) per position (y & 1) * 2 + (x & 1),
     // in source raster coordinates.
     cfa: vec4<u32>,
-    // Rows of the camera -> BT.2020 matrix, exposure gain folded in.
-    m0: vec4<f32>,
-    m1: vec4<f32>,
-    m2: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -63,6 +60,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var rgb = sum / max(cnt, vec3<f32>(1.0));
     rgb[own] = load(sx, sy);
 
-    let out = vec3<f32>(dot(u.m0.xyz, rgb), dot(u.m1.xyz, rgb), dot(u.m2.xyz, rgb));
-    textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(out, 1.0));
+    textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(rgb, 1.0));
 }

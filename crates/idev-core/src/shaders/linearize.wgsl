@@ -1,10 +1,7 @@
 // Pass 1: raw u16 Bayer values -> linear, black-subtracted, white-balanced
 // f32 plane. Per-CFA-position tables so the shader needs no pattern logic.
-//
-// Highlights: a site at the sensor clip level carries no information, so
-// after white balance its value is clamped to 1.0. Without this, a clipped
-// neutral turns magenta (red and blue gains push their clipped sites above
-// green's). Real highlight reconstruction replaces this later.
+// No clamping here: the colour pass handles clipped sites with the full
+// pixel in hand.
 
 struct Uniforms {
     width: u32,
@@ -32,6 +29,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let word = raw[idx >> 1u];
     let v = select(word & 0xffffu, word >> 16u, (idx & 1u) == 1u);
     let pos = (y & 1u) * 2u + (x & 1u);
-    let lin = min((f32(v) - u.black[pos]) * u.scale[pos], 1.0);
+    let lin = (f32(v) - u.black[pos]) * u.scale[pos];
     textureStore(plane, vec2<i32>(i32(x), i32(y)), vec4<f32>(lin, 0.0, 0.0, 1.0));
 }

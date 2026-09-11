@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use idev_core::gpu::{Developer, Gpu};
+use idev_core::gpu::{Developer, Gpu, OutputTarget};
 use idev_core::params::{DevelopParams, WhiteBalance};
 use idev_core::{output, sensor};
 
@@ -178,7 +178,7 @@ fn develop(
     let gpu = Gpu::headless()?;
     let dev = Developer::new(&gpu);
     let t2 = Instant::now();
-    let img = dev.develop(&gpu, &frame, &params)?;
+    let img = dev.develop(&gpu, &frame, &params, OutputTarget::SDR)?;
     let t3 = Instant::now();
 
     let ext = out
