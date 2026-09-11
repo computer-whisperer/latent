@@ -9,6 +9,7 @@ use rawler::formats::tiff::reader::TiffReader;
 use rawler::imgop::xyz::Illuminant;
 use rawler::rawsource::RawSource;
 use rawler::{Orientation, RawImageData};
+use serde::{Deserialize, Serialize};
 
 use crate::metadata::Metadata;
 
@@ -38,7 +39,10 @@ pub struct ColorMatrix {
 }
 
 /// The shooting metadata we carry forward into outputs and the UI.
-#[derive(Debug, Clone, Default)]
+/// Serialized (TOML) into thumbnail cache entries so the library can
+/// sort and filter without reopening files.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ExifSummary {
     pub make: String,
     pub model: String,
@@ -51,6 +55,26 @@ pub struct ExifSummary {
 }
 
 impl ExifSummary {
+    pub fn to_toml(&self) -> String {
+        toml::to_string(self).unwrap_or_default()
+    }
+
+    pub fn from_toml(text: &str) -> Option<ExifSummary> {
+        toml::from_str(text).ok()
+    }
+
+    /// `DateTimeOriginal` as `YYYY-MM-DD HH:MM:SS` (EXIF writes colons
+    /// in the date), for sorting and filtering.
+    pub fn date(&self) -> Option<String> {
+        let d = self.date_time_original.as_ref()?;
+        let (day, time) = d.split_once(' ').unwrap_or((d, ""));
+        Some(
+            format!("{} {time}", day.replace(':', "-"))
+                .trim()
+                .to_string(),
+        )
+    }
+
     pub fn from_exif(exif: &rawler::exif::Exif, make: String, model: String) -> ExifSummary {
         ExifSummary {
             make,
@@ -188,6 +212,7 @@ pub struct Preview {
     /// sRGB-encoded RGB, three bytes per pixel.
     pub rgb: Vec<u8>,
     pub orientation: Orientation,
+    pub exif: ExifSummary,
 }
 
 /// Read the embedded JPEG preview without decoding the raw data.
@@ -207,12 +232,17 @@ pub fn embedded_preview(path: &Path) -> Result<Preview> {
         Some(o @ 1..=8) => Orientation::from_u16(o),
         _ => Orientation::Normal,
     };
+    let mut exif = ExifSummary::from_exif(&meta.exif, meta.make.clone(), meta.model.clone());
+    if let Some(l) = &meta.lens {
+        exif.lens = Some(l.lens_name.clone());
+    }
     let rgb = image.into_rgb8();
     Ok(Preview {
         width: rgb.width(),
         height: rgb.height(),
         rgb: rgb.into_raw(),
         orientation,
+        exif,
     })
 }
 

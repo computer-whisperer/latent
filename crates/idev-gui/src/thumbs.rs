@@ -23,7 +23,7 @@ use idev_core::color::srgb_oetf;
 use idev_core::gpu::{Developer, Gpu, OutputTarget};
 use idev_core::output;
 use idev_core::params::{DevelopParams, sidecar_path};
-use idev_core::sensor;
+use idev_core::sensor::{self, ExifSummary};
 use idev_core::source::{self, Source};
 
 /// Long edge of a thumbnail in pixels. Tiles are ~240 logical px wide,
@@ -33,9 +33,10 @@ pub const THUMB_EDGE: u32 = 512;
 /// Bumped whenever the entry encoding or the rendering changes; part of
 /// the key, so old entries age out through the sweep.
 // 2: rendered images honour their EXIF orientation.
-const FORMAT_VERSION: u32 = 2;
+// 3: the EXIF summary rides along for library sorting and filtering.
+const FORMAT_VERSION: u32 = 3;
 const MAGIC: [u8; 4] = *b"IDTH";
-const HEADER_LEN: usize = 4 + 4 + 4 + 4 + 1;
+const HEADER_LEN: usize = 4 + 4 + 4 + 4 + 1 + 4;
 const MAX_DIM: u32 = 16_384;
 
 /// Bytes the cache may hold before the sweep evicts least recently used
@@ -47,6 +48,7 @@ pub struct Thumb {
     pub image: Image,
     /// Rendered from the sidecar (true) or the camera's preview (false).
     pub developed: bool,
+    pub exif: ExifSummary,
 }
 
 /// The headless device developed thumbnails render on. One full
@@ -217,6 +219,7 @@ fn camera_preview(raw: &Path) -> Result<Thumb> {
     Ok(Thumb {
         image: Image::from_rgb8(w, h, rgb),
         developed: false,
+        exif: p.exif,
     })
 }
 
@@ -234,9 +237,11 @@ fn image_preview(path: &Path) -> Result<Thumb> {
         },
         THUMB_EDGE,
     );
+    let img = output::oriented(&img, i.orientation);
     Ok(Thumb {
         image: Image::from_rgb8(img.width, img.height, output::srgb8(&img)),
         developed: false,
+        exif: i.exif,
     })
 }
 
@@ -261,6 +266,7 @@ fn developed(raw: &Path, sidecar: &Path, gpu: &ThumbGpu) -> Result<Thumb> {
     Ok(Thumb {
         image: Image::from_rgb8(img.width, img.height, output::srgb8(&img)),
         developed: true,
+        exif: source.exif().clone(),
     })
 }
 
@@ -307,17 +313,21 @@ fn srgb_eotf(v: f32) -> f32 {
 ///
 /// ```text
 /// magic "IDTH" · version u32 · width u32 · height u32 · developed u8
+/// · exif_len u32 · exif: TOML of `ExifSummary`
 /// payload: width × height × 4 bytes, sRGB RGBA8
 /// ```
 fn encode_entry(thumb: &Thumb) -> Vec<u8> {
     let img = &thumb.image;
     let pixels = img.pixels();
-    let mut out = Vec::with_capacity(HEADER_LEN + pixels.len());
+    let exif = thumb.exif.to_toml();
+    let mut out = Vec::with_capacity(HEADER_LEN + exif.len() + pixels.len());
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&img.width().to_le_bytes());
     out.extend_from_slice(&img.height().to_le_bytes());
     out.push(thumb.developed as u8);
+    out.extend_from_slice(&(exif.len() as u32).to_le_bytes());
+    out.extend_from_slice(exif.as_bytes());
     out.extend_from_slice(pixels);
     out
 }
@@ -340,13 +350,17 @@ fn parse_entry(data: &[u8]) -> Option<Thumb> {
         1 => true,
         _ => return None,
     };
-    let payload = &data[HEADER_LEN..];
+    let exif_len = u32_at(17) as usize;
+    let exif_text = data.get(HEADER_LEN..HEADER_LEN + exif_len)?;
+    let exif = ExifSummary::from_toml(std::str::from_utf8(exif_text).ok()?)?;
+    let payload = &data[HEADER_LEN + exif_len..];
     if payload.len() != (width as usize) * (height as usize) * 4 {
         return None;
     }
     Some(Thumb {
         image: Image::from_rgba8(width, height, payload.to_vec()),
         developed,
+        exif,
     })
 }
 
@@ -387,9 +401,15 @@ mod tests {
         let thumb = Thumb {
             image: Image::from_rgba8(3, 2, (0..24).collect()),
             developed: true,
+            exif: ExifSummary {
+                make: "SONY".into(),
+                iso: Some(3200),
+                ..Default::default()
+            },
         };
         let back = parse_entry(&encode_entry(&thumb)).unwrap();
         assert!(back.developed);
+        assert_eq!(back.exif, thumb.exif);
         assert_eq!(back.image.width(), 3);
         assert_eq!(back.image.pixels(), thumb.image.pixels());
         assert!(parse_entry(&encode_entry(&thumb)[..20]).is_none());

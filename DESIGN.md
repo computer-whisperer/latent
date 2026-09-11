@@ -614,6 +614,45 @@ the analogue), XMP, ICC profiles (the PNG has sRGB/cICP chunks and the
 AVIF its colr box, which is what readers use), and reading EXIF back
 out of AVIF/HEIF sources.
 
+## Metadata arc, chunk 3: library sort, filter, stack (2026-09-11)
+
+Built:
+
+- `ExifSummary` is serde-serializable and rides in every thumbnail
+  cache entry (format v3: a TOML blob between the header and the
+  pixels). `sensor::embedded_preview` now fills it for raws; image
+  previews take it from `Source`. The library keeps one per file as
+  thumbnails arrive, so sorting and filtering need no second pass over
+  the files and cost nothing on a warm cache.
+- `library::{SortKey, Filter, Item, sort_indices, pairs}`: sort by
+  name, date, ISO, focal length or lens (missing key sorts last, ties
+  by name); a filter query of ANDed terms (`iso>=1600`, `f<2.8`,
+  `mm>=50`, `date:2026-09-10`, `raw`/`jpg`, free text over name, lens,
+  make and model); raw + rendered pairs by case-insensitive stem. Unit
+  tests cover all three.
+- The app keeps a `view: Vec<usize>` of file indices; the grid, the
+  selection, stepping and Enter all go through it, so left/right in
+  the develop view follow the sorted, filtered order. The toolbar has
+  a text input (damascene `text_input`), sort tabs and a Stack button;
+  the view is rebuilt on every change and, when it depends on
+  metadata, after each batch of thumbnails, keeping the selected file
+  selected. The runtime matches hotkeys before text editing, so the
+  app's `hotkeys()` returns nothing while the filter box owns the
+  selection; Escape or a click elsewhere releases it.
+- Fix found on the way: `image_preview` never applied the EXIF
+  orientation, so portrait JPEG thumbnails were still landscape after
+  chunk 1 (only the developed-thumbnail path and exports rotated).
+  Now it does; the cache version bump regenerates them.
+
+Verified: unit tests for the filter grammar, the sort order and the
+pairing; clippy and the full suite clean. No screenshot this time: the
+user was working on the desktop and the test window did not land on
+the captured outputs, so the toolbar layout is unreviewed visually.
+
+Not done: burst / sequence grouping (Sony SequenceNumber lives in the
+makernote, not in `ExifSummary`); persisting the sort/filter across
+folders; a date range syntax beyond prefix matching.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

@@ -25,7 +25,7 @@ use damascene_core::surface::{AppTexture, SurfaceAlpha};
 use damascene_core::toast::ToastSpec;
 use damascene_core::viewport::{FitPolicy, ViewportBehavior, ViewportRequest};
 use damascene_core::widgets::number_scrubber::{self, ScrubDrag, ScrubberOpts};
-use damascene_core::widgets::{switch, tabs};
+use damascene_core::widgets::{switch, tabs, text_input};
 use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent, UiEventKind};
 use damascene_winit_wgpu::{Wakeup, WinitWgpuApp};
 use idev_core::color::Gamut;
@@ -36,11 +36,12 @@ use idev_core::metadata;
 use idev_core::params::{
     DEFAULT_WHITE, Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sidecar_path,
 };
+use idev_core::sensor::ExifSummary;
 use idev_core::source::{self, Source};
 use idev_core::whitepoint::{self, Temperature};
 use idev_core::{WorkingImage, output};
 
-use crate::library::{self, Loaded, Loader, LoaderResults};
+use crate::library::{self, Filter, Item, Loaded, Loader, LoaderResults, SortKey, sort_indices};
 use crate::thumbs::{CACHE_BUDGET, ThumbCache, ThumbGpu};
 
 /// The host's redraw handle, filled in once the event loop exists.
@@ -126,6 +127,8 @@ const HDR_EXPORT_NITS: f32 = 1000.0;
 /// JPEG / AVIF quality for GUI exports.
 const EXPORT_QUALITY: u8 = 92;
 const SIDEBAR_WIDTH: f32 = 320.0;
+/// The library filter box.
+const FILTER_WIDTH: f32 = 380.0;
 const FIT_PADDING: f32 = 8.0;
 const TABS_WIDTH: f32 = 170.0;
 const HISTOGRAM_HEIGHT: f32 = 90.0;
@@ -201,9 +204,23 @@ struct Library {
     thumbs: Vec<Option<Image>>,
     developed: Vec<bool>,
     errors: Vec<Option<String>>,
+    /// Shooting summary per file, once its thumbnail (cache entry) has
+    /// been read.
+    exifs: Vec<Option<ExifSummary>>,
+    /// Raw + rendered partner by stem (see `library::pairs`).
+    pair: Vec<Option<usize>>,
     loader: Loader,
     results: LoaderResults,
     loaded: usize,
+
+    // The view: what the grid shows, in which order.
+    sort: SortKey,
+    query: String,
+    query_sel: Selection,
+    /// Hide rendered files that have a raw partner.
+    stack: bool,
+    /// File indices in display order.
+    view: Vec<usize>,
 }
 
 impl Library {
@@ -224,17 +241,32 @@ impl Library {
             })
             .collect();
         let (loader, results) = Loader::spawn(files.clone(), THUMB_WORKERS, wakeup, cache, gpu);
-        Library {
+        let pair = library::pairs(&files);
+        let mut lib = Library {
             dir,
             files,
             names,
             thumbs: vec![None; n],
             developed: vec![false; n],
             errors: vec![None; n],
+            exifs: vec![None; n],
+            pair,
             loader,
             results,
             loaded: 0,
-        }
+            sort: SortKey::Name,
+            query: String::new(),
+            query_sel: Selection::default(),
+            stack: true,
+            view: Vec::new(),
+        };
+        lib.refresh_view();
+        lib
+    }
+
+    /// Whether the view depends on summaries that may still be loading.
+    fn view_uses_metadata(&self) -> bool {
+        self.sort != SortKey::Name || !self.query.trim().is_empty()
     }
 
     fn drain(&mut self) -> bool {
@@ -248,12 +280,36 @@ impl Library {
                     }
                     self.thumbs[index] = Some(thumb.image);
                     self.developed[index] = thumb.developed;
+                    self.exifs[index] = Some(thumb.exif);
                     self.errors[index] = None;
                 }
                 Loaded::Failed { index, error } => self.errors[index] = Some(error),
             }
         }
         any
+    }
+
+    /// Recompute `view` from the stack toggle, the filter and the sort.
+    fn refresh_view(&mut self) {
+        let items: Vec<Item> = (0..self.files.len())
+            .map(|i| Item {
+                name: &self.names[i],
+                raw: source::is_raw(&self.files[i]),
+                exif: self.exifs[i].as_ref(),
+            })
+            .collect();
+        let filter = Filter::parse(&self.query);
+        let mut view: Vec<usize> = (0..self.files.len())
+            .filter(|&i| !(self.stack && !items[i].raw && self.pair[i].is_some()))
+            .filter(|&i| filter.matches(&items[i]))
+            .collect();
+        sort_indices(&mut view, &items, self.sort);
+        self.view = view;
+    }
+
+    /// The filter input owns the keyboard while it holds the selection.
+    fn filter_focused(&self) -> bool {
+        self.query_sel.within("filter").is_some()
     }
 }
 
@@ -499,8 +555,9 @@ impl IdevApp {
         }
     }
 
-    fn select(&mut self, index: usize) {
-        self.selected = index.min(self.library.files.len().saturating_sub(1));
+    /// Select by position in the view.
+    fn select(&mut self, position: usize) {
+        self.selected = position.min(self.library.view.len().saturating_sub(1));
         let cols = self.cols.get().max(1);
         self.scroll_requests.push(ScrollRequest::new(
             "grid",
@@ -509,21 +566,30 @@ impl IdevApp {
         ));
     }
 
+    /// Rebuild the view, keeping the selected file selected when it is
+    /// still shown.
+    fn refresh_view(&mut self) {
+        let current = self.library.view.get(self.selected).copied();
+        self.library.refresh_view();
+        let position = current.and_then(|f| self.library.view.iter().position(|&i| i == f));
+        self.selected = position
+            .unwrap_or(0)
+            .min(self.library.view.len().saturating_sub(1));
+        wake(&self.wakeup);
+    }
+
     /// Enter develop mode on the selected file.
     fn open_selected(&mut self) {
-        let Some(path) = self.library.files.get(self.selected).cloned() else {
+        let Some(&index) = self.library.view.get(self.selected) else {
             return;
         };
-        if self
-            .session
-            .as_ref()
-            .is_some_and(|s| s.index == self.selected)
-        {
+        let path = self.library.files[index].clone();
+        if self.session.as_ref().is_some_and(|s| s.index == index) {
             self.mode = Mode::Develop;
             return;
         }
         self.close_session();
-        match Session::open(self.selected, path, &self.wakeup) {
+        match Session::open(index, path, &self.wakeup) {
             Ok(s) => {
                 self.session = Some(s);
                 self.mode = Mode::Develop;
@@ -555,7 +621,7 @@ impl IdevApp {
     }
 
     fn step(&mut self, delta: isize) {
-        let n = self.library.files.len();
+        let n = self.library.view.len();
         if n == 0 {
             return;
         }
@@ -694,7 +760,10 @@ impl IdevApp {
 
     fn poll_background(&mut self) {
         self.drain_picker();
-        self.library.drain();
+        // Summaries arriving can change a metadata-ordered or filtered view.
+        if self.library.drain() && self.library.view_uses_metadata() {
+            self.refresh_view();
+        }
         let mut loaded = false;
         if let Some(s) = self.session.as_mut()
             && s.frame.is_none()
@@ -794,16 +863,21 @@ impl IdevApp {
         let developed = lib.developed.clone();
         let errors = lib.errors.clone();
         let names = lib.names.clone();
-        let selected = self.selected;
+        let view = lib.view.clone();
+        let paired: Vec<bool> = (0..lib.files.len())
+            .map(|i| lib.stack && lib.pair[i].is_some() && source::is_raw(&lib.files[i]))
+            .collect();
+        let selected = lib.view.get(self.selected).copied();
         let ring = cx.theme().palette().ring;
         let loader = lib.loader.clone();
 
         let grid = virtual_grid(
-            lib.files.len(),
+            lib.view.len(),
             cols,
             TILE_H + CAPTION_H,
             TILE_GAP,
-            move |i| {
+            move |position| {
+                let i = view[position];
                 let mut tip = names[i].clone();
                 let picture = match (&thumbs[i], &errors[i]) {
                     (Some(img), _) => image(img.clone())
@@ -821,6 +895,9 @@ impl IdevApp {
                     }
                 };
                 let mut caption = vec![text(names[i].clone()).caption().muted()];
+                if paired[i] {
+                    caption.push(text("+JPG").caption().muted());
+                }
                 if developed[i] {
                     caption.push(spacer());
                     caption.push(
@@ -850,22 +927,24 @@ impl IdevApp {
                 .radius(tokens::RADIUS_MD)
                 .focusable()
                 .tooltip(tip);
-                if i == selected {
+                if Some(i) == selected {
                     cell = cell.stroke(ring).stroke_width(2.0);
                 }
                 cell
             },
         );
 
-        let body = if lib.files.is_empty() {
-            column([
-                icon("folder"),
-                text(format!("no raw files in {}", lib.dir.display())).muted(),
-            ])
-            .gap(tokens::SPACE_3)
-            .align(Align::Center)
-            .justify(Justify::Center)
-            .fill_size()
+        let body = if lib.view.is_empty() {
+            let what = if lib.files.is_empty() {
+                format!("no image files in {}", lib.dir.display())
+            } else {
+                "no files match the filter".to_string()
+            };
+            column([icon("folder"), text(what).muted()])
+                .gap(tokens::SPACE_3)
+                .align(Align::Center)
+                .justify(Justify::Center)
+                .fill_size()
         } else {
             grid.key("grid").padding(GRID_PAD).fill_size()
         };
@@ -875,10 +954,33 @@ impl IdevApp {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| lib.dir.display().to_string());
+        let count = if lib.view.len() == lib.files.len() {
+            format!("{} images · {} ready", lib.files.len(), lib.loaded)
+        } else {
+            format!(
+                "{} of {} images · {} ready",
+                lib.view.len(),
+                lib.files.len(),
+                lib.loaded
+            )
+        };
+        let stack = button("Stack")
+            .key("stack")
+            .tooltip("hide JPEGs that have a raw of the same name");
         let mut bar = vec![
             toolbar_title(dir_name),
-            toolbar_description(format!("{} images · {} ready", lib.files.len(), lib.loaded)),
+            toolbar_description(count),
             spacer(),
+            text_input_with(
+                "filter",
+                &lib.query,
+                &lib.query_sel,
+                TextInputOpts::default()
+                    .placeholder("filter: iso>1600 f<2.8 mm>=50 date:2026-09-10 lens…"),
+            )
+            .width(Size::Fixed(FILTER_WIDTH)),
+            tabs_list("sort", &lib.sort, SortKey::ALL.map(|k| (k, k.label()))),
+            if lib.stack { stack } else { stack.ghost() },
         ];
         if let Some(n) = &self.notice {
             bar.push(badge(n.clone()).warning());
@@ -1410,20 +1512,45 @@ impl IdevApp {
     }
 
     fn on_library_event(&mut self, event: &UiEvent) {
+        // View controls first: the filter box owns keys while focused.
+        let lib = &mut self.library;
+        if text_input::apply_event(&mut lib.query, &mut lib.query_sel, event, "filter") {
+            self.refresh_view();
+            return;
+        }
+        if event.kind == UiEventKind::Escape && lib.filter_focused() {
+            lib.query_sel = Selection::default();
+            return;
+        }
+        if event.kind == UiEventKind::PointerDown && !event.is_route("filter") {
+            lib.query_sel = Selection::default();
+        }
+        if tabs::apply_event(&mut lib.sort, event, "sort", SortKey::parse) {
+            self.refresh_view();
+            return;
+        }
+        if event.is_click_or_activate("stack") {
+            lib.stack = !lib.stack;
+            self.refresh_view();
+            return;
+        }
         if let Some(key) = event.target_key()
-            && let Some(i) = key.strip_prefix("thumb:").and_then(|s| s.parse().ok())
+            && let Some(i) = key
+                .strip_prefix("thumb:")
+                .and_then(|s| s.parse::<usize>().ok())
+            && let Some(position) = self.library.view.iter().position(|&f| f == i)
         {
             if event.kind == UiEventKind::Click && event.click_count >= 2 {
-                self.select(i);
+                self.select(position);
                 self.open_selected();
                 return;
             }
             if event.is_click_or_activate(key) {
-                self.select(i);
+                self.select(position);
                 return;
             }
         }
-        let last = self.library.files.len().saturating_sub(1);
+        let last = self.library.view.len().saturating_sub(1);
         let cols = self.cols.get().max(1) as isize;
         if event.is_hotkey("open") {
             self.open_selected();
@@ -1478,7 +1605,16 @@ impl App for IdevApp {
         }
     }
 
+    fn selection(&self) -> Selection {
+        self.library.query_sel.clone()
+    }
+
     fn hotkeys(&self) -> Vec<(KeyChord, String)> {
+        // Hotkeys beat text editing in the runtime, so none while the
+        // filter box is being typed into.
+        if self.mode == Mode::Library && self.library.filter_focused() {
+            return Vec::new();
+        }
         let mut keys = vec![
             (KeyChord::vim('t'), "sdr-preview".into()),
             (KeyChord::vim('o'), "open-folder".into()),

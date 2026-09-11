@@ -34,7 +34,14 @@ Radiance HDR through achromat) as a thumbnail grid (`idev-gui FILE.ARW` opens st
 no argument means the current directory). Thumbnails come from the
 camera's embedded JPEG until a raw has a sidecar, then from a scaled
 develop with the sidecar's parameters (marked with a dot); they are
-cached under `~/.cache/idev/thumbs`. Enter or a double click opens the
+cached under `~/.cache/idev/thumbs`. The toolbar has a filter box
+(terms are ANDed: `iso>=1600`, `f<2.8`, `mm>=50`, `date:2026-09-10`,
+`raw` / `jpg`, or any word matched against the file name, lens and
+camera), sort tabs (name, date, ISO, focal length, lens; files without
+the key sort last) and a Stack toggle that hides JPEGs which have a raw
+of the same name (the raw's tile says `+JPG`). Metadata for sorting and
+filtering rides along in the thumbnail cache, so a metadata-ordered
+view settles as thumbnails arrive. Enter or a double click opens the
 develop view (damascene, HDR-aware on prism): pan/zoom preview, a
 per-channel histogram of the preview, scrubbers for exposure, contrast,
 hue preservation, white, temperature and tint, tabs for tone curve,
