@@ -71,7 +71,7 @@ pub enum Gamut {
 }
 
 /// CIE 1931 xy chromaticities of (red, green, blue, white).
-type Chromaticities = [[f32; 2]; 4];
+pub type Chromaticities = [[f32; 2]; 4];
 
 const D65_XY: [f32; 2] = [0.3127, 0.3290];
 
@@ -108,7 +108,7 @@ impl Gamut {
 }
 
 /// RGB → XYZ for primaries and white given as xy, white scaled to Y = 1.
-fn xyz_from_chromaticities(c: Chromaticities) -> Mat3 {
+pub fn xyz_from_chromaticities(c: Chromaticities) -> Mat3 {
     let xyz = |[x, y]: [f32; 2]| [x / y, 1.0, (1.0 - x - y) / y];
     let [r, g, b] = [xyz(c[0]), xyz(c[1]), xyz(c[2])];
     let w = xyz(c[3]);
@@ -127,6 +127,18 @@ fn xyz_from_chromaticities(c: Chromaticities) -> Mat3 {
 pub fn srgb_from_bt2020() -> Mat3 {
     let srgb_from_xyz = invert(&XYZ_FROM_SRGB).expect("sRGB matrix is invertible");
     mul(&srgb_from_xyz, &XYZ_FROM_BT2020)
+}
+
+/// SMPTE ST 2084 PQ EOTF: code value in `[0, 1]` → absolute cd/m².
+pub fn pq_eotf(v: f32) -> f32 {
+    const M1: f32 = 2610.0 / 16384.0;
+    const M2: f32 = 2523.0 / 4096.0 * 128.0;
+    const C1: f32 = 3424.0 / 4096.0;
+    const C2: f32 = 2413.0 / 4096.0 * 32.0;
+    const C3: f32 = 2392.0 / 4096.0 * 32.0;
+    let p = v.clamp(0.0, 1.0).powf(1.0 / M2);
+    let n = (p - C1).max(0.0) / (C2 - C3 * p);
+    n.powf(1.0 / M1) * 10000.0
 }
 
 /// sRGB piecewise OETF on a linear value in `[0, 1]`.

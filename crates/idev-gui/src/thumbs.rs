@@ -18,11 +18,13 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use damascene_core::image::Image;
+use idev_core::WorkingImage;
 use idev_core::color::srgb_oetf;
 use idev_core::gpu::{Developer, Gpu, OutputTarget};
 use idev_core::output;
 use idev_core::params::{DevelopParams, sidecar_path};
 use idev_core::sensor;
+use idev_core::source::{self, Source};
 
 /// Long edge of a thumbnail in pixels. Tiles are ~240 logical px wide,
 /// so this covers a 2x display without upscaling.
@@ -92,8 +94,10 @@ impl ThumbCache {
         }
         let thumb = if sidecar_meta.is_some() {
             developed(raw, &sidecar, gpu)?
-        } else {
+        } else if source::is_raw(raw) {
             camera_preview(raw)?
+        } else {
+            image_preview(raw)?
         };
         if let Err(e) = self.store_entry(&entry, &thumb) {
             tracing::warn!(entry = %entry.display(), error = %format!("{e:#}"), "thumb store failed");
@@ -215,17 +219,33 @@ fn camera_preview(raw: &Path) -> Result<Thumb> {
     })
 }
 
+/// A rendered image decoded into the working space, downscaled in
+/// linear light, SDR-clipped.
+fn image_preview(path: &Path) -> Result<Thumb> {
+    let Source::Image(i) = Source::load(path)? else {
+        anyhow::bail!("{}: expected a rendered image", path.display());
+    };
+    let img = output::downscaled(
+        &WorkingImage {
+            width: i.width,
+            height: i.height,
+            rgba: i.rgba,
+        },
+        THUMB_EDGE,
+    );
+    Ok(Thumb {
+        image: Image::from_rgb8(img.width, img.height, output::srgb8(&img)),
+        developed: false,
+    })
+}
+
 /// Develop with the sidecar's parameters at the integer scale that
 /// lands the long edge at or under the thumbnail edge.
 fn developed(raw: &Path, sidecar: &Path, gpu: &ThumbGpu) -> Result<Thumb> {
     let params = DevelopParams::load(sidecar)?;
-    let frame = sensor::unpack(raw)?;
-    let scale = frame
-        .crop
-        .width
-        .max(frame.crop.height)
-        .div_ceil(THUMB_EDGE)
-        .max(1);
+    let source = Source::load(raw)?;
+    let (w, h) = source.size();
+    let scale = w.max(h).div_ceil(THUMB_EDGE).max(1);
     let mut guard = gpu.0.lock().unwrap();
     if guard.is_none() {
         let g = Gpu::headless().context("thumbnail device")?;
@@ -233,10 +253,10 @@ fn developed(raw: &Path, sidecar: &Path, gpu: &ThumbGpu) -> Result<Thumb> {
         *guard = Some((g, d));
     }
     let (g, dev) = guard.as_ref().expect("initialised above");
-    let prepared = dev.prepare(g, &frame, &params)?;
+    let prepared = dev.prepare(g, &source, &params)?;
     let img = dev.develop_prepared(g, &prepared, &params, OutputTarget::SDR, scale)?;
     drop(guard);
-    let img = output::oriented(&img, frame.orientation);
+    let img = output::oriented(&img, source.orientation());
     Ok(Thumb {
         image: Image::from_rgb8(img.width, img.height, output::srgb8(&img)),
         developed: true,

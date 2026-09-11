@@ -16,25 +16,15 @@ use anyhow::{Context, Result};
 use crate::app::{SharedWakeup, wake};
 use crate::thumbs::{Thumb, ThumbCache, ThumbGpu};
 
-/// Raw extensions worth listing. The pipeline supports 2x2 Bayer
-/// mosaics that rawler decodes; anything else fails at unpack and shows
-/// as an error tile.
-pub const EXTENSIONS: &[&str] = &[
-    "arw", "dng", "cr2", "cr3", "nef", "nrw", "raf", "orf", "rw2", "pef", "srw",
-];
-
-/// Raw files directly inside `dir` (not recursive), sorted by name.
+/// Image files directly inside `dir` (not recursive), sorted by name:
+/// camera raws and the rendered formats achromat decodes.
 pub fn scan_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in
         std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?
     {
         let p = entry?.path();
-        let ext = p
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        if p.is_file() && EXTENSIONS.contains(&ext.as_str()) {
+        if p.is_file() && idev_core::source::is_supported(&p) {
             files.push(p);
         }
     }

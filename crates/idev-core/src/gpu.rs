@@ -24,6 +24,7 @@ use crate::params::{
     DEFAULT_WHITE, Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sigmoid_constants,
 };
 use crate::sensor::{LensCorrection, SensorFrame};
+use crate::source::{ImageSource, Source};
 use crate::whitepoint::{self, Temperature, xy_from_temperature};
 
 /// A device and queue the pipeline runs on.
@@ -248,6 +249,8 @@ pub struct Prepared {
     pub height: u32,
     pub white_balance: WhiteBalance,
     pub demosaic: Demosaic,
+    /// A rendered image: no sensor-space steps (highlights, lens).
+    is_image: bool,
     wb: [f32; 3],
     to_working: Mat3,
     ylum_cam: [f32; 3],
@@ -258,7 +261,8 @@ pub struct Prepared {
 impl Prepared {
     /// Whether `params` would need a fresh [`Developer::prepare`].
     pub fn matches(&self, params: &DevelopParams) -> bool {
-        self.white_balance == params.white_balance && self.demosaic == params.demosaic
+        self.is_image
+            || (self.white_balance == params.white_balance && self.demosaic == params.demosaic)
     }
 }
 
@@ -443,9 +447,59 @@ impl Developer {
         }
     }
 
-    /// Linearize and demosaic `frame` for the white balance and demosaic
-    /// in `params`; the result stays on the GPU.
-    pub fn prepare(
+    /// Bring `source` onto the GPU for `params`: a raw is linearized and
+    /// demosaiced for its white balance and demosaic choice, a rendered
+    /// image is uploaded as is.
+    pub fn prepare(&self, gpu: &Gpu, source: &Source, params: &DevelopParams) -> Result<Prepared> {
+        match source {
+            Source::Raw(frame) => self.prepare_raw(gpu, frame, params),
+            Source::Image(img) => Ok(Self::prepare_image(gpu, img, params)),
+        }
+    }
+
+    fn prepare_image(gpu: &Gpu, img: &ImageSource, params: &DevelopParams) -> Prepared {
+        let size = wgpu::Extent3d {
+            width: img.width,
+            height: img.height,
+            depth_or_array_layers: 1,
+        };
+        let cam_rgb = texture(
+            &gpu.device,
+            "idev::cam_rgb",
+            size,
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        );
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &cam_rgb.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&img.rgba),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(img.width * 8),
+                rows_per_image: Some(img.height),
+            },
+            size,
+        );
+        Prepared {
+            width: img.width,
+            height: img.height,
+            white_balance: params.white_balance,
+            demosaic: params.demosaic,
+            is_image: true,
+            wb: [1.0; 3],
+            to_working: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            ylum_cam: XYZ_FROM_BT2020[1],
+            lens: None,
+            cam_rgb,
+        }
+    }
+
+    fn prepare_raw(
         &self,
         gpu: &Gpu,
         frame: &SensorFrame,
@@ -656,6 +710,7 @@ impl Developer {
             height: out_h,
             white_balance: params.white_balance,
             demosaic: params.demosaic,
+            is_image: false,
             wb,
             to_working,
             ylum_cam,
@@ -700,9 +755,10 @@ impl Developer {
         };
         let (contrast, sig_s, white) = sigmoid_constants(contrast, white, target.peak);
         let f_white = white.powf(contrast) / (white.powf(contrast) + sig_s);
-        let highlight_mode = match params.highlights {
-            Highlights::Clip => 0u32,
-            Highlights::Blend => 1u32,
+        let highlight_mode = match (prepared.is_image, params.highlights) {
+            (true, _) => 2u32,
+            (false, Highlights::Clip) => 0u32,
+            (false, Highlights::Blend) => 1u32,
         };
         let d: Mat3 = match display {
             DisplayPrimaries::Bt2020 => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
@@ -863,11 +919,11 @@ impl Developer {
     pub fn develop(
         &self,
         gpu: &Gpu,
-        frame: &SensorFrame,
+        source: &Source,
         params: &DevelopParams,
         target: OutputTarget,
     ) -> Result<WorkingImage> {
-        let prepared = self.prepare(gpu, frame, params)?;
+        let prepared = self.prepare(gpu, source, params)?;
         self.develop_prepared(gpu, &prepared, params, target, 1)
     }
 

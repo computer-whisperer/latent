@@ -482,6 +482,44 @@ soft-proof questions go back to the user.
 - Verified by screenshot with a sidecar at white 2.0: the clipped
   window and sill show the red zebra; the rest is untouched.
 
+## Rendered images as sources (2026-09-11)
+
+Option 2 from the chunk report, ratified by the user: a rendered
+image enters the working space and goes through the same colour pass.
+
+- `source::Source::{Raw(Box<SensorFrame>), Image(ImageSource)}`;
+  `Source::load` dispatches on extension (rawler for raws, achromat's
+  `load_straight` for PNG/JPEG/WebP/AVIF/JXL/JXR/EXR/HDR). achromat is
+  consumed without its `damascene` feature (it pins damascene-core
+  0.4, ours is 0.8) and converted here: transfer linearized (PQ
+  anchored at the declared reference or 203 cd/m², linear passed
+  through, the rest by their EOTF), primaries rotated into BT.2020
+  through `color::Gamut` or the custom chromaticities, stored as
+  linear BT.2020 f16 in viewing orientation.
+- `Developer::prepare` uploads an image source straight into the
+  camera-RGB texture with identity matrices; `Prepared::is_image`
+  turns off highlight handling (shader mode 2) and lens tables, and
+  `matches` ignores white balance and demosaic. The GUI hides the
+  White balance, Pipeline and Lens groups for non-raws; the info
+  block shows the source encoding.
+- Verified: a PNG through the pipeline with the tone curve off comes
+  back with zero error in all 4.8 M samples; the camera JPEG differs
+  by up to 4 codes, which is zune-jpeg vs libjpeg IDCT, not the
+  pipeline (the PNG test isolates that). A scene-referred EXR of a
+  raw, developed again, matches the direct develop within 1 code.
+  Screenshots: the card folder lists 516 images with JPEG thumbnails
+  (portrait ones oriented), and a JPEG opens in the develop view with
+  the reduced sidebar and a live histogram.
+- Cost: JPEG load 330 ms for 25 MP (decode plus conversion); the
+  thumbnail sweep decodes each JPEG at full size, so a mixed folder
+  fills slower than a raw-only one (embedded previews are ~30 ms).
+- Dependencies achromat brings that are not pure Rust: dav1d for
+  AVIF decode, and the vendored jpegxr C library (bindgen). rav1d is
+  the replacement for the former when the time comes.
+- Not done: raw + JPEG pairs from the same shot show as two entries;
+  a stacking rule (same stem) is an obvious next step. Gallery
+  retirement can proceed once the user has used this for a while.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

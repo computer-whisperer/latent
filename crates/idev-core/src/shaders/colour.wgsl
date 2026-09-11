@@ -10,7 +10,7 @@
 struct Uniforms {
     width: u32,            // output size
     height: u32,
-    highlight_mode: u32,   // 0 clip, 1 blend
+    highlight_mode: u32,   // 0 clip, 1 blend, 2 none (rendered image source)
     tone_mode: u32,        // 0 none, 1 sigmoid
     src_width: u32,        // camera RGB size
     src_height: u32,
@@ -155,7 +155,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if u.highlight_mode == 0u {
         v = min(v, vec3<f32>(1.0));
-    } else {
+    } else if u.highlight_mode == 1u {
         // Blend reconstruction. A channel at its clip level is a lower
         // bound on the truth; lift it to at least the brightest channel
         // of the pixel. Once a second channel clips the colour is

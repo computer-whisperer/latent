@@ -2,6 +2,7 @@
 //! the GPU as the pipeline's final stage; for now they make the working
 //! image viewable and exportable.
 
+use half::f16;
 use rawler::Orientation;
 
 use crate::WorkingImage;
@@ -50,6 +51,37 @@ pub fn oriented(img: &WorkingImage, orientation: Orientation) -> WorkingImage {
     WorkingImage {
         width,
         height,
+        rgba,
+    }
+}
+
+/// Integer box downscale so the long edge is at most `edge`.
+pub fn downscaled(img: &WorkingImage, edge: u32) -> WorkingImage {
+    let f = img.width.max(img.height).div_ceil(edge).max(1) as usize;
+    if f == 1 {
+        return img.clone();
+    }
+    let (w, h) = (img.width as usize, img.height as usize);
+    let (ow, oh) = ((w / f).max(1), (h / f).max(1));
+    let mut rgba = Vec::with_capacity(ow * oh * 4);
+    let norm = 1.0 / (f * f) as f32;
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let mut acc = [0.0f32; 4];
+            for y in oy * f..(oy + 1) * f {
+                for x in ox * f..(ox + 1) * f {
+                    let px = &img.rgba[(y * w + x) * 4..(y * w + x) * 4 + 4];
+                    for c in 0..4 {
+                        acc[c] += px[c].to_f32();
+                    }
+                }
+            }
+            rgba.extend(acc.map(|v| f16::from_f32(v * norm)));
+        }
+    }
+    WorkingImage {
+        width: ow as u32,
+        height: oh as u32,
         rgba,
     }
 }

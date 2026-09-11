@@ -5,7 +5,7 @@ and SDR images out, one GPU pipeline behind both a CLI and (later) a
 damascene GUI. `DESIGN.md` is the plan and the decision record.
 
 ```
-idev inspect DSC00039.ARW
+idev inspect DSC00039.ARW                                 # raws and rendered images alike
 idev develop DSC00039.ARW -o out.jpg                      # sRGB JPEG, sidecar params if present
 idev develop DSC00039.ARW -o out.png --hdr 1000           # BT.2020 PQ 16-bit PNG for a 1000-nit master
 idev develop DSC00039.ARW -o out.avif --hdr 1000          # BT.2020 PQ 10-bit AVIF (pure-Rust rav1e; slow)
@@ -22,8 +22,9 @@ Parameters live in `<raw>.idev.toml` beside each raw; flags override,
 (distortion, lateral CA, vignetting; Sony SubIFD tags) are applied by
 default; `--lens none` disables them and `inspect` reports them.
 
-GUI: `cargo run --release -p idev-gui -- DIR` opens a folder of raws as
-a thumbnail grid (`idev-gui FILE.ARW` opens straight into that file;
+GUI: `cargo run --release -p idev-gui -- DIR` opens a folder of images
+(camera raws, plus PNG, JPEG, WebP, AVIF, JPEG XL, JPEG XR, EXR and
+Radiance HDR through achromat) as a thumbnail grid (`idev-gui FILE.ARW` opens straight into that file;
 no argument means the current directory). Thumbnails come from the
 camera's embedded JPEG until a raw has a sidecar, then from a scaled
 develop with the sidecar's parameters (marked with a dot); they are
@@ -41,8 +42,9 @@ warning for pixels at the panel's peak (red) or outside its gamut
 
 Crates:
 
-- `idev-core` — rawler unpack into a `SensorFrame`, color matrices,
-  `DevelopParams`, the wgpu compute pipeline, CPU output transforms.
+- `idev-core` — rawler unpack into a `SensorFrame`, achromat decode into
+  the working space (`Source`), color matrices, `DevelopParams`, the
+  wgpu compute pipeline, CPU output transforms.
 - `idev-formats` — encoders (EXR, PNG, JPEG, AVIF, PGM).
 - `idev-cli` — the `idev` binary.
 - `idev-gui` — the `idev-gui` window: library grid, thumbnail cache,

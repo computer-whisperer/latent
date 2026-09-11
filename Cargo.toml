@@ -28,6 +28,8 @@ damascene-core = "0.8"
 damascene-wgpu = "0.8"
 damascene-winit-wgpu = "0.8"
 rfd = "0.17"
+# Decoders for non-raw sources (PNG, JPEG, WebP, AVIF, JXL, JXR, EXR, HDR).
+achromat = { git = "https://github.com/computer-whisperer/achromat.git", branch = "main" }
 
 # Our own pixel loops and the codecs are hot even in dev runs; keep the
 # CLI/GUI crates unoptimised for debugging.

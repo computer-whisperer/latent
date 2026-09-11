@@ -7,8 +7,8 @@ use idev_core::gpu::{Developer, Gpu, OutputTarget};
 use idev_core::params::{
     Demosaic, DevelopParams, Highlights, LensParams, ToneCurve, WhiteBalance, sidecar_path,
 };
-use idev_core::sensor::SensorFrame;
-use idev_core::{WorkingImage, output, sensor};
+use idev_core::source::Source;
+use idev_core::{WorkingImage, output};
 
 #[derive(Parser)]
 #[command(name = "idev", about = "Raw developer")]
@@ -297,7 +297,9 @@ fn main() -> Result<()> {
             &overrides,
         ),
         Cmd::DumpBayer { file, out } => {
-            let frame = sensor::unpack(&file)?;
+            let Source::Raw(frame) = Source::load(&file)? else {
+                bail!("{}: not a camera raw", file.display());
+            };
             idev_formats::write_pgm16(&out, frame.width, frame.height, &frame.data)
         }
         Cmd::Params { file, overrides } => {
@@ -317,8 +319,21 @@ fn main() -> Result<()> {
 
 fn inspect(file: &Path) -> Result<()> {
     let t = Instant::now();
-    let f = sensor::unpack(file)?;
+    let source = Source::load(file)?;
     println!("{}  ({:.2?})", file.display(), t.elapsed());
+    let f = match &source {
+        Source::Raw(f) => f,
+        Source::Image(i) => {
+            println!("image        {} x {}  {}", i.width, i.height, i.encoding);
+            let (max, mean) = output::stats(&WorkingImage {
+                width: i.width,
+                height: i.height,
+                rgba: i.rgba.clone(),
+            });
+            println!("max rgb      {:?}  mean luminance {:.4}", max, mean);
+            return Ok(());
+        }
+    };
     println!("camera       {} {}", f.exif.make, f.exif.model);
     if let Some(l) = &f.exif.lens {
         println!("lens         {l}");
@@ -497,18 +512,18 @@ fn develop_one(
 ) -> Result<()> {
     let params = overrides.resolve(input)?;
     let t0 = Instant::now();
-    let frame: SensorFrame = sensor::unpack(input)?;
+    let source = Source::load(input)?;
     let t1 = Instant::now();
-    let img: WorkingImage = dev.develop(gpu, &frame, &params, target)?;
+    let img: WorkingImage = dev.develop(gpu, &source, &params, target)?;
     let t2 = Instant::now();
-    let img = output::oriented(&img, frame.orientation);
+    let img = output::oriented(&img, source.orientation());
     encode(&img, output_path, fmt, hdr, quality)?;
     let t3 = Instant::now();
     if save_params {
         params.save(&sidecar_path(input))?;
     }
     println!(
-        "{} -> {}  {}x{}  unpack {:.0?}  develop {:.0?}  encode {:.0?}",
+        "{} -> {}  {}x{}  load {:.0?}  develop {:.0?}  encode {:.0?}",
         input.display(),
         output_path.display(),
         img.width,

@@ -35,7 +35,7 @@ use idev_core::gpu::{
 use idev_core::params::{
     DEFAULT_WHITE, Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sidecar_path,
 };
-use idev_core::sensor::{self, SensorFrame};
+use idev_core::source::{self, Source};
 use idev_core::whitepoint::{self, Temperature};
 use idev_core::{WorkingImage, output};
 
@@ -267,8 +267,8 @@ struct Session {
     index: usize,
     path: PathBuf,
     name: String,
-    frame: Option<Arc<SensorFrame>>,
-    load_rx: Receiver<Result<SensorFrame>>,
+    frame: Option<Arc<Source>>,
+    load_rx: Receiver<Result<Source>>,
     load_error: Option<String>,
     params: DevelopParams,
     sidecar: SidecarWriter,
@@ -287,8 +287,8 @@ impl Session {
                 .name("idev-unpack".into())
                 .spawn(move || {
                     let t = Instant::now();
-                    let r = sensor::unpack(&path);
-                    tracing::info!("unpacked in {:.0?}", t.elapsed());
+                    let r = Source::load(&path);
+                    tracing::info!("loaded in {:.0?}", t.elapsed());
                     let _ = tx.send(r);
                     wake(&wakeup);
                 })
@@ -582,7 +582,8 @@ impl IdevApp {
         self.contrast.set(c, 2);
         self.hue.set(h, 2);
         self.white.set(w, 2);
-        let temp = match (s.params.white_balance, &s.frame) {
+        let raw = s.frame.as_deref().and_then(Source::as_raw);
+        let temp = match (s.params.white_balance, raw) {
             (WhiteBalance::Temperature { kelvin, tint }, _) => Some(Temperature { kelvin, tint }),
             (WhiteBalance::AsShot, Some(f)) => {
                 whitepoint::white_from_neutral(&f.matrices, f.neutral_as_shot())
@@ -864,7 +865,7 @@ impl IdevApp {
             .unwrap_or_else(|| lib.dir.display().to_string());
         let mut bar = vec![
             toolbar_title(dir_name),
-            toolbar_description(format!("{} raws · {} ready", lib.files.len(), lib.loaded)),
+            toolbar_description(format!("{} images · {} ready", lib.files.len(), lib.loaded)),
             spacer(),
         ];
         if let Some(n) = &self.notice {
@@ -907,24 +908,28 @@ impl IdevApp {
 
         let mut info: Vec<El> = Vec::new();
         if let Some(f) = &s.frame {
-            let e = &f.exif;
-            info.push(text(format!("{} {}", e.make, e.model)).caption().muted());
-            if let Some(l) = &e.lens {
-                info.push(text(l.clone()).caption().muted());
+            match f.as_ref() {
+                Source::Raw(f) => {
+                    let e = &f.exif;
+                    info.push(text(format!("{} {}", e.make, e.model)).caption().muted());
+                    if let Some(l) = &e.lens {
+                        info.push(text(l.clone()).caption().muted());
+                    }
+                    let exp = e
+                        .exposure_time
+                        .map(|(n, d)| format!("{n}/{d} s"))
+                        .unwrap_or_default();
+                    let fnum = e.f_number.map(|v| format!("f/{v:.1}")).unwrap_or_default();
+                    let iso = e.iso.map(|v| format!("ISO {v}")).unwrap_or_default();
+                    info.push(text(format!("{exp}  {fnum}  {iso}")).caption().muted());
+                }
+                Source::Image(i) => info.push(text(i.encoding.clone()).caption().muted()),
             }
-            let exp = e
-                .exposure_time
-                .map(|(n, d)| format!("{n}/{d} s"))
-                .unwrap_or_default();
-            let fnum = e.f_number.map(|v| format!("f/{v:.1}")).unwrap_or_default();
-            let iso = e.iso.map(|v| format!("ISO {v}")).unwrap_or_default();
-            info.push(text(format!("{exp}  {fnum}  {iso}")).caption().muted());
-            info.push(
-                text(format!("{} x {}", f.crop.width, f.crop.height))
-                    .caption()
-                    .muted(),
-            );
+            let (w, h) = f.size();
+            info.push(text(format!("{w} x {h}")).caption().muted());
         }
+        // Sensor-space controls only apply to raws.
+        let is_raw = source::is_raw(&s.path);
 
         let tabs = |key: &str, current: &str, options: [(&str, &str); 2]| {
             tabs_list(
@@ -934,7 +939,7 @@ impl IdevApp {
             )
             .width(Size::Fixed(TABS_WIDTH))
         };
-        sidebar([scroll([column([
+        let mut sections: Vec<El> = vec![
             sidebar_group([sidebar_group_label("Histogram"), self.histogram_el()]),
             sidebar_group([
                 sidebar_group_label("Tone"),
@@ -956,7 +961,9 @@ impl IdevApp {
                     "scene value mapped to the display peak; 1 = diffuse white, 4 = two stops above",
                 ),
             ]),
-            sidebar_group([
+        ];
+        if is_raw {
+            sections.push(sidebar_group([
                 sidebar_group_label("White balance"),
                 field_row(
                     "Temperature (K)",
@@ -969,8 +976,8 @@ impl IdevApp {
                     button("As shot").key("wb-as-shot").secondary(),
                 ])
                 .gap(tokens::SPACE_2),
-            ]),
-            sidebar_group([
+            ]));
+            sections.push(sidebar_group([
                 sidebar_group_label("Pipeline"),
                 field_row(
                     "Highlights",
@@ -988,8 +995,10 @@ impl IdevApp {
                         [("bilinear", "Bilinear"), ("rcd", "RCD")],
                     ),
                 ),
-            ]),
-            sidebar_group(lens_group(s)),
+            ]));
+            sections.push(sidebar_group(lens_group(s)));
+        }
+        sections.extend([
             sidebar_group([
                 sidebar_group_label("Export"),
                 row([
@@ -1018,10 +1027,9 @@ impl IdevApp {
                 button("Reset parameters").key("reset").ghost(),
             ]),
             sidebar_group(info),
-        ])
-        .gap(tokens::SPACE_4)])
-        .scrollbar()])
-        .width(Size::Fixed(SIDEBAR_WIDTH))
+        ]);
+        sidebar([scroll([column(sections).gap(tokens::SPACE_4)]).scrollbar()])
+            .width(Size::Fixed(SIDEBAR_WIDTH))
     }
 
     /// Per-channel histogram as translucent bars, log-scaled counts.
@@ -1089,7 +1097,8 @@ impl IdevApp {
                 .justify(Justify::Center)
                 .fill_size();
         };
-        let (w, h) = (frame.crop.width as f32, frame.crop.height as f32);
+        let (w, h) = frame.size();
+        let (w, h) = (w as f32, h as f32);
         let content = match self.gpu.as_ref().and_then(|g| g.preview.as_ref()) {
             Some(p) => surface(p.texture.clone())
                 .width(Size::Fixed(w))
@@ -1598,7 +1607,11 @@ impl WinitWgpuApp for IdevApp {
 /// no correction tables.
 fn lens_group(s: &Session) -> Vec<El> {
     let mut items = vec![sidebar_group_label("Lens")];
-    match s.frame.as_ref().map(|f| f.lens.is_some()) {
+    match s
+        .frame
+        .as_ref()
+        .map(|f| f.as_raw().is_some_and(|r| r.lens.is_some()))
+    {
         Some(true) => {
             let l = s.params.lens;
             items.push(field_row(
@@ -1621,12 +1634,7 @@ fn lens_group(s: &Session) -> Vec<El> {
 }
 
 /// Develop at full resolution on a private device and encode.
-fn export_to(
-    frame: &SensorFrame,
-    params: &DevelopParams,
-    kind: &ExportKind,
-    path: &Path,
-) -> Result<()> {
+fn export_to(frame: &Source, params: &DevelopParams, kind: &ExportKind, path: &Path) -> Result<()> {
     let t = Instant::now();
     let gpu = Gpu::headless()?;
     let dev = Developer::new(&gpu);
@@ -1635,7 +1643,7 @@ fn export_to(
         _ => OutputTarget::SDR,
     };
     let img: WorkingImage = dev.develop(&gpu, frame, params, target)?;
-    let img = output::oriented(&img, frame.orientation);
+    let img = output::oriented(&img, frame.orientation());
     match kind {
         ExportKind::Jpeg => idev_formats::write_jpeg_srgb8(
             path,
