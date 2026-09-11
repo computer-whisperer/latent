@@ -1,7 +1,9 @@
 // Colour pass: camera RGB (white balanced, unclamped) -> output space.
-// Each output pixel samples the camera RGB at its lens-corrected source
-// coordinate per channel (distortion, lateral CA): bilinear at scale 1,
-// a scale x scale box average in camera-space linear light otherwise.
+// Each output pixel maps through the output geometry (crop, straighten,
+// EXIF orientation: one affine map, see geometry.rs) to a camera RGB
+// position, then samples at its lens-corrected source coordinate per
+// channel (distortion, lateral CA): bilinear at scale 1, a scale x
+// scale box average in camera-space linear light otherwise.
 // Then highlight handling, the vignetting gain, camera matrix
 // (Bradford-adapted to D65), exposure, tone curve, and the display
 // primaries matrix (identity for exports, BT.2020 -> sRGB for the
@@ -48,6 +50,10 @@ struct Uniforms {
     g0: vec4<f32>,
     g1: vec4<f32>,
     g2: vec4<f32>,
+    // view -> sensor: m00, m01, m10, m11
+    geo_m: vec4<f32>,
+    // view -> sensor: tx, ty; crop origin x, y (view pixels)
+    geo_t: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -133,9 +139,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let p = vec2<i32>(i32(gid.x), i32(gid.y));
-    // This output pixel's centre in camera RGB pixels, and its offset
-    // from the image centre.
-    let out_c = (vec2<f32>(gid.xy) + 0.5) * f32(u.scale);
+    // This output pixel's centre in view pixels, then in camera RGB
+    // pixels (identity geometry maps it exactly), and its offset from
+    // the image centre.
+    let view_c = (vec2<f32>(gid.xy) + 0.5) * f32(u.scale) + u.geo_t.zw;
+    let out_c = vec2<f32>(
+        u.geo_m.x * view_c.x + u.geo_m.y * view_c.y + u.geo_t.x,
+        u.geo_m.z * view_c.x + u.geo_m.w * view_c.y + u.geo_t.y,
+    );
+    if any(out_c < vec2<f32>(0.0)) || any(out_c > vec2<f32>(f32(u.src_width), f32(u.src_height))) {
+        // Outside the content (a crop past the rotated edge).
+        textureStore(out_tex, p, vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
     let off = out_c - u.centre.xy;
     let rout = u.centre.z * length(off);
     var f = vec3<f32>(1.0);

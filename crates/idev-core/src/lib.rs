@@ -13,6 +13,7 @@
 //!   export encodings.
 
 pub mod color;
+pub mod geometry;
 pub mod gpu;
 pub mod metadata;
 pub mod output;

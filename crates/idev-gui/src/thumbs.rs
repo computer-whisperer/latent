@@ -262,7 +262,6 @@ fn developed(raw: &Path, sidecar: &Path, gpu: &ThumbGpu) -> Result<Thumb> {
     let prepared = dev.prepare(g, &source, &params)?;
     let img = dev.develop_prepared(g, &prepared, &params, OutputTarget::SDR, scale)?;
     drop(guard);
-    let img = output::oriented(&img, source.orientation());
     Ok(Thumb {
         image: Image::from_rgb8(img.width, img.height, output::srgb8(&img)),
         developed: true,

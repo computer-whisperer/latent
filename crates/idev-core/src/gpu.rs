@@ -19,7 +19,10 @@ use bytemuck::{Pod, Zeroable};
 use half::f16;
 
 use crate::WorkingImage;
+use rawler::Orientation;
+
 use crate::color::{Gamut, Mat3, XYZ_FROM_BT2020, srgb_from_bt2020};
+use crate::geometry::{self, Layout};
 use crate::params::{
     DEFAULT_WHITE, Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sigmoid_constants,
 };
@@ -207,6 +210,10 @@ struct ColourUniforms {
     g0: [f32; 4],
     g1: [f32; 4],
     g2: [f32; 4],
+    /// view → sensor: m00, m01, m10, m11
+    geo_m: [f32; 4],
+    /// view → sensor: tx, ty; crop origin x, y (view pixels)
+    geo_t: [f32; 4],
 }
 
 /// Spread a correction table over the uniform's 16 slots, repeating
@@ -251,6 +258,8 @@ pub struct Prepared {
     pub demosaic: Demosaic,
     /// A rendered image: no sensor-space steps (highlights, lens).
     is_image: bool,
+    /// EXIF orientation, folded into the output geometry.
+    orientation: Orientation,
     wb: [f32; 3],
     to_working: Mat3,
     ylum_cam: [f32; 3],
@@ -491,6 +500,7 @@ impl Developer {
             white_balance: params.white_balance,
             demosaic: params.demosaic,
             is_image: true,
+            orientation: img.orientation,
             wb: [1.0; 3],
             to_working: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             ylum_cam: XYZ_FROM_BT2020[1],
@@ -711,6 +721,7 @@ impl Developer {
             white_balance: params.white_balance,
             demosaic: params.demosaic,
             is_image: false,
+            orientation: frame.orientation,
             wb,
             to_working,
             ylum_cam,
@@ -720,13 +731,22 @@ impl Developer {
     }
 
     /// Output size of the colour pass for a downscale factor.
-    pub fn scaled_size(prepared: &Prepared, scale: u32) -> (u32, u32) {
-        let s = scale.max(1);
-        (prepared.width.div_ceil(s), prepared.height.div_ceil(s))
+    /// The output geometry (orientation, straighten, crop) for `params`.
+    pub fn layout(prepared: &Prepared, params: &DevelopParams) -> Layout {
+        geometry::layout(
+            (prepared.width, prepared.height),
+            prepared.orientation,
+            &params.geometry,
+        )
+    }
+
+    /// Output size for `params` at an integer downscale.
+    pub fn output_size(prepared: &Prepared, params: &DevelopParams, scale: u32) -> (u32, u32) {
+        Self::layout(prepared, params).scaled(scale)
     }
 
     /// Run the colour pass into `out` (an `Rgba16Float` storage texture
-    /// of [`Self::scaled_size`] for `render.scale`) and submit it.
+    /// of [`Self::output_size`] for `render.scale`) and submit it.
     pub fn colour(
         &self,
         gpu: &Gpu,
@@ -743,7 +763,8 @@ impl Developer {
             display,
             warn,
         } = render;
-        let (out_w, out_h) = Self::scaled_size(prepared, scale);
+        let layout = Self::layout(prepared, params);
+        let (out_w, out_h) = layout.scaled(scale);
         let gain = 2f32.powf(params.exposure_ev);
         let (tone_mode, contrast, hue_preservation, white) = match params.tone {
             ToneCurve::None => (0u32, 1.0, 0.0, DEFAULT_WHITE),
@@ -834,6 +855,13 @@ impl Developer {
                 g0: row(g[0]),
                 g1: row(g[1]),
                 g2: row(g[2]),
+                geo_m: [
+                    layout.m[0][0],
+                    layout.m[0][1],
+                    layout.m[1][0],
+                    layout.m[1][1],
+                ],
+                geo_t: [layout.t[0], layout.t[1], layout.crop[0], layout.crop[1]],
             },
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -938,7 +966,7 @@ impl Developer {
         scale: u32,
     ) -> Result<WorkingImage> {
         let device = &gpu.device;
-        let (out_w, out_h) = Self::scaled_size(prepared, scale);
+        let (out_w, out_h) = Self::output_size(prepared, params, scale);
         let working = texture(
             device,
             "idev::working",

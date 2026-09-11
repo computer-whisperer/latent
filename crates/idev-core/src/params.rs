@@ -142,6 +142,29 @@ pub struct DevelopParams {
     pub highlights: Highlights,
     pub tone: ToneCurve,
     pub lens: LensParams,
+    pub geometry: Geometry,
+}
+
+/// Straighten and crop, applied after the EXIF orientation (see
+/// `geometry`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Geometry {
+    /// Straighten angle in degrees, positive turns the image clockwise.
+    pub angle_deg: f32,
+    /// Crop as fractions (x, y, width, height) of the oriented frame;
+    /// `None` keeps the largest same-aspect rectangle that stays inside
+    /// the rotated content (the whole frame at 0°).
+    pub crop: Option<[f32; 4]>,
+}
+
+impl Default for Geometry {
+    fn default() -> Self {
+        Geometry {
+            angle_deg: 0.0,
+            crop: None,
+        }
+    }
 }
 
 impl Default for DevelopParams {
@@ -154,6 +177,7 @@ impl Default for DevelopParams {
             highlights: Highlights::default(),
             tone: ToneCurve::default(),
             lens: LensParams::default(),
+            geometry: Geometry::default(),
         }
     }
 }

@@ -29,6 +29,7 @@ use damascene_core::widgets::{switch, tabs, text_input};
 use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent, UiEventKind};
 use damascene_winit_wgpu::{Wakeup, WinitWgpuApp};
 use idev_core::color::Gamut;
+use idev_core::geometry;
 use idev_core::gpu::{
     Developer, DisplayPrimaries, Gpu, Histogram, HistogramReadback, OutputTarget, Prepared, Render,
 };
@@ -1245,8 +1246,8 @@ impl IdevApp {
                 .justify(Justify::Center)
                 .fill_size();
         };
-        let (w, h) = frame.size();
-        let (w, h) = (w as f32, h as f32);
+        let layout = geometry::layout(frame.size(), frame.orientation(), &s.params.geometry);
+        let (w, h) = (layout.width as f32, layout.height as f32);
         let content = match self.gpu.as_ref().and_then(|g| g.preview.as_ref()) {
             Some(p) => surface(p.texture.clone())
                 .width(Size::Fixed(w))
@@ -1738,7 +1739,7 @@ impl WinitWgpuApp for IdevApp {
         let prepared = g.prepared.as_ref().expect("prepared above");
 
         if g.preview.as_ref().is_none_or(|p| p.scale != scale) {
-            let (w, h) = Developer::scaled_size(prepared, scale);
+            let (w, h) = Developer::output_size(prepared, &params, scale);
             let texture = g.gpu.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("idev::preview"),
                 size: wgpu::Extent3d {
@@ -1769,12 +1770,12 @@ impl WinitWgpuApp for IdevApp {
         if g.rendered.as_ref() != Some(&want) {
             g.dev
                 .colour(&g.gpu, prepared, &want.0, render, &preview.view);
+            let (w, h) = Developer::output_size(prepared, &want.0, scale);
             g.rendered = Some(want);
             // One histogram in flight at a time; a newer render just
             // waits for the next frame. The zebra overlay would pollute
             // it, so the last clean histogram stays while warning.
             if g.histogram_pending.is_none() && render.warn.is_none() {
-                let (w, h) = Developer::scaled_size(prepared, scale);
                 g.histogram_pending =
                     Some(
                         g.dev
@@ -1837,8 +1838,8 @@ fn export_to(
         ExportKind::HdrPng | ExportKind::HdrAvif => OutputTarget::hdr_nits(HDR_EXPORT_NITS),
         _ => OutputTarget::SDR,
     };
+    // Oriented, straightened and cropped by the colour pass itself.
     let img: WorkingImage = dev.develop(&gpu, frame, params, target)?;
-    let img = output::oriented(&img, frame.orientation());
     let note = metadata::develop_note(source_name, params);
     let exif = metadata::exif_for_output(
         &frame.metadata().tags,

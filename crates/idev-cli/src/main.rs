@@ -112,6 +112,13 @@ struct Overrides {
     /// Lens corrections from the camera's tables.
     #[arg(long)]
     lens: Option<LensArg>,
+    /// Straighten: degrees, positive turns the image clockwise.
+    #[arg(long, allow_negative_numbers = true)]
+    rotate: Option<f32>,
+    /// Crop as fractions "x,y,w,h" of the oriented frame, or "auto"
+    /// (largest same-aspect rectangle inside the straightened content).
+    #[arg(long)]
+    crop: Option<String>,
 }
 
 impl Overrides {
@@ -150,6 +157,26 @@ impl Overrides {
             p.lens = match l {
                 LensArg::All => LensParams::default(),
                 LensArg::None => LensParams::NONE,
+            };
+        }
+        if let Some(deg) = self.rotate {
+            p.geometry.angle_deg = deg;
+        }
+        if let Some(c) = &self.crop {
+            p.geometry.crop = if c == "auto" {
+                None
+            } else {
+                let v: Vec<f32> = c
+                    .split(',')
+                    .map(|x| x.trim().parse::<f32>())
+                    .collect::<Result<_, _>>()
+                    .with_context(|| format!("--crop {c}: expected x,y,w,h fractions"))?;
+                anyhow::ensure!(v.len() == 4, "--crop {c}: expected four values");
+                anyhow::ensure!(
+                    v[2] > 0.0 && v[3] > 0.0 && v.iter().all(|x| (0.0..=1.0).contains(x)),
+                    "--crop {c}: fractions must lie in 0..=1 with positive size"
+                );
+                Some([v[0], v[1], v[2], v[3]])
             };
         }
         if let Some(d) = self.demosaic {
@@ -542,7 +569,6 @@ fn develop_one(
     let t1 = Instant::now();
     let img: WorkingImage = dev.develop(gpu, &source, &params, target)?;
     let t2 = Instant::now();
-    let img = output::oriented(&img, source.orientation());
     let name = input
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
