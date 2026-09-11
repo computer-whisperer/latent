@@ -118,8 +118,10 @@ fn named(key: NamedKey) -> KeyChord {
     KeyChord::named(LogicalKey::Named(key))
 }
 
-/// Peak nits a "HDR PNG" export is mastered for.
+/// Peak nits the HDR exports are mastered for.
 const HDR_EXPORT_NITS: f32 = 1000.0;
+/// JPEG / AVIF quality for GUI exports.
+const EXPORT_QUALITY: u8 = 92;
 const SIDEBAR_WIDTH: f32 = 320.0;
 const FIT_PADDING: f32 = 8.0;
 const TABS_WIDTH: f32 = 170.0;
@@ -166,6 +168,8 @@ enum ExportKind {
     Jpeg,
     Png,
     HdrPng,
+    Avif,
+    HdrAvif,
     Exr,
 }
 
@@ -174,6 +178,7 @@ impl ExportKind {
         match self {
             ExportKind::Jpeg => "jpg",
             ExportKind::Png | ExportKind::HdrPng => "png",
+            ExportKind::Avif | ExportKind::HdrAvif => "avif",
             ExportKind::Exr => "exr",
         }
     }
@@ -653,7 +658,7 @@ impl IdevApp {
             .name("idev-export".into())
             .spawn(move || {
                 let suffix = match kind {
-                    ExportKind::HdrPng => ".hdr",
+                    ExportKind::HdrPng | ExportKind::HdrAvif => ".hdr",
                     _ => "",
                 };
                 let picked = rfd::FileDialog::new()
@@ -973,12 +978,19 @@ impl IdevApp {
                 row([
                     button("JPEG").key("export-jpg"),
                     button("PNG").key("export-png"),
-                    button("HDR PNG")
-                        .key("export-hdr-png")
-                        .tooltip("BT.2020 PQ 16-bit, 1000-nit master"),
+                    button("AVIF").key("export-avif"),
                     button("EXR")
                         .key("export-exr")
                         .tooltip("scRGB linear f16, current parameters"),
+                ])
+                .gap(tokens::SPACE_2),
+                row([
+                    button("HDR PNG")
+                        .key("export-hdr-png")
+                        .tooltip("BT.2020 PQ 16-bit, 1000-nit master"),
+                    button("HDR AVIF")
+                        .key("export-hdr-avif")
+                        .tooltip("BT.2020 PQ 10-bit, 1000-nit master"),
                 ])
                 .gap(tokens::SPACE_2),
                 if self.exports_running > 0 {
@@ -1155,6 +1167,14 @@ impl IdevApp {
         }
         if event.is_click_or_activate("export-exr") {
             self.export(ExportKind::Exr);
+            return;
+        }
+        if event.is_click_or_activate("export-avif") {
+            self.export(ExportKind::Avif);
+            return;
+        }
+        if event.is_click_or_activate("export-hdr-avif") {
+            self.export(ExportKind::HdrAvif);
             return;
         }
         if event.is_click_or_activate("reset") {
@@ -1578,15 +1598,19 @@ fn export_to(
     let gpu = Gpu::headless()?;
     let dev = Developer::new(&gpu);
     let target = match kind {
-        ExportKind::HdrPng => OutputTarget::hdr_nits(HDR_EXPORT_NITS),
+        ExportKind::HdrPng | ExportKind::HdrAvif => OutputTarget::hdr_nits(HDR_EXPORT_NITS),
         _ => OutputTarget::SDR,
     };
     let img: WorkingImage = dev.develop(&gpu, frame, params, target)?;
     let img = output::oriented(&img, frame.orientation);
     match kind {
-        ExportKind::Jpeg => {
-            idev_formats::write_jpeg_srgb8(path, img.width, img.height, &output::srgb8(&img), 92)?
-        }
+        ExportKind::Jpeg => idev_formats::write_jpeg_srgb8(
+            path,
+            img.width,
+            img.height,
+            &output::srgb8(&img),
+            EXPORT_QUALITY,
+        )?,
         ExportKind::Png => {
             idev_formats::write_png_srgb8(path, img.width, img.height, &output::srgb8(&img))?
         }
@@ -1595,6 +1619,20 @@ fn export_to(
             img.width,
             img.height,
             &output::bt2020_pq16(&img),
+        )?,
+        ExportKind::Avif => idev_formats::write_avif_srgb8(
+            path,
+            img.width,
+            img.height,
+            &output::srgb8(&img),
+            EXPORT_QUALITY,
+        )?,
+        ExportKind::HdrAvif => idev_formats::write_avif_bt2020_pq10(
+            path,
+            img.width,
+            img.height,
+            &output::bt2020_pq16(&img),
+            EXPORT_QUALITY,
         )?,
         ExportKind::Exr => idev_formats::write_exr_rgb_f32(
             path,

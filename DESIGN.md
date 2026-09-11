@@ -444,6 +444,24 @@ soft-proof questions go back to the user.
   toggled at 1:1 in the GUI.
 - GUI: a "Lens" sidebar group with three switches; not exercised.
 
+## AVIF export results (2026-09-11)
+
+- `idev-formats::avif`: rav1e (pure Rust, no assembly, `threading`)
+  plus avif-serialize. Still picture, 4:4:4, identity matrix (planes
+  carry G, B, R), full range, 10-bit in both flavours. SDR widens
+  sRGB 8-bit; HDR narrows the PQ 16-bit samples. ravif's quality →
+  quantizer mapping; speed preset 6.
+- ffprobe reads the tags as intended: `gbrp10le`, `pc` range,
+  `gbr`, sRGB / BT.709 for SDR, `smpte2084` / `bt2020` for HDR.
+- Round trip through ffmpeg's decoder at quality 92: SDR 43.8 dB
+  PSNR against the PNG (mean 1.3 / 255, max 13); HDR 44.9 dB against
+  the PQ PNG in 16-bit code values.
+- Cost on the 25 MP frame: 27 s per file on 16 threads (JPEG: 1 s,
+  PQ PNG: 5 s); SDR 18 MB, HDR 12 MB. Speed preset and quality are
+  the knobs if that is too slow.
+- `--format avif` (with `--hdr` for PQ) on the CLI; "AVIF" and "HDR
+  AVIF" buttons in the GUI export group (not exercised).
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

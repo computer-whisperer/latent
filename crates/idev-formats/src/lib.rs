@@ -1,9 +1,12 @@
 //! Output encoders. Each function takes pixels already transformed to
 //! the target encoding; the color decisions live in `idev-core::output`.
 
+mod avif;
+
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
+pub use avif::{write_avif_bt2020_pq10, write_avif_srgb8};
 
 /// Write linear RGB (sRGB/Rec.709 primaries, the EXR default) as f16.
 pub fn write_exr_rgb_f32(path: &Path, width: u32, height: u32, rgb: &[f32]) -> Result<()> {

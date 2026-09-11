@@ -13,3 +13,6 @@ exr.workspace = true
 png.workspace = true
 image.workspace = true
 half.workspace = true
+rav1e = { version = "0.8", default-features = false, features = ["threading"] }
+avif-serialize = "0.8"
+v_frame = "0.3"

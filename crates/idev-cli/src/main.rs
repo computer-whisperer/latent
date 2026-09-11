@@ -25,6 +25,8 @@ enum Format {
     Png,
     /// sRGB 8-bit
     Jpg,
+    /// sRGB 10-bit, or BT.2020 PQ 10-bit with --hdr
+    Avif,
 }
 
 impl Format {
@@ -32,6 +34,7 @@ impl Format {
         match self {
             Format::Exr => "exr",
             Format::Png => "png",
+            Format::Avif => "avif",
             Format::Jpg => "jpg",
         }
     }
@@ -240,7 +243,7 @@ enum Cmd {
         /// write PNG as BT.2020 PQ 16-bit.
         #[arg(long)]
         hdr: Option<f32>,
-        /// JPEG quality.
+        /// JPEG / AVIF quality.
         #[arg(long, default_value_t = 92)]
         quality: u8,
         /// Overwrite existing outputs.
@@ -545,6 +548,22 @@ fn encode(
             &output::srgb8(img),
             quality,
         ),
-        (Format::Jpg, Some(_)) => bail!("JPEG has no HDR encoding; use png or exr with --hdr"),
+        (Format::Jpg, Some(_)) => {
+            bail!("JPEG has no HDR encoding; use png, avif or exr with --hdr")
+        }
+        (Format::Avif, None) => idev_formats::write_avif_srgb8(
+            path,
+            img.width,
+            img.height,
+            &output::srgb8(img),
+            quality,
+        ),
+        (Format::Avif, Some(_)) => idev_formats::write_avif_bt2020_pq10(
+            path,
+            img.width,
+            img.height,
+            &output::bt2020_pq16(img),
+            quality,
+        ),
     }
 }
