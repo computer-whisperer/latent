@@ -53,12 +53,22 @@ pub enum ToneCurve {
     None,
     /// Grey-anchored sigmoid in linear light: 0.18 maps to 0.18, the
     /// slope at grey scales with `contrast`, and the curve approaches
-    /// the output target's peak asymptotically. `hue_preservation`
-    /// blends from per-channel (0) toward a luminance-ratio result (1).
+    /// the output target's peak at scene value `white` (relative to
+    /// diffuse white: 1.0 is diffuse white itself, 4.0 two stops above);
+    /// anything brighter clips there. `hue_preservation` blends from
+    /// per-channel (0) toward a luminance-ratio result (1).
     Sigmoid {
         contrast: f32,
         hue_preservation: f32,
+        #[serde(default = "default_white")]
+        white: f32,
     },
+}
+
+pub const DEFAULT_WHITE: f32 = 4.0;
+
+fn default_white() -> f32 {
+    DEFAULT_WHITE
 }
 
 impl Default for ToneCurve {
@@ -66,8 +76,30 @@ impl Default for ToneCurve {
         ToneCurve::Sigmoid {
             contrast: 1.6,
             hue_preservation: 0.0,
+            white: DEFAULT_WHITE,
         }
     }
+}
+
+/// The sigmoid's constants for a target peak: `(contrast, s, white)`
+/// such that `f(x) = peak * F(x) / F(white)` with `F(x) = x^c / (x^c + s)`
+/// passes through grey and reaches `peak` at `white`.
+///
+/// Anchoring grey fixes `s` for a given contrast; that solution only
+/// exists when the contrast is above `ln(peak/grey) / ln(white/grey)`,
+/// so the contrast is raised to that floor when necessary, and `white`
+/// is held above the peak (a white below the display's peak is
+/// meaningless).
+pub fn sigmoid_constants(contrast: f32, white: f32, peak: f32) -> (f32, f32, f32) {
+    const GREY: f32 = 0.18;
+    let white = white.max(peak * 1.001).max(GREY * 1.5);
+    let c_min = (peak / GREY).ln() / (white / GREY).ln();
+    let c = contrast.max(c_min * 1.02);
+    let r = GREY / peak;
+    let a = GREY.powf(c);
+    let b = white.powf(c);
+    let s = a * b * (1.0 - r) / (r * b - a);
+    (c, s.max(1e-6), white)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,5 +169,51 @@ impl DevelopParams {
         } else {
             Ok(Self::default())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f(x: f32, c: f32, s: f32, white: f32, peak: f32) -> f32 {
+        let big_f = |v: f32| v.powf(c) / (v.powf(c) + s);
+        peak * big_f(x) / big_f(white)
+    }
+
+    #[test]
+    fn sigmoid_hits_grey_and_white() {
+        for (contrast, white, peak) in [
+            (1.6, 4.0, 1.0),
+            (1.6, 4.0, 2.0),
+            (1.2, 2.0, 1.0),
+            (0.5, 8.0, 1.0),
+        ] {
+            let (c, s, w) = sigmoid_constants(contrast, white, peak);
+            assert!(
+                (f(0.18, c, s, w, peak) - 0.18).abs() < 1e-3,
+                "grey {contrast} {white} {peak}"
+            );
+            assert!(
+                (f(w, c, s, w, peak) - peak).abs() < 1e-3,
+                "white {contrast} {white} {peak}"
+            );
+            assert!(f(0.05, c, s, w, peak) < f(0.5, c, s, w, peak), "monotone");
+        }
+    }
+
+    #[test]
+    fn old_sidecar_without_white_loads() {
+        let text =
+            "schema = 1\n[tone]\nkind = \"sigmoid\"\ncontrast = 1.6\nhue_preservation = 0.0\n";
+        let p: DevelopParams = toml::from_str(text).unwrap();
+        assert_eq!(
+            p.tone,
+            ToneCurve::Sigmoid {
+                contrast: 1.6,
+                hue_preservation: 0.0,
+                white: DEFAULT_WHITE
+            }
+        );
     }
 }

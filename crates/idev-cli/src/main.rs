@@ -94,6 +94,10 @@ struct Overrides {
     /// Sigmoid hue preservation, 0 (per channel) to 1 (luminance ratio).
     #[arg(long)]
     hue_preservation: Option<f32>,
+    /// Sigmoid white: scene value (1.0 = diffuse white) that maps to the
+    /// output peak.
+    #[arg(long)]
+    white: Option<f32>,
 }
 
 impl Overrides {
@@ -149,17 +153,19 @@ impl Overrides {
                 },
             };
         }
-        if self.contrast.is_some() || self.hue_preservation.is_some() {
-            let (mut c, mut h) = match p.tone {
+        if self.contrast.is_some() || self.hue_preservation.is_some() || self.white.is_some() {
+            let (mut c, mut h, mut w) = match p.tone {
                 ToneCurve::Sigmoid {
                     contrast,
                     hue_preservation,
-                } => (contrast, hue_preservation),
+                    white,
+                } => (contrast, hue_preservation, white),
                 ToneCurve::None => match ToneCurve::default() {
                     ToneCurve::Sigmoid {
                         contrast,
                         hue_preservation,
-                    } => (contrast, hue_preservation),
+                        white,
+                    } => (contrast, hue_preservation, white),
                     ToneCurve::None => unreachable!(),
                 },
             };
@@ -169,9 +175,13 @@ impl Overrides {
             if let Some(v) = self.hue_preservation {
                 h = v;
             }
+            if let Some(v) = self.white {
+                w = v;
+            }
             p.tone = ToneCurve::Sigmoid {
                 contrast: c,
                 hue_preservation: h,
+                white: w,
             };
         }
         Ok(())

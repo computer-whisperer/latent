@@ -300,6 +300,27 @@ screenshot: the preview renders through `surface()` inside a
   export dialog) was not exercised by me; it is wired through
   damascene's documented `apply_event` folds.
 
+## Chunk after milestone 3 (2026-09-11): white point, histogram
+
+- **Sigmoid white point.** `ToneCurve::Sigmoid` gained `white` (scene
+  value, relative to diffuse white, that maps to the output peak;
+  default 4.0). Curve is `peak · F(x) / F(white)` with
+  `F(x) = x^c / (x^c + s)`; `s` solves the grey anchor for the chosen
+  contrast, which only exists above a contrast floor of
+  `ln(peak/grey) / ln(white/grey)`, so contrast is raised to it when
+  needed. Old sidecars load with the default. At white 2.9 (this
+  camera's fully-clipped level) clipped regions reach exact white.
+- **Histogram.** Compute pass over the preview texture: 3 × 256 bins
+  of sRGB-encoded values after division by the display peak, atomics
+  into a storage buffer, copied to a staging buffer and mapped
+  asynchronously; the UI polls without blocking, one in flight at a
+  time. Drawn as 128 overlaid translucent bars per channel, log
+  counts, plain Els (damascene's plot API was more surface than the
+  widget needed).
+- GUI sidecar writes are debounced 250 ms on a writer thread after
+  synchronous writes on a Ceph mount (20–70 ms each) starved the
+  Wayland socket during drags and the compositor dropped the client.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

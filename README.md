@@ -9,7 +9,7 @@ idev inspect DSC00039.ARW
 idev develop DSC00039.ARW -o out.jpg                      # sRGB JPEG, sidecar params if present
 idev develop DSC00039.ARW -o out.png --hdr 1000           # BT.2020 PQ 16-bit PNG for a 1000-nit master
 idev develop DSC00039.ARW -o out.exr --tone none          # scene-referred scRGB linear f16
-idev develop DSC00039.ARW -o out.jpg --exposure 0.5 --temp 5200,4 --contrast 1.8 --save-params
+idev develop DSC00039.ARW -o out.jpg --exposure 0.5 --temp 5200,4 --contrast 1.8 --white 2.9 --save-params
 idev develop *.ARW --out-dir developed --format jpg       # batch; skips existing outputs
 idev params DSC00039.ARW                                  # resolved params (sidecar + defaults)
 idev dump-bayer DSC00039.ARW -o raw.pgm                   # decoder cross-checks
@@ -20,10 +20,11 @@ Parameters live in `<raw>.idev.toml` beside each raw; flags override,
 `--save-params` writes back.
 
 GUI: `cargo run --release -p idev-gui -- DSC00039.ARW` opens a develop
-window (damascene, HDR-aware on prism): pan/zoom preview, scrubbers for
-exposure, contrast, hue preservation, temperature and tint, tabs for
-tone curve, highlights and demosaic, export buttons, and the sidecar is
-written on every change. Keys: `f` fit, `1` 1:1, `t` SDR preview,
+window (damascene, HDR-aware on prism): pan/zoom preview, a per-channel
+histogram of the preview, scrubbers for exposure, contrast, hue
+preservation, white, temperature and tint, tabs for tone curve,
+highlights and demosaic, export buttons, and the sidecar is written
+(debounced) on every change. Keys: `f` fit, `1` 1:1, `t` SDR preview,
 `e` export JPEG.
 
 Crates:

@@ -25,19 +25,22 @@ struct Uniforms {
     d2: vec4<f32>,
     // exposure gain, contrast, peak, hue preservation
     tone: vec4<f32>,
+    // sigmoid s, white, 1 / F(white), pad
+    tone2: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var cam_rgb: texture_2d<f32>;
 @group(0) @binding(2) var out_tex: texture_storage_2d<rgba16float, write>;
 
-const GREY: f32 = 0.18;
 const Y2020: vec3<f32> = vec3<f32>(0.2627, 0.6780, 0.0593);
 
+// peak * F(x) / F(white), F(x) = x^c / (x^c + s); constants from
+// params::sigmoid_constants so grey stays at grey and white hits peak.
 fn sigmoid(x: f32, contrast: f32, peak: f32) -> f32 {
     let xc = pow(max(x, 0.0), contrast);
-    let s = pow(GREY, contrast) * (peak / GREY - 1.0);
-    return peak * xc / (xc + s);
+    let f = xc / (xc + u.tone2.x);
+    return min(peak * f * u.tone2.z, peak);
 }
 
 @compute @workgroup_size(16, 16)

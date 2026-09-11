@@ -20,7 +20,9 @@ use half::f16;
 
 use crate::WorkingImage;
 use crate::color::{Mat3, XYZ_FROM_BT2020, srgb_from_bt2020};
-use crate::params::{Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance};
+use crate::params::{
+    DEFAULT_WHITE, Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sigmoid_constants,
+};
 use crate::sensor::SensorFrame;
 use crate::whitepoint::{self, Temperature, xy_from_temperature};
 
@@ -115,6 +117,61 @@ struct CropUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct HistogramUniforms {
+    width: u32,
+    height: u32,
+    peak: f32,
+    _pad: u32,
+}
+
+/// 3 x 256 bins over sRGB-encoded channel values.
+#[derive(Debug, Clone)]
+pub struct Histogram {
+    pub bins: [[u32; 256]; 3],
+    pub pixels: u32,
+}
+
+/// A histogram in flight on the GPU. Poll with [`Self::try_take`] from
+/// the UI thread; it never blocks.
+pub struct HistogramReadback {
+    staging: wgpu::Buffer,
+    rx: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    mapped: bool,
+    pixels: u32,
+}
+
+impl HistogramReadback {
+    /// The histogram once the GPU has finished and the buffer mapped;
+    /// `None` while still pending. Consumes the readback on success.
+    pub fn try_take(&mut self) -> Option<Histogram> {
+        if !self.mapped {
+            match self.rx.try_recv() {
+                Ok(Ok(())) => self.mapped = true,
+                Ok(Err(e)) => {
+                    tracing::warn!("histogram map failed: {e:?}");
+                    return None;
+                }
+                Err(_) => return None,
+            }
+        }
+        let view = self.staging.slice(..).get_mapped_range().ok()?;
+        let words: &[u32] = bytemuck::cast_slice(&view);
+        let mut bins = [[0u32; 256]; 3];
+        for c in 0..3 {
+            bins[c].copy_from_slice(&words[c * 256..(c + 1) * 256]);
+        }
+        drop(view);
+        self.staging.unmap();
+        self.mapped = false;
+        Some(Histogram {
+            bins,
+            pixels: self.pixels,
+        })
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct ColourUniforms {
     width: u32,
     height: u32,
@@ -133,6 +190,7 @@ struct ColourUniforms {
     d1: [f32; 4],
     d2: [f32; 4],
     tone: [f32; 4],
+    tone2: [f32; 4],
 }
 
 /// Primaries the colour pass writes.
@@ -178,6 +236,7 @@ struct Pass {
 enum Slot {
     Uniform,
     StorageBuffer,
+    StorageBufferRw,
     Texture,
     StorageTexture(wgpu::TextureFormat),
 }
@@ -202,6 +261,11 @@ impl Pass {
                     },
                     Slot::StorageBuffer => wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    Slot::StorageBufferRw => wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -286,6 +350,7 @@ pub struct Developer {
     rcd_green: Pass,
     rcd_rb: Pass,
     colour: Pass,
+    histogram: Pass,
 }
 
 impl Developer {
@@ -329,6 +394,12 @@ impl Developer {
                 "idev::colour",
                 include_str!("shaders/colour.wgsl"),
                 &[Uniform, Texture, StorageTexture(Rgba16Float)],
+            ),
+            histogram: Pass::new(
+                d,
+                "idev::histogram",
+                include_str!("shaders/histogram.wgsl"),
+                &[Uniform, Texture, StorageBufferRw],
             ),
         }
     }
@@ -576,13 +647,16 @@ impl Developer {
         let queue = &gpu.queue;
         let (out_w, out_h) = Self::scaled_size(prepared, scale);
         let gain = 2f32.powf(params.exposure_ev);
-        let (tone_mode, contrast, hue_preservation) = match params.tone {
-            ToneCurve::None => (0u32, 1.0, 0.0),
+        let (tone_mode, contrast, hue_preservation, white) = match params.tone {
+            ToneCurve::None => (0u32, 1.0, 0.0, DEFAULT_WHITE),
             ToneCurve::Sigmoid {
                 contrast,
                 hue_preservation,
-            } => (1u32, contrast, hue_preservation),
+                white,
+            } => (1u32, contrast, hue_preservation, white),
         };
+        let (contrast, sig_s, white) = sigmoid_constants(contrast, white, target.peak);
+        let f_white = white.powf(contrast) / (white.powf(contrast) + sig_s);
         let highlight_mode = match params.highlights {
             Highlights::Clip => 0u32,
             Highlights::Blend => 1u32,
@@ -619,6 +693,7 @@ impl Developer {
                 d1: row(d[1]),
                 d2: row(d[2]),
                 tone: [gain, contrast, target.peak, hue_preservation],
+                tone2: [sig_s, white, 1.0 / f_white, 0.0],
             },
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -634,6 +709,70 @@ impl Developer {
         );
         self.colour.dispatch(&mut encoder, &bg, out_w, out_h);
         queue.submit([encoder.finish()]);
+    }
+
+    /// Submit a histogram of a developed texture (values divided by
+    /// `peak` before sRGB encoding) and start its readback.
+    pub fn histogram(
+        &self,
+        gpu: &Gpu,
+        image: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        peak: f32,
+    ) -> HistogramReadback {
+        let device = &gpu.device;
+        let queue = &gpu.queue;
+        let size = (3 * 256 * std::mem::size_of::<u32>()) as u64;
+        let bins = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("idev::histogram::bins"),
+            size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("idev::histogram::staging"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let u = uniform_buffer(
+            device,
+            queue,
+            &HistogramUniforms {
+                width,
+                height,
+                peak: peak.max(1e-3),
+                _pad: 0,
+            },
+        );
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("idev::histogram"),
+        });
+        encoder.clear_buffer(&bins, 0, None);
+        let bg = self.histogram.bind(
+            device,
+            &[
+                u.as_entire_binding(),
+                wgpu::BindingResource::TextureView(image),
+                bins.as_entire_binding(),
+            ],
+        );
+        self.histogram.dispatch(&mut encoder, &bg, width, height);
+        encoder.copy_buffer_to_buffer(&bins, 0, &staging, 0, size);
+        queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        HistogramReadback {
+            staging,
+            rx,
+            mapped: false,
+            pixels: width * height,
+        }
     }
 
     /// Full-resolution develop with CPU readback (the CLI path).

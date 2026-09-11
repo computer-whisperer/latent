@@ -24,9 +24,11 @@ use damascene_core::widgets::number_scrubber::{self, ScrubDrag, ScrubberOpts};
 use damascene_core::widgets::tabs;
 use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent};
 use damascene_winit_wgpu::{Wakeup, WinitWgpuApp};
-use idev_core::gpu::{Developer, DisplayPrimaries, Gpu, OutputTarget, Prepared};
+use idev_core::gpu::{
+    Developer, DisplayPrimaries, Gpu, Histogram, HistogramReadback, OutputTarget, Prepared,
+};
 use idev_core::params::{
-    Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sidecar_path,
+    DEFAULT_WHITE, Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sidecar_path,
 };
 use idev_core::sensor::{self, SensorFrame};
 use idev_core::whitepoint::{self, Temperature};
@@ -111,6 +113,7 @@ const HDR_EXPORT_NITS: f32 = 1000.0;
 const SIDEBAR_WIDTH: f32 = 320.0;
 const FIT_PADDING: f32 = 8.0;
 const TABS_WIDTH: f32 = 170.0;
+const HISTOGRAM_HEIGHT: f32 = 90.0;
 
 struct GpuState {
     gpu: Gpu,
@@ -119,6 +122,8 @@ struct GpuState {
     preview: Option<Preview>,
     /// What the preview texture currently shows.
     rendered: Option<(DevelopParams, f32, u32)>,
+    /// Histogram of the preview, in flight.
+    histogram_pending: Option<HistogramReadback>,
 }
 
 struct Preview {
@@ -159,6 +164,7 @@ pub struct DevelopApp {
     export_rx: Vec<Receiver<Result<PathBuf>>>,
     exports_running: usize,
     sdr_preview: bool,
+    histogram: Option<Histogram>,
 
     // Read during build (immutable), consumed in before_paint.
     last_zoom: Cell<f32>,
@@ -170,6 +176,7 @@ pub struct DevelopApp {
     exposure: Scrub,
     contrast: Scrub,
     hue: Scrub,
+    white: Scrub,
     kelvin: Scrub,
     tint: Scrub,
 }
@@ -228,6 +235,7 @@ impl DevelopApp {
             export_rx: Vec::new(),
             exports_running: 0,
             sdr_preview: false,
+            histogram: None,
             last_zoom: Cell::new(0.2),
             scale_factor: Cell::new(1.0),
             display_peak: Cell::new(1.0),
@@ -235,6 +243,7 @@ impl DevelopApp {
             exposure: Scrub::default(),
             contrast: Scrub::default(),
             hue: Scrub::default(),
+            white: Scrub::default(),
             kelvin: Scrub::default(),
             tint: Scrub::default(),
         };
@@ -246,15 +255,17 @@ impl DevelopApp {
     /// as-shot white once it is known).
     fn seed_controls(&mut self) {
         self.exposure.set(self.params.exposure_ev, 2);
-        let (c, h) = match self.params.tone {
+        let (c, h, w) = match self.params.tone {
             ToneCurve::Sigmoid {
                 contrast,
                 hue_preservation,
-            } => (contrast, hue_preservation),
-            ToneCurve::None => (1.6, 0.0),
+                white,
+            } => (contrast, hue_preservation, white),
+            ToneCurve::None => (1.6, 0.0, DEFAULT_WHITE),
         };
         self.contrast.set(c, 2);
         self.hue.set(h, 2);
+        self.white.set(w, 2);
         let temp = match (self.params.white_balance, &self.frame) {
             (WhiteBalance::Temperature { kelvin, tint }, _) => Some(Temperature { kelvin, tint }),
             (WhiteBalance::AsShot, Some(f)) => {
@@ -293,11 +304,13 @@ impl DevelopApp {
 
     fn set_tone_numbers(&mut self) {
         if let ToneCurve::Sigmoid { .. } = self.params.tone
-            && let (Some(c), Some(h)) = (self.contrast.value(), self.hue.value())
+            && let (Some(c), Some(h), Some(w)) =
+                (self.contrast.value(), self.hue.value(), self.white.value())
         {
             self.params.tone = ToneCurve::Sigmoid {
                 contrast: c.max(0.1),
                 hue_preservation: h.clamp(0.0, 1.0),
+                white: w.max(1.0),
             };
             self.params_changed();
         }
@@ -447,6 +460,7 @@ impl DevelopApp {
             .width(Size::Fixed(TABS_WIDTH))
         };
         sidebar([scroll([column([
+            sidebar_group([sidebar_group_label("Histogram"), self.histogram_el()]),
             sidebar_group([
                 sidebar_group_label("Tone"),
                 field_row(
@@ -463,6 +477,7 @@ impl DevelopApp {
                 ),
                 field_row("Contrast", number_scrubber("contrast", &self.contrast.text)),
                 field_row("Hue preservation", number_scrubber("hue", &self.hue.text)),
+                field_row("White", number_scrubber("white", &self.white.text)).tooltip("scene value mapped to the display peak; 1 = diffuse white, 4 = two stops above"),
             ]),
             sidebar_group([
                 sidebar_group_label("White balance"),
@@ -522,6 +537,59 @@ impl DevelopApp {
         .gap(tokens::SPACE_4)])
         .scrollbar()])
         .width(Size::Fixed(SIDEBAR_WIDTH))
+    }
+
+    /// Per-channel histogram as translucent bars, log-scaled counts.
+    fn histogram_el(&self) -> El {
+        let Some(h) = &self.histogram else {
+            return skeleton().height(Size::Fixed(HISTOGRAM_HEIGHT));
+        };
+        let bin_px = 2.0;
+        let bins = 128usize;
+        let per = 256 / bins;
+        let max = h
+            .bins
+            .iter()
+            .flat_map(|c| c.chunks(per).map(|ch| ch.iter().sum::<u32>()))
+            .max()
+            .unwrap_or(1)
+            .max(1) as f32;
+        let scale = |v: u32| -> f32 {
+            if v == 0 {
+                0.0
+            } else {
+                (v as f32).ln_1p() / max.ln_1p() * HISTOGRAM_HEIGHT
+            }
+        };
+        let colours = [
+            Color::srgb_u8(242, 77, 77),
+            Color::srgb_u8(77, 217, 90),
+            Color::srgb_u8(90, 128, 255),
+        ];
+        let columns: Vec<El> = (0..bins)
+            .map(|i| {
+                let bars: Vec<El> = (0..3)
+                    .map(|c| {
+                        let v: u32 = h.bins[c][i * per..(i + 1) * per].iter().sum();
+                        column(Vec::<El>::new())
+                            .width(Size::Fixed(bin_px))
+                            .height(Size::Fixed(scale(v)))
+                            .fill(colours[c].with_alpha(0.55))
+                    })
+                    .collect();
+                // Overlay the three bars, bottom-aligned.
+                stack(
+                    bars.into_iter()
+                        .map(|b| column([b]).justify(Justify::End).fill_size())
+                        .collect::<Vec<_>>(),
+                )
+                .width(Size::Fixed(bin_px))
+                .height(Size::Fixed(HISTOGRAM_HEIGHT))
+            })
+            .collect();
+        row(columns)
+            .height(Size::Fixed(HISTOGRAM_HEIGHT))
+            .fill(tokens::MUTED.with_alpha(0.3))
     }
 
     fn canvas(&self) -> El {
@@ -733,6 +801,22 @@ impl App for DevelopApp {
             self.set_tone_numbers();
             return;
         }
+        let white = ScrubberOpts::default()
+            .min(1.0)
+            .max(32.0)
+            .step(0.1)
+            .sensitivity(3.0)
+            .decimals(2);
+        if number_scrubber::apply_event(
+            &mut self.white.text,
+            &mut self.white.drag,
+            "white",
+            &white,
+            &event,
+        ) {
+            self.set_tone_numbers();
+            return;
+        }
         let kelvin = ScrubberOpts::default()
             .min(1667.0)
             .max(25000.0)
@@ -820,6 +904,7 @@ impl WinitWgpuApp for DevelopApp {
             prepared: None,
             preview: None,
             rendered: None,
+            histogram_pending: None,
         });
     }
 
@@ -889,6 +974,19 @@ impl WinitWgpuApp for DevelopApp {
                 &preview.view,
             );
             g.rendered = Some(want);
+            // One histogram in flight at a time; a newer render just
+            // waits for the next frame.
+            if g.histogram_pending.is_none() {
+                let (w, h) = Developer::scaled_size(prepared, scale);
+                g.histogram_pending = Some(g.dev.histogram(&g.gpu, &preview.view, w, h, peak));
+            }
+        }
+        if let Some(pending) = g.histogram_pending.as_mut()
+            && let Some(hist) = pending.try_take()
+        {
+            g.histogram_pending = None;
+            self.histogram = Some(hist);
+            wake(&self.wakeup);
         }
     }
 }
