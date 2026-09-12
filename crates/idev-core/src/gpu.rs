@@ -15,6 +15,8 @@
 //! per slider event. [`Developer::develop`] chains both with a readback.
 
 use anyhow::{Context, Result, anyhow};
+use std::cell::RefCell;
+
 use bytemuck::{Pod, Zeroable};
 use half::f16;
 
@@ -24,7 +26,7 @@ use rawler::Orientation;
 use crate::color::{Gamut, Mat3, XYZ_FROM_BT2020, srgb_from_bt2020};
 use crate::geometry::{self, Layout};
 use crate::params::{
-    DEFAULT_WHITE, Demosaic, DevelopParams, Highlights, Sharpen, ToneCurve, WhiteBalance,
+    DEFAULT_WHITE, Demosaic, Denoise, DevelopParams, Highlights, Sharpen, ToneCurve, WhiteBalance,
     sigmoid_constants,
 };
 use crate::sensor::{LensCorrection, SensorFrame};
@@ -271,6 +273,9 @@ pub struct Prepared {
     ylum_cam: [f32; 3],
     lens: Option<LensCorrection>,
     cam_rgb: Tex,
+    /// The denoised camera RGB for the last `Denoise` used, rebuilt by
+    /// the colour pass when the parameters change.
+    denoised: RefCell<Option<(Denoise, Tex)>>,
 }
 
 impl Prepared {
@@ -412,6 +417,19 @@ pub struct Developer {
     resample: Pass,
     sharpen_blur: Pass,
     sharpen_apply: Pass,
+    denoise: Pass,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct DenoiseUniforms {
+    width: u32,
+    height: u32,
+    _pad0: [u32; 2],
+    chroma: f32,
+    luma: f32,
+    _pad1: [f32; 2],
+    ylum: [f32; 4],
 }
 
 #[repr(C)]
@@ -527,7 +545,68 @@ impl Developer {
                 include_str!("shaders/sharpen_apply.wgsl"),
                 &[Uniform, Texture, Texture, StorageTexture(Rgba16Float)],
             ),
+            denoise: Pass::new(
+                d,
+                "idev::denoise",
+                include_str!("shaders/denoise.wgsl"),
+                &[Uniform, Texture, StorageTexture(Rgba16Float)],
+            ),
         }
+    }
+
+    /// Make sure `prepared.denoised` holds the camera RGB denoised for
+    /// `params.denoise` (a no-op when denoising is off or the cache
+    /// already matches). Submitted.
+    fn ensure_denoised(&self, gpu: &Gpu, prepared: &Prepared, denoise: Denoise) {
+        if !denoise.active() {
+            return;
+        }
+        if prepared
+            .denoised
+            .borrow()
+            .as_ref()
+            .is_some_and(|(d, _)| *d == denoise)
+        {
+            return;
+        }
+        let device = &gpu.device;
+        let queue = &gpu.queue;
+        let out = texture(
+            device,
+            "idev::denoised",
+            wgpu::Extent3d {
+                width: prepared.width,
+                height: prepared.height,
+                depth_or_array_layers: 1,
+            },
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let y = prepared.ylum_cam;
+        let u = uniform_buffer(
+            device,
+            queue,
+            &DenoiseUniforms {
+                width: prepared.width,
+                height: prepared.height,
+                _pad0: [0; 2],
+                chroma: denoise.chroma.clamp(0.0, 1.0),
+                luma: denoise.luminance.clamp(0.0, 1.0),
+                _pad1: [0.0; 2],
+                ylum: [y[0], y[1], y[2], 0.0],
+            },
+        );
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("idev::denoise"),
+        });
+        let bg = self.denoise.bind(
+            device,
+            &[u.as_entire_binding(), tex(&prepared.cam_rgb), tex(&out)],
+        );
+        self.denoise
+            .dispatch(&mut encoder, &bg, prepared.width, prepared.height);
+        queue.submit([encoder.finish()]);
+        *prepared.denoised.borrow_mut() = Some((denoise, out));
     }
 
     /// Whether the sharpening passes would change anything.
@@ -787,6 +866,7 @@ impl Developer {
             ylum_cam: XYZ_FROM_BT2020[1],
             lens: None,
             cam_rgb,
+            denoised: RefCell::new(None),
         }
     }
 
@@ -1008,6 +1088,7 @@ impl Developer {
             ylum_cam,
             lens: frame.lens.clone(),
             cam_rgb,
+            denoised: RefCell::new(None),
         })
     }
 
@@ -1047,6 +1128,12 @@ impl Developer {
         } = render;
         let layout = Self::layout(prepared, params);
         let (out_w, out_h) = layout.scaled(scale);
+        self.ensure_denoised(gpu, prepared, params.denoise);
+        let denoised = prepared.denoised.borrow();
+        let input: &Tex = match denoised.as_ref() {
+            Some((d, t)) if params.denoise.active() && *d == params.denoise => t,
+            _ => &prepared.cam_rgb,
+        };
         let gain = 2f32.powf(params.exposure_ev);
         let (tone_mode, contrast, hue_preservation, white) = match params.tone {
             ToneCurve::None => (0u32, 1.0, 0.0, DEFAULT_WHITE),
@@ -1154,7 +1241,7 @@ impl Developer {
             device,
             &[
                 colour_u.as_entire_binding(),
-                tex(&prepared.cam_rgb),
+                tex(input),
                 wgpu::BindingResource::TextureView(out),
             ],
         );

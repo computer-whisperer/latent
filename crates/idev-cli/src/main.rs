@@ -123,6 +123,9 @@ struct Overrides {
     /// luminance at output resolution; amount 0 disables).
     #[arg(long)]
     sharpen: Option<String>,
+    /// Noise reduction: "chroma[,luminance]", each 0 (off) to 1.
+    #[arg(long)]
+    denoise: Option<String>,
 }
 
 impl Overrides {
@@ -165,6 +168,19 @@ impl Overrides {
         }
         if let Some(deg) = self.rotate {
             p.geometry.angle_deg = deg;
+        }
+        if let Some(spec) = &self.denoise {
+            let v: Vec<f32> = spec
+                .split(',')
+                .map(|x| x.trim().parse::<f32>())
+                .collect::<Result<_, _>>()
+                .with_context(|| format!("--denoise {spec}: expected chroma[,luminance]"))?;
+            anyhow::ensure!(
+                (1..=2).contains(&v.len()),
+                "--denoise {spec}: one or two values"
+            );
+            p.denoise.chroma = v[0].clamp(0.0, 1.0);
+            p.denoise.luminance = v.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
         }
         if let Some(spec) = &self.sharpen {
             let v: Vec<f32> = spec

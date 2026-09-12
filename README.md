@@ -15,6 +15,7 @@ idev develop DSC00039.ARW -o out.jpg --exposure 0.5 --temp 5200,4 --contrast 1.8
 idev develop DSC00039.ARW -o out.jpg --rotate 1.5 --crop 0.1,0.1,0.8,0.6   # straighten (deg, cw) and crop (fractions)
 idev develop DSC00039.ARW -o out.jpg --size 3000                         # long edge 3000 px (Lanczos-3, linear light)
 idev develop DSC00039.ARW -o out.jpg --sharpen 1,0.8,0.01                # unsharp mask: amount, radius px, threshold
+idev develop DSC00039.ARW -o out.jpg --denoise 1,0.5                     # noise reduction: chroma, luminance (0..1)
 idev develop *.ARW --out-dir developed --format jpg       # batch; skips existing outputs
 idev params DSC00039.ARW                                  # resolved params (sidecar + defaults)
 idev dump-bayer DSC00039.ARW -o raw.pgm                   # decoder cross-checks
@@ -64,7 +65,9 @@ with the outside of the crop dimmed, a plain drag draws the rectangle
 The Export group's long-edge scrubber resizes exports (0 = full size).
 The Detail group is an unsharp mask on luminance at output resolution
 (amount, radius, threshold); in the preview its radius shrinks with the
-downscale, so judge it at 1:1.
+downscale, so judge it at 1:1. The Noise group runs bilateral chroma
+and luminance smoothing on the demosaiced camera RGB, before the tone
+curve; strengths 0 to 1.
 
 Crates:
 

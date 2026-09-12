@@ -737,6 +737,46 @@ Cost note: with sharpening on, `render` allocates a scratch texture
 per frame (25 MP × 8 bytes at 1:1); fine so far, a cached scratch in
 the app's GpuState is the fix if scrubbing at 1:1 stutters.
 
+## Processing arc, step 4: noise reduction (2026-09-11)
+
+One GPU pass (`denoise.wgsl`) over the white-balanced camera RGB,
+before the colour pass so the tone curve never amplifies what was
+removed; cached per `Denoise` on the `Prepared` (a `RefCell` slot the
+colour pass fills when the parameters change, so scrubbing exposure
+does not re-denoise). Chroma is the difference from luminance (ratios
+were tried first and blow up on near-black pixels): a 13 × 13 window
+sampled every other pixel, spatial sigma 4, range kernel on the
+chroma-difference vector. Luminance: a 7 × 7 bilateral, spatial sigma
+1.5. Both range sigmas follow shot noise, `strength · k · sqrt(max(Y,
+0) + 0.002)` (k = 0.1 chroma, 0.06 luminance); the `max` matters,
+negative luminance after black subtraction made the sigma NaN and the
+pixel garbage. `Denoise { chroma, luminance }` in the sidecar,
+`--denoise c[,l]`, a Noise group in the GUI.
+
+Verified on the ISO 3200 sample exported at 2000 px, in the flattest
+mid-tone 48 px block, high-pass (sigma 2) standard deviations:
+
+| denoise | luma HF | chroma HF | global Laplacian var |
+|---|---|---|---|
+| off | 1.78 | 5.88 | 109 |
+| chroma 0.5 | 1.66 | 3.21 | 103 |
+| chroma 1 | 1.74 | 2.16 | 107 |
+| luminance 0.5 | 1.59 | 5.89 | 92 |
+| luminance 1 | 1.51 | 5.89 | 78 |
+| both 1 | 1.23 | 2.09 | 64 |
+
+Chroma smoothing leaves luminance alone and vice versa; luminance 1
+takes ~30 % off the global Laplacian variance, part noise and part
+fine texture (fur softens a little at 1:1). A near-zero strength is
+within one code of the untouched render. A 1:1 crop of the shadowed
+pillow at chroma 1 / luminance 0.7 loses the grain and keeps the
+print. Cost: within the develop time at 25 MP (denoise runs once per
+parameter change, ~10 ms).
+
+Not done: a noise profile per ISO (the k constants are guesses that
+fit this sensor at ISO 3200), and a proper non-local or wavelet
+luminance denoiser; the bilateral is a first version.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

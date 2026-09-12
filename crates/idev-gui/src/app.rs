@@ -420,6 +420,8 @@ pub struct IdevApp {
     sharpen_amount: Scrub,
     sharpen_radius: Scrub,
     sharpen_threshold: Scrub,
+    denoise_chroma: Scrub,
+    denoise_luma: Scrub,
 
     // Control scratch state.
     exposure: Scrub,
@@ -555,6 +557,8 @@ impl IdevApp {
             sharpen_amount: Scrub::default(),
             sharpen_radius: Scrub::default(),
             sharpen_threshold: Scrub::default(),
+            denoise_chroma: Scrub::default(),
+            denoise_luma: Scrub::default(),
             exposure: Scrub::default(),
             contrast: Scrub::default(),
             hue: Scrub::default(),
@@ -721,6 +725,8 @@ impl IdevApp {
         self.sharpen_amount.set(s.params.sharpen.amount, 2);
         self.sharpen_radius.set(s.params.sharpen.radius, 2);
         self.sharpen_threshold.set(s.params.sharpen.threshold, 3);
+        self.denoise_chroma.set(s.params.denoise.chroma, 2);
+        self.denoise_luma.set(s.params.denoise.luminance, 2);
         self.exposure.set(s.params.exposure_ev, 2);
         let (c, h, w) = match s.params.tone {
             ToneCurve::Sigmoid {
@@ -1260,6 +1266,17 @@ impl IdevApp {
             .width(Size::Fill(1.0)),
         ]));
         sections.push(sidebar_group([
+            sidebar_group_label("Noise"),
+            field_row(
+                "Chroma",
+                number_scrubber("denoise-chroma", &self.denoise_chroma.text),
+            ),
+            field_row(
+                "Luminance",
+                number_scrubber("denoise-luma", &self.denoise_luma.text),
+            ),
+        ]));
+        sections.push(sidebar_group([
             sidebar_group_label("Detail"),
             field_row(
                 "Sharpen",
@@ -1673,6 +1690,38 @@ impl IdevApp {
             event,
         ) {
             wake(&self.wakeup);
+            return;
+        }
+        let strength = ScrubberOpts::default()
+            .min(0.0)
+            .max(1.0)
+            .step(0.05)
+            .sensitivity(4.0)
+            .decimals(2);
+        if number_scrubber::apply_event(
+            &mut self.denoise_chroma.text,
+            &mut self.denoise_chroma.drag,
+            "denoise-chroma",
+            &strength,
+            event,
+        ) {
+            if let (Some(v), Some(s)) = (self.denoise_chroma.value(), self.session.as_mut()) {
+                s.params.denoise.chroma = v.clamp(0.0, 1.0);
+                self.params_changed();
+            }
+            return;
+        }
+        if number_scrubber::apply_event(
+            &mut self.denoise_luma.text,
+            &mut self.denoise_luma.drag,
+            "denoise-luma",
+            &strength,
+            event,
+        ) {
+            if let (Some(v), Some(s)) = (self.denoise_luma.value(), self.session.as_mut()) {
+                s.params.denoise.luminance = v.clamp(0.0, 1.0);
+                self.params_changed();
+            }
             return;
         }
         let amount = ScrubberOpts::default()

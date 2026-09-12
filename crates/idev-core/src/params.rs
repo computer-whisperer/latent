@@ -144,6 +144,32 @@ pub struct DevelopParams {
     pub lens: LensParams,
     pub geometry: Geometry,
     pub sharpen: Sharpen,
+    pub denoise: Denoise,
+}
+
+/// Noise reduction on the demosaiced camera RGB, before the colour pass.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Denoise {
+    /// Chroma smoothing strength, 0 (off) to 1.
+    pub chroma: f32,
+    /// Luminance smoothing strength, 0 (off) to 1.
+    pub luminance: f32,
+}
+
+impl Default for Denoise {
+    fn default() -> Self {
+        Denoise {
+            chroma: 0.0,
+            luminance: 0.0,
+        }
+    }
+}
+
+impl Denoise {
+    pub fn active(&self) -> bool {
+        self.chroma > 0.0 || self.luminance > 0.0
+    }
 }
 
 /// Unsharp mask on luminance at output resolution (after resize).
@@ -203,6 +229,7 @@ impl Default for DevelopParams {
             lens: LensParams::default(),
             geometry: Geometry::default(),
             sharpen: Sharpen::default(),
+            denoise: Denoise::default(),
         }
     }
 }
