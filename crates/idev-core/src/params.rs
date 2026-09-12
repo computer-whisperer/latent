@@ -143,6 +143,30 @@ pub struct DevelopParams {
     pub tone: ToneCurve,
     pub lens: LensParams,
     pub geometry: Geometry,
+    pub sharpen: Sharpen,
+}
+
+/// Unsharp mask on luminance at output resolution (after resize).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Sharpen {
+    /// Strength; 0 disables. 0.5–1.5 is the usual range.
+    pub amount: f32,
+    /// Gaussian sigma in output pixels.
+    pub radius: f32,
+    /// Detail below this (in gamma-2.2 luminance, 0..1) is left alone,
+    /// so noise in flat areas is not amplified.
+    pub threshold: f32,
+}
+
+impl Default for Sharpen {
+    fn default() -> Self {
+        Sharpen {
+            amount: 0.0,
+            radius: 0.8,
+            threshold: 0.0,
+        }
+    }
 }
 
 /// Straighten and crop, applied after the EXIF orientation (see
@@ -178,6 +202,7 @@ impl Default for DevelopParams {
             tone: ToneCurve::default(),
             lens: LensParams::default(),
             geometry: Geometry::default(),
+            sharpen: Sharpen::default(),
         }
     }
 }

@@ -24,7 +24,8 @@ use rawler::Orientation;
 use crate::color::{Gamut, Mat3, XYZ_FROM_BT2020, srgb_from_bt2020};
 use crate::geometry::{self, Layout};
 use crate::params::{
-    DEFAULT_WHITE, Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sigmoid_constants,
+    DEFAULT_WHITE, Demosaic, DevelopParams, Highlights, Sharpen, ToneCurve, WhiteBalance,
+    sigmoid_constants,
 };
 use crate::sensor::{LensCorrection, SensorFrame};
 use crate::source::{ImageSource, Source};
@@ -409,6 +410,31 @@ pub struct Developer {
     colour: Pass,
     histogram: Pass,
     resample: Pass,
+    sharpen_blur: Pass,
+    sharpen_apply: Pass,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SharpenBlurUniforms {
+    width: u32,
+    height: u32,
+    axis: u32,
+    encode: u32,
+    sigma: f32,
+    _pad: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SharpenApplyUniforms {
+    width: u32,
+    height: u32,
+    _pad0: [u32; 2],
+    amount: f32,
+    threshold: f32,
+    peak: f32,
+    _pad1: f32,
 }
 
 #[repr(C)]
@@ -489,7 +515,158 @@ impl Developer {
                 include_str!("shaders/resample.wgsl"),
                 &[Uniform, Texture, StorageTexture(Rgba16Float)],
             ),
+            sharpen_blur: Pass::new(
+                d,
+                "idev::sharpen_blur",
+                include_str!("shaders/sharpen_blur.wgsl"),
+                &[Uniform, Texture, StorageTexture(R32Float)],
+            ),
+            sharpen_apply: Pass::new(
+                d,
+                "idev::sharpen_apply",
+                include_str!("shaders/sharpen_apply.wgsl"),
+                &[Uniform, Texture, Texture, StorageTexture(Rgba16Float)],
+            ),
         }
+    }
+
+    /// Whether the sharpening passes would change anything.
+    fn sharpens(params: &DevelopParams) -> bool {
+        params.sharpen.amount > 0.0 && params.sharpen.radius > 0.0
+    }
+
+    /// Unsharp mask `src` (`width × height`, a sampled Rgba16Float
+    /// texture) into `out`; `sigma` in the texture's pixels, `peak`
+    /// the output peak to clamp to. Submitted.
+    #[allow(clippy::too_many_arguments)]
+    fn sharpen(
+        &self,
+        gpu: &Gpu,
+        src: &Tex,
+        width: u32,
+        height: u32,
+        sharpen: &Sharpen,
+        sigma: f32,
+        peak: f32,
+        out: &wgpu::TextureView,
+    ) {
+        let device = &gpu.device;
+        let queue = &gpu.queue;
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let usage = wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
+        let blur_h = texture(
+            device,
+            "idev::sharpen::h",
+            extent,
+            wgpu::TextureFormat::R32Float,
+            usage,
+        );
+        let blur_v = texture(
+            device,
+            "idev::sharpen::v",
+            extent,
+            wgpu::TextureFormat::R32Float,
+            usage,
+        );
+        let blur_u = |axis: u32, encode: u32| {
+            uniform_buffer(
+                device,
+                queue,
+                &SharpenBlurUniforms {
+                    width,
+                    height,
+                    axis,
+                    encode,
+                    sigma: sigma.max(0.05),
+                    _pad: [0.0; 3],
+                },
+            )
+        };
+        let u_h = blur_u(0, 1);
+        let u_v = blur_u(1, 0);
+        let u_apply = uniform_buffer(
+            device,
+            queue,
+            &SharpenApplyUniforms {
+                width,
+                height,
+                _pad0: [0; 2],
+                amount: sharpen.amount,
+                threshold: sharpen.threshold,
+                peak,
+                _pad1: 0.0,
+            },
+        );
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("idev::sharpen"),
+        });
+        let bg = self
+            .sharpen_blur
+            .bind(device, &[u_h.as_entire_binding(), tex(src), tex(&blur_h)]);
+        self.sharpen_blur.dispatch(&mut encoder, &bg, width, height);
+        let bg = self.sharpen_blur.bind(
+            device,
+            &[u_v.as_entire_binding(), tex(&blur_h), tex(&blur_v)],
+        );
+        self.sharpen_blur.dispatch(&mut encoder, &bg, width, height);
+        let bg = self.sharpen_apply.bind(
+            device,
+            &[
+                u_apply.as_entire_binding(),
+                tex(src),
+                tex(&blur_v),
+                wgpu::BindingResource::TextureView(out),
+            ],
+        );
+        self.sharpen_apply
+            .dispatch(&mut encoder, &bg, width, height);
+        queue.submit([encoder.finish()]);
+    }
+
+    /// The colour pass plus sharpening into `out` (a storage texture of
+    /// [`Self::output_size`] for `render.scale`). Sharpening is defined
+    /// at output resolution, so at a preview downscale its radius
+    /// shrinks accordingly.
+    pub fn render(
+        &self,
+        gpu: &Gpu,
+        prepared: &Prepared,
+        params: &DevelopParams,
+        render: Render,
+        out: &wgpu::TextureView,
+    ) {
+        if !Self::sharpens(params) {
+            self.colour(gpu, prepared, params, render, out);
+            return;
+        }
+        let (w, h) = Self::output_size(prepared, params, render.scale);
+        let scratch = texture(
+            &gpu.device,
+            "idev::render::scratch",
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        self.colour(gpu, prepared, params, render, &scratch.view);
+        let sigma = params.sharpen.radius / render.scale.max(1) as f32;
+        self.sharpen(
+            gpu,
+            &scratch,
+            w,
+            h,
+            &params.sharpen,
+            sigma,
+            render.target.peak,
+            out,
+        );
     }
 
     /// Lanczos-3 resample of `src` (`in_w × in_h`) to `out_w × out_h`,
@@ -1108,6 +1285,32 @@ impl Developer {
             }
             _ => (working, w, h),
         };
+        let out = if Self::sharpens(params) {
+            let sharp = texture(
+                device,
+                "idev::sharpened",
+                wgpu::Extent3d {
+                    width: ow,
+                    height: oh,
+                    depth_or_array_layers: 1,
+                },
+                wgpu::TextureFormat::Rgba16Float,
+                wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            );
+            self.sharpen(
+                gpu,
+                &out,
+                ow,
+                oh,
+                &params.sharpen,
+                params.sharpen.radius,
+                target.peak,
+                &sharp.view,
+            );
+            sharp
+        } else {
+            out
+        };
         let rgba = read_back_rgba16f(gpu, &out.texture, ow, oh)?;
         Ok(WorkingImage {
             width: ow,
@@ -1139,7 +1342,7 @@ impl Developer {
             wgpu::TextureFormat::Rgba16Float,
             wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
         );
-        self.colour(
+        self.render(
             gpu,
             prepared,
             params,

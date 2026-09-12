@@ -417,6 +417,9 @@ pub struct IdevApp {
     /// Export long edge in pixels; 0 = full size. Not a develop
     /// parameter: it does not go into the sidecar.
     export_edge: Scrub,
+    sharpen_amount: Scrub,
+    sharpen_radius: Scrub,
+    sharpen_threshold: Scrub,
 
     // Control scratch state.
     exposure: Scrub,
@@ -549,6 +552,9 @@ impl IdevApp {
                 text: "0".into(),
                 drag: ScrubDrag::default(),
             },
+            sharpen_amount: Scrub::default(),
+            sharpen_radius: Scrub::default(),
+            sharpen_threshold: Scrub::default(),
             exposure: Scrub::default(),
             contrast: Scrub::default(),
             hue: Scrub::default(),
@@ -712,6 +718,9 @@ impl IdevApp {
     fn seed_controls(&mut self) {
         let Some(s) = &self.session else { return };
         self.angle.set(s.params.geometry.angle_deg, 2);
+        self.sharpen_amount.set(s.params.sharpen.amount, 2);
+        self.sharpen_radius.set(s.params.sharpen.radius, 2);
+        self.sharpen_threshold.set(s.params.sharpen.threshold, 3);
         self.exposure.set(s.params.exposure_ev, 2);
         let (c, h, w) = match s.params.tone {
             ToneCurve::Sigmoid {
@@ -1250,6 +1259,21 @@ impl IdevApp {
             )
             .width(Size::Fill(1.0)),
         ]));
+        sections.push(sidebar_group([
+            sidebar_group_label("Detail"),
+            field_row(
+                "Sharpen",
+                number_scrubber("sharpen-amount", &self.sharpen_amount.text),
+            ),
+            field_row(
+                "Radius (px)",
+                number_scrubber("sharpen-radius", &self.sharpen_radius.text),
+            ),
+            field_row(
+                "Threshold",
+                number_scrubber("sharpen-threshold", &self.sharpen_threshold.text),
+            ),
+        ]));
         sections.extend([
             sidebar_group([
                 sidebar_group_label("Export"),
@@ -1649,6 +1673,63 @@ impl IdevApp {
             event,
         ) {
             wake(&self.wakeup);
+            return;
+        }
+        let amount = ScrubberOpts::default()
+            .min(0.0)
+            .max(3.0)
+            .step(0.05)
+            .sensitivity(4.0)
+            .decimals(2);
+        if number_scrubber::apply_event(
+            &mut self.sharpen_amount.text,
+            &mut self.sharpen_amount.drag,
+            "sharpen-amount",
+            &amount,
+            event,
+        ) {
+            if let (Some(v), Some(s)) = (self.sharpen_amount.value(), self.session.as_mut()) {
+                s.params.sharpen.amount = v.clamp(0.0, 3.0);
+                self.params_changed();
+            }
+            return;
+        }
+        let radius = ScrubberOpts::default()
+            .min(0.3)
+            .max(3.0)
+            .step(0.05)
+            .sensitivity(4.0)
+            .decimals(2);
+        if number_scrubber::apply_event(
+            &mut self.sharpen_radius.text,
+            &mut self.sharpen_radius.drag,
+            "sharpen-radius",
+            &radius,
+            event,
+        ) {
+            if let (Some(v), Some(s)) = (self.sharpen_radius.value(), self.session.as_mut()) {
+                s.params.sharpen.radius = v.clamp(0.3, 3.0);
+                self.params_changed();
+            }
+            return;
+        }
+        let threshold = ScrubberOpts::default()
+            .min(0.0)
+            .max(0.1)
+            .step(0.002)
+            .sensitivity(6.0)
+            .decimals(3);
+        if number_scrubber::apply_event(
+            &mut self.sharpen_threshold.text,
+            &mut self.sharpen_threshold.drag,
+            "sharpen-threshold",
+            &threshold,
+            event,
+        ) {
+            if let (Some(v), Some(s)) = (self.sharpen_threshold.value(), self.session.as_mut()) {
+                s.params.sharpen.threshold = v.clamp(0.0, 0.1);
+                self.params_changed();
+            }
             return;
         }
         let angle = ScrubberOpts::default()
@@ -2076,7 +2157,7 @@ impl WinitWgpuApp for IdevApp {
         let want = (params, render);
         if g.rendered.as_ref() != Some(&want) {
             g.dev
-                .colour(&g.gpu, prepared, &want.0, render, &preview.view);
+                .render(&g.gpu, prepared, &want.0, render, &preview.view);
             let (w, h) = Developer::output_size(prepared, &want.0, scale);
             g.rendered = Some(want);
             // One histogram in flight at a time; a newer render just

@@ -712,6 +712,31 @@ result is 48.3 dB PSNR with a max difference of 87 codes at edges,
 the expected gap between filtering in linear light and in sRGB.
 Upscaling is allowed (unit kernel).
 
+## Processing arc, step 3: sharpening (2026-09-11)
+
+Unsharp mask on luminance, defined at output resolution: two Gaussian
+passes over the gamma-2.2-encoded BT.2020 luminance of the developed
+image, then `l' = l + amount · detail` with a soft threshold
+(`smoothstep(t, 2t, |detail|)`), applied as a luminance ratio to all
+three channels so colour is untouched, clamped to the output peak.
+Runs after the colour pass (and after the export resize), on the
+preview with sigma divided by the downscale. `Sharpen { amount,
+radius, threshold }` in the sidecar; `--sharpen a[,r[,t]]`; Detail
+group in the GUI. `Developer::render` = colour + sharpen, used by the
+preview and thumbnails; `develop_sized` sharpens after the resample.
+
+Verified on a 2000 px export: amount 1 / radius 0.8 triples the
+Laplacian variance (119 → 360) and touches 32 % of pixels by more than
+one code; threshold 0.02 keeps the edge gain (var 192) while touching
+1.4 % of pixels; amount 2 / radius 2 is visibly strong (var 907). A
+crop of the cat's face shows crisp whiskers without dark or light
+halos at these settings. GPU cost at 2000 px: within the 46 ms
+develop time. Amount 0 takes the direct path and is bit-identical.
+
+Cost note: with sharpening on, `render` allocates a scratch texture
+per frame (25 MP × 8 bytes at 1:1); fine so far, a cached scratch in
+the app's GpuState is the fix if scrubbing at 1:1 stutters.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

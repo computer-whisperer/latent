@@ -119,6 +119,10 @@ struct Overrides {
     /// (largest same-aspect rectangle inside the straightened content).
     #[arg(long)]
     crop: Option<String>,
+    /// Sharpen: "amount[,radius[,threshold]]" (unsharp mask on
+    /// luminance at output resolution; amount 0 disables).
+    #[arg(long)]
+    sharpen: Option<String>,
 }
 
 impl Overrides {
@@ -161,6 +165,26 @@ impl Overrides {
         }
         if let Some(deg) = self.rotate {
             p.geometry.angle_deg = deg;
+        }
+        if let Some(spec) = &self.sharpen {
+            let v: Vec<f32> = spec
+                .split(',')
+                .map(|x| x.trim().parse::<f32>())
+                .collect::<Result<_, _>>()
+                .with_context(|| {
+                    format!("--sharpen {spec}: expected amount[,radius[,threshold]]")
+                })?;
+            anyhow::ensure!(
+                (1..=3).contains(&v.len()),
+                "--sharpen {spec}: one to three values"
+            );
+            p.sharpen.amount = v[0].max(0.0);
+            if let Some(r) = v.get(1) {
+                p.sharpen.radius = r.max(0.0);
+            }
+            if let Some(t) = v.get(2) {
+                p.sharpen.threshold = t.max(0.0);
+            }
         }
         if let Some(c) = &self.crop {
             p.geometry.crop = if c == "auto" {
