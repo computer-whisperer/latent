@@ -2200,6 +2200,10 @@ impl WinitWgpuApp for IdevApp {
             });
             g.rendered = None;
             tracing::debug!(w, h, scale, "preview texture");
+            // The build that ran before this paint saw no texture and
+            // drew the placeholder; ask for another frame so the
+            // surface appears without waiting for the next event.
+            wake(&self.wakeup);
         }
         let preview = g.preview.as_ref().expect("preview above");
 
