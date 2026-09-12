@@ -414,6 +414,9 @@ pub struct IdevApp {
     /// Anchor of the drag in progress, as view fractions.
     crop_anchor: Option<(f32, f32)>,
     angle: Scrub,
+    /// Export long edge in pixels; 0 = full size. Not a develop
+    /// parameter: it does not go into the sidecar.
+    export_edge: Scrub,
 
     // Control scratch state.
     exposure: Scrub,
@@ -542,6 +545,10 @@ impl IdevApp {
             crop_aspect: Aspect::Free,
             crop_anchor: None,
             angle: Scrub::default(),
+            export_edge: Scrub {
+                text: "0".into(),
+                drag: ScrubDrag::default(),
+            },
             exposure: Scrub::default(),
             contrast: Scrub::default(),
             hue: Scrub::default(),
@@ -789,6 +796,11 @@ impl IdevApp {
             return;
         };
         let params = s.params.clone();
+        let long_edge = self
+            .export_edge
+            .value()
+            .map(|v| v.round() as u32)
+            .filter(|&v| v > 0);
         let stem = s
             .path
             .file_stem()
@@ -815,7 +827,9 @@ impl IdevApp {
                     .save_file();
                 let result = match picked {
                     None => Err(anyhow::anyhow!("cancelled")),
-                    Some(path) => export_to(&frame, &name, &params, &kind, &path).map(|()| path),
+                    Some(path) => {
+                        export_to(&frame, &name, &params, &kind, long_edge, &path).map(|()| path)
+                    }
                 };
                 let _ = tx.send(result);
                 wake(&wakeup);
@@ -1262,6 +1276,10 @@ impl IdevApp {
                 } else {
                     row(Vec::<El>::new())
                 },
+                field_row(
+                    "Long edge (px, 0 = full)",
+                    number_scrubber("export-edge", &self.export_edge.text),
+                ),
                 button("Reset parameters").key("reset").ghost(),
             ]),
             sidebar_group(info),
@@ -1616,6 +1634,22 @@ impl IdevApp {
                 }
                 _ => {}
             }
+        }
+        let edge = ScrubberOpts::default()
+            .min(0.0)
+            .max(20000.0)
+            .step(100.0)
+            .sensitivity(20.0)
+            .decimals(0);
+        if number_scrubber::apply_event(
+            &mut self.export_edge.text,
+            &mut self.export_edge.drag,
+            "export-edge",
+            &edge,
+            event,
+        ) {
+            wake(&self.wakeup);
+            return;
         }
         let angle = ScrubberOpts::default()
             .min(-45.0)
@@ -2102,6 +2136,7 @@ fn export_to(
     source_name: &str,
     params: &DevelopParams,
     kind: &ExportKind,
+    long_edge: Option<u32>,
     path: &Path,
 ) -> Result<()> {
     let t = Instant::now();
@@ -2112,7 +2147,7 @@ fn export_to(
         _ => OutputTarget::SDR,
     };
     // Oriented, straightened and cropped by the colour pass itself.
-    let img: WorkingImage = dev.develop(&gpu, frame, params, target)?;
+    let img: WorkingImage = dev.develop_sized(&gpu, frame, params, target, long_edge)?;
     let note = metadata::develop_note(source_name, params);
     let exif = metadata::exif_for_output(
         &frame.metadata().tags,

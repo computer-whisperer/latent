@@ -408,6 +408,31 @@ pub struct Developer {
     rcd_rb: Pass,
     colour: Pass,
     histogram: Pass,
+    resample: Pass,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ResampleUniforms {
+    in_w: u32,
+    in_h: u32,
+    out_w: u32,
+    out_h: u32,
+    axis: u32,
+    _pad: [u32; 3],
+}
+
+/// The output size for a long-edge target: the long edge exactly, the
+/// short edge rounded to keep the aspect.
+pub fn sized(width: u32, height: u32, long_edge: u32) -> (u32, u32) {
+    let long = width.max(height).max(1) as f32;
+    let f = long_edge.max(1) as f32 / long;
+    let side = |v: u32| ((v as f32 * f).round() as u32).max(1);
+    if width >= height {
+        (long_edge.max(1), side(height))
+    } else {
+        (side(width), long_edge.max(1))
+    }
 }
 
 impl Developer {
@@ -458,7 +483,81 @@ impl Developer {
                 include_str!("shaders/histogram.wgsl"),
                 &[Uniform, Texture, StorageBufferRw],
             ),
+            resample: Pass::new(
+                d,
+                "idev::resample",
+                include_str!("shaders/resample.wgsl"),
+                &[Uniform, Texture, StorageTexture(Rgba16Float)],
+            ),
         }
+    }
+
+    /// Lanczos-3 resample of `src` (`in_w × in_h`) to `out_w × out_h`,
+    /// horizontal pass then vertical, submitted; returns the result
+    /// texture (storage, sampled, copy source).
+    fn resample(&self, gpu: &Gpu, src: &Tex, input: (u32, u32), output: (u32, u32)) -> Tex {
+        let device = &gpu.device;
+        let queue = &gpu.queue;
+        let usage = wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC;
+        let extent = |w, h| wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        let mid = texture(
+            device,
+            "idev::resample::mid",
+            extent(output.0, input.1),
+            wgpu::TextureFormat::Rgba16Float,
+            usage,
+        );
+        let out = texture(
+            device,
+            "idev::resample::out",
+            extent(output.0, output.1),
+            wgpu::TextureFormat::Rgba16Float,
+            usage,
+        );
+        let u_h = uniform_buffer(
+            device,
+            queue,
+            &ResampleUniforms {
+                in_w: input.0,
+                in_h: input.1,
+                out_w: output.0,
+                out_h: input.1,
+                axis: 0,
+                _pad: [0; 3],
+            },
+        );
+        let u_v = uniform_buffer(
+            device,
+            queue,
+            &ResampleUniforms {
+                in_w: output.0,
+                in_h: input.1,
+                out_w: output.0,
+                out_h: output.1,
+                axis: 1,
+                _pad: [0; 3],
+            },
+        );
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("idev::resample"),
+        });
+        let bg = self
+            .resample
+            .bind(device, &[u_h.as_entire_binding(), tex(src), tex(&mid)]);
+        self.resample.dispatch(&mut encoder, &bg, output.0, input.1);
+        let bg = self
+            .resample
+            .bind(device, &[u_v.as_entire_binding(), tex(&mid), tex(&out)]);
+        self.resample
+            .dispatch(&mut encoder, &bg, output.0, output.1);
+        queue.submit([encoder.finish()]);
+        out
     }
 
     /// Bring `source` onto the GPU for `params`: a raw is linearized and
@@ -958,8 +1057,63 @@ impl Developer {
         params: &DevelopParams,
         target: OutputTarget,
     ) -> Result<WorkingImage> {
+        self.develop_sized(gpu, source, params, target, None)
+    }
+
+    /// Develop at full resolution, then Lanczos-resample so the long
+    /// edge is `long_edge` pixels (when given and different), and read
+    /// back. The resample runs in linear light before any output
+    /// encoding, i.e. it is the export's anti-aliasing filter.
+    pub fn develop_sized(
+        &self,
+        gpu: &Gpu,
+        source: &Source,
+        params: &DevelopParams,
+        target: OutputTarget,
+        long_edge: Option<u32>,
+    ) -> Result<WorkingImage> {
         let prepared = self.prepare(gpu, source, params)?;
-        self.develop_prepared(gpu, &prepared, params, target, 1)
+        let device = &gpu.device;
+        let (w, h) = Self::output_size(&prepared, params, 1);
+        let working = texture(
+            device,
+            "idev::working",
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+        );
+        self.colour(
+            gpu,
+            &prepared,
+            params,
+            Render {
+                target,
+                scale: 1,
+                display: DisplayPrimaries::Bt2020,
+                warn: None,
+                dim_outside: None,
+            },
+            &working.view,
+        );
+        let (out, ow, oh) = match long_edge {
+            Some(edge) if edge > 0 && edge != w.max(h) => {
+                let (ow, oh) = sized(w, h, edge);
+                (self.resample(gpu, &working, (w, h), (ow, oh)), ow, oh)
+            }
+            _ => (working, w, h),
+        };
+        let rgba = read_back_rgba16f(gpu, &out.texture, ow, oh)?;
+        Ok(WorkingImage {
+            width: ow,
+            height: oh,
+            rgba,
+        })
     }
 
     /// Colour pass over an existing [`Prepared`] at an integer

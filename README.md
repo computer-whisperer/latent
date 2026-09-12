@@ -13,6 +13,7 @@ idev develop DSC00039.ARW -o out.avif --hdr 1000          # BT.2020 PQ 10-bit AV
 idev develop DSC00039.ARW -o out.exr --tone none          # scene-referred scRGB linear f16
 idev develop DSC00039.ARW -o out.jpg --exposure 0.5 --temp 5200,4 --contrast 1.8 --white 2.9 --save-params
 idev develop DSC00039.ARW -o out.jpg --rotate 1.5 --crop 0.1,0.1,0.8,0.6   # straighten (deg, cw) and crop (fractions)
+idev develop DSC00039.ARW -o out.jpg --size 3000                         # long edge 3000 px (Lanczos-3, linear light)
 idev develop *.ARW --out-dir developed --format jpg       # batch; skips existing outputs
 idev params DSC00039.ARW                                  # resolved params (sidecar + defaults)
 idev dump-bayer DSC00039.ARW -o raw.pgm                   # decoder cross-checks
@@ -59,6 +60,7 @@ defaults to the largest same-aspect rectangle inside the turned
 content) and Crop: in crop mode the whole straightened frame shows
 with the outside of the crop dimmed, a plain drag draws the rectangle
 (middle-drag pans), the aspect tabs lock its ratio, Reset clears both.
+The Export group's long-edge scrubber resizes exports (0 = full size).
 
 Crates:
 

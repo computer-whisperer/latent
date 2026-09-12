@@ -279,6 +279,10 @@ enum Cmd {
         /// JPEG / AVIF quality.
         #[arg(long, default_value_t = 92)]
         quality: u8,
+        /// Resize so the long edge is this many pixels (Lanczos-3 in
+        /// linear light, after crop and straighten).
+        #[arg(long)]
+        size: Option<u32>,
         /// Overwrite existing outputs.
         #[arg(long)]
         force: bool,
@@ -315,6 +319,7 @@ fn main() -> Result<()> {
             format,
             hdr,
             quality,
+            size,
             force,
             save_params,
             overrides,
@@ -325,6 +330,7 @@ fn main() -> Result<()> {
             format,
             hdr,
             quality,
+            size,
             force,
             save_params,
             &overrides,
@@ -470,6 +476,7 @@ fn develop(
     format: Option<Format>,
     hdr: Option<f32>,
     quality: u8,
+    size: Option<u32>,
     force: bool,
     save_params: bool,
     overrides: &Overrides,
@@ -534,6 +541,7 @@ fn develop(
             target,
             hdr,
             quality,
+            size,
             save_params,
             overrides,
         ) {
@@ -560,6 +568,7 @@ fn develop_one(
     target: OutputTarget,
     hdr: Option<f32>,
     quality: u8,
+    size: Option<u32>,
     save_params: bool,
     overrides: &Overrides,
 ) -> Result<()> {
@@ -567,7 +576,7 @@ fn develop_one(
     let t0 = Instant::now();
     let source = Source::load(input)?;
     let t1 = Instant::now();
-    let img: WorkingImage = dev.develop(gpu, &source, &params, target)?;
+    let img: WorkingImage = dev.develop_sized(gpu, &source, &params, target, size)?;
     let t2 = Instant::now();
     let name = input
         .file_name()

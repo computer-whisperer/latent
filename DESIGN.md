@@ -696,6 +696,22 @@ always starts a new rectangle); a straighten guide (grid or a
 two-point horizon line); the crop is not clamped to the turned
 content, so a rectangle pulled past the edge shows black.
 
+## Processing arc, step 2: resize on export (2026-09-11)
+
+A GPU separable Lanczos-3 pass (`resample.wgsl`) on the developed
+working image, in linear light, before readback and output encoding:
+the kernel widens with the downscale factor so it is the
+anti-aliasing filter; negative lobes are clamped out. Not a develop
+parameter: the CLI's `--size N` and the GUI's Export long-edge
+scrubber (0 = full). `Developer::develop_sized`; the preview keeps its
+integer box-mean path.
+
+Verified: 25 MP → 1000 × 667 in 40 ms of GPU work (the PNG encode is
+the cost); against ffmpeg's Lanczos scale of the full-size PNG the
+result is 48.3 dB PSNR with a max difference of 87 codes at edges,
+the expected gap between filtering in linear light and in sRGB.
+Upscaling is allowed (unit kernel).
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700
