@@ -777,6 +777,33 @@ Not done: a noise profile per ISO (the k constants are guesses that
 fit this sensor at ISO 3200), and a proper non-local or wavelet
 luminance denoiser; the bilateral is a first version.
 
+## Clipboard (2026-09-13)
+
+Ctrl+C in the develop view opens a modal (damascene `modal` over the
+page via `overlays`) with the encoding, PNG / JPEG / HDR PNG as tabs,
+and a long-edge scrubber seeded from the Export group; the description
+line shows the output size after crop and resize. Enter or Copy
+develops on a worker with the same `develop_for` the file exports use
+(headless device, current parameters including crop and straighten,
+EXIF block) and encodes in memory (`encode_*` variants of the PNG and
+JPEG writers in `idev-formats`; the file writers now wrap them). The
+bytes go on the Wayland clipboard through `wl-clipboard-rs`
+(data-control protocol, the same crate damascene's text copy uses):
+one MIME type, the chosen one, served by a thread the crate keeps
+until another client takes the selection. Hotkeys collapse to Enter
+while the dialog is open; Esc, Cancel and the scrim close it.
+
+Verified with a temporary hook that copied on load and pasted back
+through the compositor: 13.3 MB `image/png`, 3096 × 2477 (the
+sidecar's crop), EXIF present (Software, UserComment, dimensions),
+pixels identical to the CLI's PNG export of the same file. Screenshot
+of the dialog checked.
+
+Not done: AVIF and EXR are not offered (few paste targets read them);
+only the chosen type is offered, so a JPEG copy will not paste into an
+application that reads `image/png` only; no `text/uri-list` for the
+source file.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

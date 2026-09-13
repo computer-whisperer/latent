@@ -36,19 +36,31 @@ pub fn write_png_srgb8(
     rgb: &[u8],
     exif: Option<&[u8]>,
 ) -> Result<()> {
+    let bytes = encode_png_srgb8(width, height, rgb, exif)?;
+    std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
+}
+
+/// [`write_png_srgb8`] into memory.
+pub fn encode_png_srgb8(
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+    exif: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     ensure!(
         rgb.len() == (width * height * 3) as usize,
         "png: pixel buffer size mismatch"
     );
-    let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, width, height);
     enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Eight);
     enc.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
     let mut writer = enc.write_header().context("png header")?;
     write_exif_chunk(&mut writer, exif)?;
     writer.write_image_data(rgb).context("png data")?;
-    Ok(())
+    writer.finish().context("png finish")?;
+    Ok(out)
 }
 
 fn write_exif_chunk<W: std::io::Write>(
@@ -90,12 +102,23 @@ pub fn write_png_bt2020_pq16(
     rgb: &[u16],
     exif: Option<&[u8]>,
 ) -> Result<()> {
+    let bytes = encode_png_bt2020_pq16(width, height, rgb, exif)?;
+    std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
+}
+
+/// [`write_png_bt2020_pq16`] into memory.
+pub fn encode_png_bt2020_pq16(
+    width: u32,
+    height: u32,
+    rgb: &[u16],
+    exif: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     ensure!(
         rgb.len() == (width * height * 3) as usize,
         "png: pixel buffer size mismatch"
     );
-    let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, width, height);
     enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Sixteen);
     let mut writer = enc.write_header().context("png header")?;
@@ -109,7 +132,8 @@ pub fn write_png_bt2020_pq16(
         bytes.extend_from_slice(&v.to_be_bytes());
     }
     writer.write_image_data(&bytes).context("png data")?;
-    Ok(())
+    writer.finish().context("png finish")?;
+    Ok(out)
 }
 
 /// Write 8-bit sRGB RGB as baseline JPEG. `exif` is a TIFF-structured
@@ -122,6 +146,18 @@ pub fn write_jpeg_srgb8(
     quality: u8,
     exif: Option<&[u8]>,
 ) -> Result<()> {
+    let bytes = encode_jpeg_srgb8(width, height, rgb, quality, exif)?;
+    std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
+}
+
+/// [`write_jpeg_srgb8`] into memory.
+pub fn encode_jpeg_srgb8(
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+    quality: u8,
+    exif: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     ensure!(
         rgb.len() == (width * height * 3) as usize,
         "jpeg: pixel buffer size mismatch"
@@ -130,11 +166,10 @@ pub fn write_jpeg_srgb8(
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality);
     enc.encode(rgb, width, height, image::ExtendedColorType::Rgb8)
         .context("jpeg encode")?;
-    let bytes = match exif {
-        Some(exif) => with_app1_exif(&jpeg, exif)?,
-        None => jpeg,
-    };
-    std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
+    match exif {
+        Some(exif) => with_app1_exif(&jpeg, exif),
+        None => Ok(jpeg),
+    }
 }
 
 /// Insert an `Exif` APP1 segment after SOI (and after a JFIF APP0 if

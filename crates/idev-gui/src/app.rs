@@ -172,6 +172,7 @@ struct Preview {
     view: wgpu::TextureView,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ExportKind {
     Jpeg,
     Png,
@@ -181,7 +182,47 @@ enum ExportKind {
     Exr,
 }
 
+impl std::fmt::Display for ExportKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 impl ExportKind {
+    /// Encodings offered for the clipboard: the ones with a MIME type
+    /// other applications paste.
+    const CLIPBOARD: [ExportKind; 3] = [ExportKind::Png, ExportKind::Jpeg, ExportKind::HdrPng];
+
+    fn label(&self) -> &'static str {
+        match self {
+            ExportKind::Jpeg => "JPEG",
+            ExportKind::Png => "PNG",
+            ExportKind::HdrPng => "HDR PNG",
+            ExportKind::Avif => "AVIF",
+            ExportKind::HdrAvif => "HDR AVIF",
+            ExportKind::Exr => "EXR",
+        }
+    }
+
+    fn parse(label: &str) -> Option<ExportKind> {
+        ExportKind::CLIPBOARD
+            .into_iter()
+            .find(|k| k.label() == label)
+    }
+
+    fn mime(&self) -> &'static str {
+        match self {
+            ExportKind::Jpeg => "image/jpeg",
+            ExportKind::Png | ExportKind::HdrPng => "image/png",
+            ExportKind::Avif | ExportKind::HdrAvif => "image/avif",
+            ExportKind::Exr => "image/x-exr",
+        }
+    }
+
+    fn srgb(&self) -> bool {
+        matches!(self, ExportKind::Jpeg | ExportKind::Png | ExportKind::Avif)
+    }
+
     fn extension(&self) -> &'static str {
         match self {
             ExportKind::Jpeg => "jpg",
@@ -391,6 +432,10 @@ pub struct IdevApp {
     viewport_requests: Vec<ViewportRequest>,
     export_rx: Vec<Receiver<Result<PathBuf>>>,
     exports_running: usize,
+    /// The ctrl-C dialog while it is open.
+    copy: Option<CopyDialog>,
+    /// Clipboard copies in flight; the message is the success toast.
+    copy_rx: Vec<Receiver<Result<String>>>,
     sdr_preview: bool,
     /// Zebra overlay over pixels the panel cannot show.
     warn: bool,
@@ -437,6 +482,13 @@ pub struct IdevApp {
 struct Scrub {
     text: String,
     drag: ScrubDrag,
+}
+
+/// Choices in the copy-to-clipboard dialog.
+struct CopyDialog {
+    kind: ExportKind,
+    /// Long edge in pixels, 0 = full; seeded from the export setting.
+    edge: Scrub,
 }
 
 /// Aspect lock for the crop rectangle.
@@ -538,6 +590,8 @@ impl IdevApp {
             viewport_requests: Vec::new(),
             export_rx: Vec::new(),
             exports_running: 0,
+            copy: None,
+            copy_rx: Vec::new(),
             sdr_preview: false,
             warn: false,
             info: false,
@@ -811,11 +865,7 @@ impl IdevApp {
             return;
         };
         let params = s.params.clone();
-        let long_edge = self
-            .export_edge
-            .value()
-            .map(|v| v.round() as u32)
-            .filter(|&v| v > 0);
+        let long_edge = copy_edge(&self.export_edge);
         let stem = s
             .path
             .file_stem()
@@ -843,13 +893,104 @@ impl IdevApp {
                 let result = match picked {
                     None => Err(anyhow::anyhow!("cancelled")),
                     Some(path) => {
-                        export_to(&frame, &name, &params, &kind, long_edge, &path).map(|()| path)
+                        export_to(&frame, &name, &params, kind, long_edge, &path).map(|()| path)
                     }
                 };
                 let _ = tx.send(result);
                 wake(&wakeup);
             })
             .expect("spawn export thread");
+    }
+
+    fn open_copy_dialog(&mut self) {
+        let Some(s) = &self.session else { return };
+        if s.frame.is_none() {
+            self.toasts.push(ToastSpec::info("still loading"));
+            return;
+        }
+        self.copy = Some(CopyDialog {
+            kind: ExportKind::Png,
+            edge: Scrub {
+                text: self.export_edge.text.clone(),
+                drag: ScrubDrag::default(),
+            },
+        });
+        wake(&self.wakeup);
+    }
+
+    /// Events while the copy dialog is open; it is modal, so nothing
+    /// else gets them.
+    fn on_copy_event(&mut self, event: &UiEvent) {
+        let Some(copy) = &mut self.copy else { return };
+        if event.kind == UiEventKind::Escape
+            || event.is_click_or_activate("copy:dismiss")
+            || event.is_click_or_activate("copy-cancel")
+        {
+            self.copy = None;
+            wake(&self.wakeup);
+            return;
+        }
+        if event.is_click_or_activate("copy-confirm") || event.is_hotkey("copy-confirm") {
+            self.copy_to_clipboard();
+            return;
+        }
+        if tabs::apply_event(&mut copy.kind, event, "copy-format", ExportKind::parse) {
+            wake(&self.wakeup);
+            return;
+        }
+        if number_scrubber::apply_event(
+            &mut copy.edge.text,
+            &mut copy.edge.drag,
+            "copy-edge",
+            &edge_opts(),
+            event,
+        ) {
+            wake(&self.wakeup);
+        }
+    }
+
+    /// Develop with the dialog's choices on a worker and offer the
+    /// encoded bytes on the Wayland clipboard. The offer is served by
+    /// a thread the clipboard crate keeps until another client takes
+    /// the selection.
+    fn copy_to_clipboard(&mut self) {
+        let Some(copy) = self.copy.take() else { return };
+        let Some(s) = &self.session else { return };
+        let Some(frame) = s.frame.clone() else { return };
+        let params = s.params.clone();
+        let name = s.name.clone();
+        let long_edge = copy_edge(&copy.edge);
+        let kind = copy.kind;
+        let (tx, rx) = channel();
+        self.copy_rx.push(rx);
+        self.toasts.push(ToastSpec::info("copying…"));
+        let wakeup = self.wakeup.clone();
+        std::thread::Builder::new()
+            .name("idev-copy".into())
+            .spawn(move || {
+                let result = (|| {
+                    let (img, exif) = develop_for(&frame, &name, &params, kind, long_edge)?;
+                    let bytes = encode(&img, kind, Some(&exif))?;
+                    let len = bytes.len();
+                    wl_clipboard_rs::copy::Options::new()
+                        .copy(
+                            wl_clipboard_rs::copy::Source::Bytes(bytes.into_boxed_slice()),
+                            wl_clipboard_rs::copy::MimeType::Specific(kind.mime().into()),
+                        )
+                        .map_err(|e| anyhow::anyhow!("clipboard: {e}"))?;
+                    Ok(format!(
+                        "copied {} × {} {} ({:.1} MB)",
+                        img.width,
+                        img.height,
+                        kind.label(),
+                        len as f64 / 1e6
+                    ))
+                })();
+                let _ = tx.send(result);
+                wake(&wakeup);
+            })
+            .expect("spawn copy thread");
+        wake(&self.wakeup);
     }
 
     fn poll_background(&mut self) {
@@ -896,6 +1037,21 @@ impl IdevApp {
         }
         for i in done.into_iter().rev() {
             self.export_rx.remove(i);
+        }
+        let mut done = Vec::new();
+        for (i, rx) in self.copy_rx.iter().enumerate() {
+            if let Ok(r) = rx.try_recv() {
+                done.push(i);
+                match r {
+                    Ok(message) => self.toasts.push(ToastSpec::success(message)),
+                    Err(e) => self
+                        .toasts
+                        .push(ToastSpec::error(format!("copy failed: {e:#}"))),
+                }
+            }
+        }
+        for i in done.into_iter().rev() {
+            self.copy_rx.remove(i);
         }
     }
 
@@ -1536,7 +1692,7 @@ impl IdevApp {
         };
         let position = format!("{} / {}", s.index + 1, self.library.files.len());
 
-        page([
+        let root = page([
             toolbar([
                 button_with_icon("layout-dashboard", "Library")
                     .key("back")
@@ -1557,7 +1713,45 @@ impl IdevApp {
             row([self.canvas(s), self.control_panel(s)])
                 .gap(tokens::SPACE_3)
                 .height(Size::Fill(1.0)),
-        ])
+        ]);
+        overlays(root, [self.copy_modal(s)])
+    }
+
+    /// The ctrl-C dialog: encoding and size for the clipboard offer.
+    fn copy_modal(&self, s: &Session) -> Option<El> {
+        let copy = self.copy.as_ref()?;
+        let size = s.frame.as_ref().map(|frame| {
+            let layout = geometry::layout(frame.size(), frame.orientation(), &s.params.geometry);
+            let (w, h) = (layout.width, layout.height);
+            match copy_edge(&copy.edge) {
+                Some(edge) => idev_core::gpu::sized(w, h, edge),
+                None => (w, h),
+            }
+        });
+        let what = match size {
+            Some((w, h)) => format!("{} · {w} × {h} px", s.name),
+            None => s.name.clone(),
+        };
+        Some(modal(
+            "copy",
+            "Copy to clipboard",
+            [
+                dialog_description(what),
+                tabs_list(
+                    "copy-format",
+                    &copy.kind,
+                    ExportKind::CLIPBOARD.map(|k| (k, k.label())),
+                ),
+                field_row(
+                    "Long edge (px, 0 = full)",
+                    number_scrubber("copy-edge", &copy.edge.text),
+                ),
+                dialog_footer([
+                    button("Cancel").key("copy-cancel").ghost(),
+                    button("Copy").key("copy-confirm").autofocus(),
+                ]),
+            ],
+        ))
     }
 
     fn on_develop_event(&mut self, event: &UiEvent) {
@@ -1588,6 +1782,10 @@ impl IdevApp {
         }
         if event.is_click_or_activate("export-jpg") || event.is_hotkey("export-jpg") {
             self.export(ExportKind::Jpeg);
+            return;
+        }
+        if event.is_hotkey("copy") {
+            self.open_copy_dialog();
             return;
         }
         if event.is_click_or_activate("export-png") {
@@ -1680,17 +1878,11 @@ impl IdevApp {
                 _ => {}
             }
         }
-        let edge = ScrubberOpts::default()
-            .min(0.0)
-            .max(20000.0)
-            .step(100.0)
-            .sensitivity(20.0)
-            .decimals(0);
         if number_scrubber::apply_event(
             &mut self.export_edge.text,
             &mut self.export_edge.drag,
             "export-edge",
-            &edge,
+            &edge_opts(),
             event,
         ) {
             wake(&self.wakeup);
@@ -2052,6 +2244,9 @@ impl App for IdevApp {
         if self.mode == Mode::Library && self.library.filter_focused() {
             return Vec::new();
         }
+        if self.copy.is_some() {
+            return vec![(named(NamedKey::Enter), "copy-confirm".into())];
+        }
         let mut keys = vec![
             (KeyChord::vim('t'), "sdr-preview".into()),
             (KeyChord::vim('o'), "open-folder".into()),
@@ -2077,12 +2272,17 @@ impl App for IdevApp {
                 (KeyChord::vim('w'), "warn".into()),
                 (KeyChord::vim('i'), "info".into()),
                 (KeyChord::vim('c'), "crop".into()),
+                (KeyChord::ctrl('c'), "copy".into()),
             ]),
         }
         keys
     }
 
     fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
+        if self.copy.is_some() {
+            self.on_copy_event(&event);
+            return;
+        }
         if event.is_click_or_activate("open-folder") || event.is_hotkey("open-folder") {
             self.open_folder_dialog();
             return;
@@ -2265,15 +2465,30 @@ fn lens_group(s: &Session) -> Vec<El> {
 }
 
 /// Develop at full resolution on a private device and encode.
-fn export_to(
+/// Scrubber options for a long-edge field (export and clipboard).
+fn edge_opts() -> ScrubberOpts {
+    ScrubberOpts::default()
+        .min(0.0)
+        .max(20000.0)
+        .step(100.0)
+        .sensitivity(20.0)
+        .decimals(0)
+}
+
+/// A long-edge scrubber's value as a resize request: `None` for full size.
+fn copy_edge(edge: &Scrub) -> Option<u32> {
+    edge.value().map(|v| v.round() as u32).filter(|&v| v > 0)
+}
+
+/// Develop `frame` for `kind` on a headless device, with the EXIF
+/// block for the result.
+fn develop_for(
     frame: &Source,
     source_name: &str,
     params: &DevelopParams,
-    kind: &ExportKind,
+    kind: ExportKind,
     long_edge: Option<u32>,
-    path: &Path,
-) -> Result<()> {
-    let t = Instant::now();
+) -> Result<(WorkingImage, Vec<u8>)> {
     let gpu = Gpu::headless()?;
     let dev = Developer::new(&gpu);
     let target = match kind {
@@ -2288,30 +2503,54 @@ fn export_to(
         &metadata::Output {
             width: img.width,
             height: img.height,
-            srgb: matches!(kind, ExportKind::Jpeg | ExportKind::Png | ExportKind::Avif),
+            srgb: kind.srgb(),
             note: &note,
         },
     )?;
-    let exif = Some(exif.as_slice());
+    Ok((img, exif))
+}
+
+/// Encode into memory; only the kinds in [`ExportKind::CLIPBOARD`].
+fn encode(img: &WorkingImage, kind: ExportKind, exif: Option<&[u8]>) -> Result<Vec<u8>> {
     match kind {
-        ExportKind::Jpeg => idev_formats::write_jpeg_srgb8(
-            path,
+        ExportKind::Jpeg => idev_formats::encode_jpeg_srgb8(
             img.width,
             img.height,
-            &output::srgb8(&img),
+            &output::srgb8(img),
             EXPORT_QUALITY,
             exif,
-        )?,
+        ),
         ExportKind::Png => {
-            idev_formats::write_png_srgb8(path, img.width, img.height, &output::srgb8(&img), exif)?
+            idev_formats::encode_png_srgb8(img.width, img.height, &output::srgb8(img), exif)
         }
-        ExportKind::HdrPng => idev_formats::write_png_bt2020_pq16(
-            path,
+        ExportKind::HdrPng => idev_formats::encode_png_bt2020_pq16(
             img.width,
             img.height,
-            &output::bt2020_pq16(&img),
+            &output::bt2020_pq16(img),
             exif,
-        )?,
+        ),
+        ExportKind::Avif | ExportKind::HdrAvif | ExportKind::Exr => {
+            anyhow::bail!("{} is not offered for the clipboard", kind.label())
+        }
+    }
+}
+
+fn export_to(
+    frame: &Source,
+    source_name: &str,
+    params: &DevelopParams,
+    kind: ExportKind,
+    long_edge: Option<u32>,
+    path: &Path,
+) -> Result<()> {
+    let t = Instant::now();
+    let (img, exif) = develop_for(frame, source_name, params, kind, long_edge)?;
+    let exif = Some(exif.as_slice());
+    match kind {
+        ExportKind::Jpeg | ExportKind::Png | ExportKind::HdrPng => {
+            std::fs::write(path, encode(&img, kind, exif)?)
+                .with_context(|| format!("write {}", path.display()))?
+        }
         ExportKind::Avif => idev_formats::write_avif_srgb8(
             path,
             img.width,

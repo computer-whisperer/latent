@@ -56,7 +56,9 @@ also step files in the develop view), Enter open, Esc back to the grid,
 `o` open another folder, `f` fit, `1` 1:1, `t` SDR preview, `w` zebra
 warning for pixels at the panel's peak (red) or outside its gamut
 (cyan), `i` metadata in the sidebar (every EXIF, GPS and Sony makernote
-field the file carries), `c` crop mode, `e` export JPEG. The Geometry
+field the file carries), `c` crop mode, `e` export JPEG, Ctrl+C copy
+the developed image to the clipboard (a dialog picks PNG, JPEG or HDR
+PNG and a long edge; Enter copies). The Geometry
 group has a Straighten scrubber (degrees, positive clockwise; the crop
 defaults to the largest same-aspect rectangle inside the turned
 content) and Crop: in crop mode the whole straightened frame shows

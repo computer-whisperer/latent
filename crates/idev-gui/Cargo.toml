@@ -16,6 +16,7 @@ anyhow.workspace = true
 damascene-core.workspace = true
 damascene-wgpu.workspace = true
 damascene-winit-wgpu.workspace = true
+wl-clipboard-rs.workspace = true
 idev-core = { path = "../idev-core" }
 idev-formats = { path = "../idev-formats" }
 rfd.workspace = true
