@@ -804,6 +804,48 @@ only the chosen type is offered, so a JPEG copy will not paste into an
 application that reads `image/png` only; no `text/uri-list` for the
 source file.
 
+## Low-light review (2026-09-15): RCD input clamp
+
+Green and red speckle in dark areas, worse under RCD than bilinear, and
+4x4 saturated red blobs on DSC01036 under RCD only.
+
+- **Cause, ours.** RCD's green step ratio-corrects each neighbour by
+  `1 + (lc - lpf2) / (eps + lc + lpf2)`. The reference implementations
+  clamp the input to non-negative first, which bounds the factor to
+  [0, 2]; we fed the unclamped plane, where black subtraction leaves a
+  third of shadow sites negative, so the denominator crosses zero. A
+  CPU replica of the shader arithmetic on DSC01024 (ISO 10000) put
+  3.1 % of R/B sites outside [0, 2], 58 k over 10x, worst 3·10^5; on
+  DSC01036 (ISO 1000) a single red site 73 DN under black gave a
+  factor of −14160, a green estimate of −250 k DN, and through the
+  colour-difference RB step a red blob at every neighbour within two
+  sites. Fixed by clamping the plane at zero in all three RCD loads
+  (reference behaviour; the shadow bias is ~0.4 sigma, under a code).
+  Strong dark-area outliers (>80 codes over the 5x5 median) on
+  DSC01024 went from R 6464 / G 3293 / B 3532 to R 2118 / G 35 / B 88;
+  bilinear sits at R 2149 / G 157 / B 75. DSC01036's blobs are gone.
+- **Cause, the sensor.** The red outliers that remain in every path are
+  single red CFA sites 400–800 DN above their same-colour median (noise
+  core ~28 DN at ISO 10000), at positions that do not repeat between
+  frames; the plane has a matching low tail (2088 sites at exactly 0
+  inside the crop). Heavy-tailed read noise, red first because of the
+  2.9x red multiplier. A genuine hot-pixel population exists but is
+  small (~1000 sites, 2–3x chance overlap between frames). Remedy, not
+  built: an impulse filter on the linearized plane before demosaic
+  (same-colour 3x3 median replacement past k sigma).
+- **Checked and fine.** rawler's lossless decode is bit-identical to
+  libraw over all 30.7 M sites (the lossless raster is 6656 x 4608,
+  zero-padded outside the crop); black 512; 14-bit data in these
+  frames (12-bit applies to continuous drive and electronic shutter);
+  the colour pass is linear in negatives and the sigmoid clamps. The
+  linearize scale uses the profile white 15360 while lossless files
+  declare 16383, so clip detection is 7 % early on them; harmless as
+  long as both use the same number.
+- **Not applicable now.** Sony's lossy Compressed RAW (files before
+  mid 2026-09-10) quantizes 14 of every 16 same-colour pixels to steps
+  of up to 64 DN when a bright pixel shares the block; the camera has
+  been on Lossless Compressed since.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

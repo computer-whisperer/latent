@@ -22,7 +22,7 @@ struct Uniforms {
 fn cfa(x: i32, y: i32) -> f32 {
     let cx = clamp(x, 0, i32(u.width) - 1);
     let cy = clamp(y, 0, i32(u.height) - 1);
-    return textureLoad(plane, vec2<i32>(cx, cy), 0).r;
+    return max(textureLoad(plane, vec2<i32>(cx, cy), 0).r, 0.0);
 }
 
 fn vh(x: i32, y: i32) -> f32 {

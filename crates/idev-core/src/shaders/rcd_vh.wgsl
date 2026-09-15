@@ -6,6 +6,14 @@
 // vertical direction is smooth, near 1 the horizontal is. The low-pass is
 // the 3x3 binomial over all colours, the "luminance" the ratio correction
 // in step 2 works against.
+//
+// The plane is clamped at zero on load, in all three steps, as the
+// reference implementation does. Black subtraction leaves shadow sites
+// negative, and the ratio correction in step 2 divides by the sum of two
+// low-pass values; with negatives that sum crosses zero and the factor is
+// unbounded (measured up to 10^6 on ISO 10000 frames, and a single site
+// 70 DN under black made a 4x4 saturated red blob). Non-negative input
+// keeps the factor in [0, 2].
 
 struct Uniforms {
     width: u32,
@@ -21,7 +29,7 @@ struct Uniforms {
 fn cfa(x: i32, y: i32) -> f32 {
     let cx = clamp(x, 0, i32(u.width) - 1);
     let cy = clamp(y, 0, i32(u.height) - 1);
-    return textureLoad(plane, vec2<i32>(cx, cy), 0).r;
+    return max(textureLoad(plane, vec2<i32>(cx, cy), 0).r, 0.0);
 }
 
 @compute @workgroup_size(16, 16)
