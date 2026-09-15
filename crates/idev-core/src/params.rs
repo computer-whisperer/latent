@@ -147,7 +147,9 @@ pub struct DevelopParams {
     pub denoise: Denoise,
 }
 
-/// Noise reduction on the demosaiced camera RGB, before the colour pass.
+/// Noise reduction: an impulse filter on the sensor plane before
+/// demosaic, and chroma / luminance smoothing on the demosaiced camera
+/// RGB before the colour pass.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Denoise {
@@ -155,6 +157,10 @@ pub struct Denoise {
     pub chroma: f32,
     /// Luminance smoothing strength, 0 (off) to 1.
     pub luminance: f32,
+    /// Impulse (hot / cold site) filter strength, 0 (off) to 1. A site
+    /// is replaced by its same-colour neighbourhood mean when it is more
+    /// than `impulse_sigmas` sigma away from it; 1 is the most eager.
+    pub impulse: f32,
 }
 
 impl Default for Denoise {
@@ -162,13 +168,23 @@ impl Default for Denoise {
         Denoise {
             chroma: 0.0,
             luminance: 0.0,
+            impulse: 0.0,
         }
     }
 }
 
 impl Denoise {
+    /// Whether the camera-RGB smoothing pass has anything to do.
     pub fn active(&self) -> bool {
         self.chroma > 0.0 || self.luminance > 0.0
+    }
+
+    /// The impulse filter's threshold in local sigmas for this strength:
+    /// 12 at the faintest setting, 4 at full. Sensor excursions measured
+    /// on the a6700 sit 8 to 30 sigma out, so 0.5 (8 sigma) catches most
+    /// of them with a negligible false-positive rate in Gaussian noise.
+    pub fn impulse_sigmas(&self) -> f32 {
+        12.0 - 8.0 * self.impulse.clamp(0.0, 1.0)
     }
 }
 

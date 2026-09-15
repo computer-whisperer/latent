@@ -467,6 +467,7 @@ pub struct IdevApp {
     sharpen_threshold: Scrub,
     denoise_chroma: Scrub,
     denoise_luma: Scrub,
+    denoise_impulse: Scrub,
 
     // Control scratch state.
     exposure: Scrub,
@@ -613,6 +614,7 @@ impl IdevApp {
             sharpen_threshold: Scrub::default(),
             denoise_chroma: Scrub::default(),
             denoise_luma: Scrub::default(),
+            denoise_impulse: Scrub::default(),
             exposure: Scrub::default(),
             contrast: Scrub::default(),
             hue: Scrub::default(),
@@ -781,6 +783,7 @@ impl IdevApp {
         self.sharpen_threshold.set(s.params.sharpen.threshold, 3);
         self.denoise_chroma.set(s.params.denoise.chroma, 2);
         self.denoise_luma.set(s.params.denoise.luminance, 2);
+        self.denoise_impulse.set(s.params.denoise.impulse, 2);
         self.exposure.set(s.params.exposure_ev, 2);
         let (c, h, w) = match s.params.tone {
             ToneCurve::Sigmoid {
@@ -1435,6 +1438,10 @@ impl IdevApp {
                 "Luminance",
                 number_scrubber("denoise-luma", &self.denoise_luma.text),
             ),
+            field_row(
+                "Impulse",
+                number_scrubber("denoise-impulse", &self.denoise_impulse.text),
+            ),
         ]));
         sections.push(sidebar_group([
             sidebar_group_label("Detail"),
@@ -1916,6 +1923,19 @@ impl IdevApp {
         ) {
             if let (Some(v), Some(s)) = (self.denoise_luma.value(), self.session.as_mut()) {
                 s.params.denoise.luminance = v.clamp(0.0, 1.0);
+                self.params_changed();
+            }
+            return;
+        }
+        if number_scrubber::apply_event(
+            &mut self.denoise_impulse.text,
+            &mut self.denoise_impulse.drag,
+            "denoise-impulse",
+            &strength,
+            event,
+        ) {
+            if let (Some(v), Some(s)) = (self.denoise_impulse.value(), self.session.as_mut()) {
+                s.params.denoise.impulse = v.clamp(0.0, 1.0);
                 self.params_changed();
             }
             return;

@@ -264,6 +264,8 @@ pub struct Prepared {
     pub height: u32,
     pub white_balance: WhiteBalance,
     pub demosaic: Demosaic,
+    /// Impulse filter strength the plane was demosaiced with.
+    pub impulse: f32,
     /// A rendered image: no sensor-space steps (highlights, lens).
     is_image: bool,
     /// EXIF orientation, folded into the output geometry.
@@ -282,7 +284,9 @@ impl Prepared {
     /// Whether `params` would need a fresh [`Developer::prepare`].
     pub fn matches(&self, params: &DevelopParams) -> bool {
         self.is_image
-            || (self.white_balance == params.white_balance && self.demosaic == params.demosaic)
+            || (self.white_balance == params.white_balance
+                && self.demosaic == params.demosaic
+                && self.impulse == params.denoise.impulse)
     }
 }
 
@@ -408,6 +412,7 @@ const WG: u32 = 16;
 /// Compiled pipelines. Build once per device, develop many frames.
 pub struct Developer {
     linearize: Pass,
+    impulse: Pass,
     bilinear: Pass,
     rcd_vh: Pass,
     rcd_green: Pass,
@@ -418,6 +423,17 @@ pub struct Developer {
     sharpen_blur: Pass,
     sharpen_apply: Pass,
     denoise: Pass,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ImpulseUniforms {
+    width: u32,
+    height: u32,
+    _pad: [u32; 2],
+    k: f32,
+    floor: f32,
+    _pad2: [f32; 2],
 }
 
 #[repr(C)]
@@ -490,6 +506,12 @@ impl Developer {
                 "idev::linearize",
                 include_str!("shaders/linearize.wgsl"),
                 &[Uniform, StorageBuffer, StorageTexture(R32Float)],
+            ),
+            impulse: Pass::new(
+                d,
+                "idev::impulse",
+                include_str!("shaders/impulse.wgsl"),
+                &[Uniform, Texture, StorageTexture(R32Float)],
             ),
             bilinear: Pass::new(
                 d,
@@ -859,6 +881,7 @@ impl Developer {
             height: img.height,
             white_balance: params.white_balance,
             demosaic: params.demosaic,
+            impulse: 0.0,
             is_image: true,
             orientation: img.orientation,
             wb: [1.0; 3],
@@ -1022,6 +1045,42 @@ impl Developer {
         self.linearize
             .dispatch(&mut encoder, &bg, frame.width, frame.height);
 
+        // The impulse filter replaces the plane the demosaic reads; the
+        // unfiltered one is dropped with the rest of the scratch.
+        let impulse = params.denoise.impulse.clamp(0.0, 1.0);
+        let plane = if impulse > 0.0 {
+            let filtered = texture(
+                device,
+                "idev::plane_filtered",
+                full,
+                wgpu::TextureFormat::R32Float,
+                intermediate,
+            );
+            let imp_u = uniform_buffer(
+                device,
+                queue,
+                &ImpulseUniforms {
+                    width: frame.width,
+                    height: frame.height,
+                    _pad: [0; 2],
+                    k: params.denoise.impulse_sigmas(),
+                    // Under any real noise floor (one 14-bit code on the
+                    // white-balanced scale), so flat regions cannot fire.
+                    floor: 1.0 / 16384.0,
+                    _pad2: [0.0; 2],
+                },
+            );
+            let bg = self.impulse.bind(
+                device,
+                &[imp_u.as_entire_binding(), tex(&plane), tex(&filtered)],
+            );
+            self.impulse
+                .dispatch(&mut encoder, &bg, frame.width, frame.height);
+            filtered
+        } else {
+            plane
+        };
+
         match params.demosaic {
             Demosaic::Bilinear => {
                 let bg = self.bilinear.bind(
@@ -1081,6 +1140,7 @@ impl Developer {
             height: out_h,
             white_balance: params.white_balance,
             demosaic: params.demosaic,
+            impulse,
             is_image: false,
             orientation: frame.orientation,
             wb,

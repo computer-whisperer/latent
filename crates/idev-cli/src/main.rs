@@ -123,7 +123,8 @@ struct Overrides {
     /// luminance at output resolution; amount 0 disables).
     #[arg(long)]
     sharpen: Option<String>,
-    /// Noise reduction: "chroma[,luminance]", each 0 (off) to 1.
+    /// Noise reduction: "chroma[,luminance[,impulse]]", each 0 (off)
+    /// to 1. Impulse is the hot / cold site filter on the sensor plane.
     #[arg(long)]
     denoise: Option<String>,
 }
@@ -174,13 +175,16 @@ impl Overrides {
                 .split(',')
                 .map(|x| x.trim().parse::<f32>())
                 .collect::<Result<_, _>>()
-                .with_context(|| format!("--denoise {spec}: expected chroma[,luminance]"))?;
+                .with_context(|| {
+                    format!("--denoise {spec}: expected chroma[,luminance[,impulse]]")
+                })?;
             anyhow::ensure!(
-                (1..=2).contains(&v.len()),
-                "--denoise {spec}: one or two values"
+                (1..=3).contains(&v.len()),
+                "--denoise {spec}: one to three values"
             );
             p.denoise.chroma = v[0].clamp(0.0, 1.0);
             p.denoise.luminance = v.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            p.denoise.impulse = v.get(2).copied().unwrap_or(0.0).clamp(0.0, 1.0);
         }
         if let Some(spec) = &self.sharpen {
             let v: Vec<f32> = spec

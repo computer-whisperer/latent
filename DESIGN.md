@@ -846,6 +846,36 @@ Green and red speckle in dark areas, worse under RCD than bilinear, and
   of up to 64 DN when a bright pixel shares the block; the camera has
   been on Lossless Compressed since.
 
+## Impulse filter (2026-09-15)
+
+`impulse.wgsl`, one pass on the linearized plane between linearize and
+demosaic, on when `Denoise.impulse` > 0 (default 0; `--denoise
+c,l,i`; an Impulse scrubber in the Noise group). It is part of
+`prepare`, so `Prepared::matches` compares it. Per site: the 24
+same-colour neighbours of the 5x5 window, the two largest and two
+smallest dropped, mean and sigma over the remaining 20; the site is
+replaced by that mean when it is more than `k` sigma away, `k = 12 −
+8 · strength` (0.5 → 8 sigma, 1 → 4). Sigma is floored at one 14-bit
+code so flat regions cannot fire. No median, so no sorting network;
+the trim handles a second bad site in the window.
+
+Verified (RCD after the clamp, strong dark-area outliers over 80 codes
+above the 5x5 median):
+
+| DSC01024, ISO 10000 | R | G | B |
+|---|---|---|---|
+| impulse 0 | 2118 | 35 | 88 |
+| impulse 0.5 | 207 | 23 | 8 |
+| impulse 1.0 | 64 | 28 | 10 |
+
+Footprint on DSC00744 (ISO 200, no push): 0.5 changes 0.007 % of
+output pixels by more than 2 codes, 1.0 changes 1.07 % (4 sigma on a
+20-sample estimate fires on ordinary noise and fine texture, which is
+why 1.0 is the eager end). DSC01036 at +4 EV: 0.5 touches 0.75 %.
+Cost: within the develop time (~125 ms at 25 MP including the pass).
+Default stays 0 because every existing sidecar deserialises the
+default; turning it on by default would change their renders.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700
