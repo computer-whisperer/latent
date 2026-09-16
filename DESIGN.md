@@ -1118,6 +1118,21 @@ SCALE [--kernel σ]`, `idev burst --stats` prints the fits.
   cleaner at 2×; σ 0.5 is crisper with more grain. Point-light
   widths are identical in every version (σ ≈ 2.2 sensor px): the
   lights are optically limited and cannot show resolution.
+- **Correction (2026-09-16, red-fringe investigation): the
+  resolution evidence above is invalid.** The refined transforms are
+  systematically 3–6 px off on the real sets (measured at 60 lights
+  across the frame, the same offset in every frame); the reconstruction
+  was the reference frame plus partially rejected ghosts of the other
+  frames, and ghost edges are what raised the high band. Cause: the
+  Gauss-Newton gradient in `refine_similarity::sample` is the central
+  difference at the integer floor of the sample position, not at the
+  position itself; on point-like content that biases every step the
+  same way, the loop never converges, and twelve iterations of ~0.2
+  quads each accumulate the offset (the coarse tile fit was right to
+  0.6 px). Verified by replicating the iteration in Python: the
+  floor-based gradient reproduces the Rust steps exactly, a gradient
+  centred on the sample point converges within 0.3 px of the measured
+  light positions. Fixed in the entry below.
 - Not evidence: the 37 mm 1/60 s set (DSC01468–1475) is too dark;
   there the 1-frame reconstruction has more high-band energy than
   the 8-frame one, i.e. the band is noise. A hand-held daytime burst
@@ -1130,6 +1145,55 @@ SCALE [--kernel σ]`, `idev burst --stats` prints the fits.
   Needs a look at the camera-RGB plane before the colour pass.
 - Not done: the GPU port; the structure-tensor kernel; merging or
   reconstruction from the GUI; the merged plane in float (step 2).
+
+### Refinement fix and the corner scorer (2026-09-16)
+
+- **Fix.** `sample_plane` now takes its gradient by central differences
+  of bilinear samples one pixel either side of the point; the
+  refinement uses it (the reconstruction's robustness term did too and
+  is unaffected in practice). The loop keeps the best state once the
+  reweighting has settled and stops when the residual rises. A new
+  test with point-like content at fractional positions reproduced the
+  drift on the old code (0.2 px on a 1024-px frame) and passes now.
+  On the night pair DSC01233/1234 the refined similarity lands within
+  0.3 px of the measured light positions (rotation −0.12°, independent
+  tile estimate −0.11°), where it was 5 px off.
+- **Scorer** (`corners.rs`, `idev burst --score`): X-corners on the
+  half-resolution plane by the saddle response of a σ = 2 quad blur,
+  refined by gradient orthogonality over a 6-quad disc centred on the
+  running estimate (the disc must exceed the blur width: at 4 quads
+  the estimate stopped 40 % of the way to the corner; a quadratic
+  saddle fit was tried first and biased 0.15 px toward the window
+  centre). Synthetic board with corners at every sub-quad phase: 0.08
+  px median, 0.13 px worst, no bias; pairwise 0.17 px. Corners are
+  matched as mutual nearest neighbours through the global shift.
+  Reported models: the global shift, coarse and refined similarity,
+  an in-sample homography (the best any global model can do on a
+  plane) and a local bound (refined plus per-cell translation over
+  6×4 cells). The strongest 120 reference corners are scored
+  separately because the ChArUco markers add weaker, worse-located
+  corners.
+- **Results, board bursts (1/200 s, ISO 320, 18 mm).** Second burst
+  (DSC01654–1670, shifts 1–8 px), strongest corners, rms px:
+  translation 0.5–1.4, coarse similarity 0.6–0.8, refined similarity
+  0.32–0.47, homography 0.29–0.39, local bound 0.27–0.37. First burst
+  (DSC01644–1653, shifts growing to 56 px): refined similarity
+  0.34 → 2.1 px with the shift, coarse about the same, homography
+  0.25–0.41, local bound 0.21–0.93.
+- **What that says.** The refinement now improves on the coarse fit
+  where the model fits at all. A global similarity is model-limited
+  on a tilted plane once the camera has moved a few tens of pixels:
+  the homography is up to eight times better. The residual floor on
+  real frames is about 0.3 px for every model, above the 0.13 px
+  synthetic floor; the likely cause is the markers intruding into
+  the 12-px refinement window, not tested. Lens distortion (4 % at
+  the corner at 18 mm) also makes even rigid motion non-projective on
+  the raw plane. Per-cell translation over 1000-px cells is not
+  enough at 56 px of motion (0.9 px), so the local field must be
+  finer than that.
+- **Next**: a per-tile alignment field (512-px tiles, refined by the
+  same Gauss-Newton per tile, initialised from the global fit), then
+  the reconstruction re-measured on the board and the room set.
 
 ## Milestones
 

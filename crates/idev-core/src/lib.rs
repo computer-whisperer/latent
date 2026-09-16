@@ -13,9 +13,11 @@
 //!   export encodings.
 //! - [`burst`] — continuous-drive bursts: grouping, alignment and the
 //!   merge into one sensor frame.
+//! - [`corners`] — checkerboard corners as alignment ground truth.
 
 pub mod burst;
 pub mod color;
+pub mod corners;
 pub mod geometry;
 pub mod gpu;
 pub mod metadata;

@@ -10,7 +10,7 @@ use idev_core::params::{
 use idev_core::sensor::{self, ExifSummary};
 use idev_core::source::Source;
 use idev_core::{WorkingImage, output};
-use idev_core::{burst, metadata};
+use idev_core::{burst, corners, metadata};
 
 #[derive(Parser)]
 #[command(name = "idev", about = "Raw developer")]
@@ -358,6 +358,10 @@ enum Cmd {
         /// Align and merge the inputs as one burst and print statistics.
         #[arg(long)]
         stats: bool,
+        /// Score the alignment models against checkerboard corners
+        /// detected in every frame (the inputs must show a board).
+        #[arg(long, conflicts_with = "stats")]
+        score: bool,
         /// With --stats: write the merged sensor plane as 16-bit PGM.
         #[arg(long, requires = "stats")]
         pgm: Option<PathBuf>,
@@ -409,9 +413,16 @@ fn main() -> Result<()> {
             Burst::from_flags(merge, superres, kernel),
             &overrides,
         ),
-        Cmd::Burst { inputs, stats, pgm } => {
+        Cmd::Burst {
+            inputs,
+            stats,
+            score,
+            pgm,
+        } => {
             if stats {
                 burst_stats(&inputs, pgm.as_deref())
+            } else if score {
+                burst_score(&inputs)
             } else {
                 list_bursts(&inputs)
             }
@@ -941,6 +952,162 @@ fn burst_stats(inputs: &[PathBuf], pgm: Option<&Path>) -> Result<()> {
             &merged.frame.data,
         )?;
         println!("merged plane -> {}", p.display());
+    }
+    Ok(())
+}
+
+/// Reference corners, by response, the strong-only score uses.
+const STRONG_CORNERS: usize = 120;
+
+/// A named alignment model: reference sensor coordinates to frame.
+type Model<'a> = (&'a str, Box<dyn Fn(f32, f32) -> (f32, f32) + 'a>);
+
+/// Alignment models against detected checkerboard corners: the global
+/// shift as a translation, the coarse similarity, and its refinement.
+fn burst_score(inputs: &[PathBuf]) -> Result<()> {
+    let files = raw_inputs(inputs)?;
+    if files.len() < 2 {
+        bail!("--score needs at least two raw frames");
+    }
+    let t = Instant::now();
+    let frames = burst::load_all(&files)?;
+    let refs: Vec<&idev_core::sensor::SensorFrame> = frames.iter().collect();
+    let mut corner_sets: Vec<Vec<corners::Corner>> = Vec::new();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = refs
+            .iter()
+            .map(|f| s.spawn(move || corners::detect(f)))
+            .collect();
+        for h in handles {
+            corner_sets.push(h.join().expect("corner detection"));
+        }
+    });
+    let shifts = burst::align_all(&refs)?;
+    let mut stages: Vec<Option<Result<(burst::Transform, burst::Transform)>>> =
+        (0..refs.len()).map(|_| None).collect();
+    std::thread::scope(|s| {
+        for ((slot, f), shift) in stages.iter_mut().zip(&refs).zip(&shifts).skip(1) {
+            let reference = refs[0];
+            s.spawn(move || {
+                *slot = Some(burst::align_similarity_stages(reference, f, *shift));
+            });
+        }
+    });
+    println!(
+        "{} frames, corners per frame: {}  ({:.1?})",
+        files.len(),
+        corner_sets
+            .iter()
+            .map(|c| c.len().to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
+        t.elapsed()
+    );
+    println!("residuals in sensor pixels over matched corners (rms / median / max):");
+    let mut totals = [(0f64, 0usize); 5];
+    for i in 1..files.len() {
+        let pairs = corners::matches(&corner_sets[0], &corner_sets[i], shifts[i], 4.0);
+        let (coarse, refined) = match stages[i].take().expect("filled") {
+            Ok(v) => v,
+            Err(e) => {
+                println!("  {}: {e:#}", file_name(&files[i]));
+                continue;
+            }
+        };
+        let shift = shifts[i];
+        let homography = corners::fit_homography(&pairs);
+        let models: [Model; 4] = [
+            (
+                "translation",
+                Box::new(move |x, y| (x + shift.dx, y + shift.dy)),
+            ),
+            (
+                "coarse similarity",
+                Box::new(move |x, y| coarse.apply(x, y)),
+            ),
+            (
+                "refined similarity",
+                Box::new(move |x, y| refined.apply(x, y)),
+            ),
+            (
+                "homography (in-sample)",
+                Box::new(move |x, y| match homography {
+                    Some(h) => h.apply(x, y),
+                    None => (f32::NAN, f32::NAN),
+                }),
+            ),
+        ];
+        println!(
+            "  {}  {} pairs  shift ({:+.2}, {:+.2})  refined rotation {:+.4}° scale {:.5}",
+            file_name(&files[i]),
+            pairs.len(),
+            shift.dx,
+            shift.dy,
+            refined.rotation_deg(),
+            refined.scale()
+        );
+        // The strongest corners are the board's own; weaker ones come
+        // from marker cells and are located less well.
+        let strong: Vec<corners::Pair> = corners::matches(
+            &corner_sets[0][..corner_sets[0].len().min(STRONG_CORNERS)],
+            &corner_sets[i],
+            shifts[i],
+            4.0,
+        );
+        println!(
+            "    {:<22} {:>24}   {:>24}",
+            "",
+            "all pairs",
+            format!("strongest {}", strong.len())
+        );
+        for (k, (name, predict)) in models.iter().enumerate() {
+            let sc = corners::score(&pairs, predict);
+            let ss = corners::score(&strong, predict);
+            println!(
+                "    {name:<22} {:6.3} / {:6.3} / {:6.2}   {:6.3} / {:6.3} / {:6.2}",
+                sc.rms, sc.median, sc.max, ss.rms, ss.median, ss.max
+            );
+            if ss.n > 0 {
+                totals[k].0 += ss.rms as f64;
+                totals[k].1 += 1;
+            }
+        }
+        let local = corners::local_bound(&strong, |x, y| refined.apply(x, y), refs[0], 6, 4);
+        println!(
+            "    {:<22} {:>24}   {:6.3} (refined + per-cell translation, 6×4 cells)",
+            "local bound", "", local
+        );
+        if local.is_finite() {
+            totals[4].0 += local as f64;
+            totals[4].1 += 1;
+        }
+        let grid = corners::residual_grid(&strong, |x, y| refined.apply(x, y), refs[0], 4, 3);
+        println!("    refined residual field (mean dx,dy per cell, 4 columns × 3 rows):");
+        for row in grid {
+            let cells: Vec<String> = row
+                .iter()
+                .map(|c| match c {
+                    Some((dx, dy, n)) => format!("({dx:+.2},{dy:+.2}) n{n:<3}"),
+                    None => "      -          ".to_string(),
+                })
+                .collect();
+            println!("      {}", cells.join("  "));
+        }
+    }
+    println!("mean rms over frames (strongest corners):");
+    for (k, name) in [
+        "translation",
+        "coarse similarity",
+        "refined similarity",
+        "homography (in-sample)",
+        "local bound",
+    ]
+    .iter()
+    .enumerate()
+    {
+        if totals[k].1 > 0 {
+            println!("  {name:<22} {:.3}", totals[k].0 / totals[k].1 as f64);
+        }
     }
     Ok(())
 }

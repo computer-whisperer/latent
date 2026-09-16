@@ -126,13 +126,13 @@ impl Shift {
 
 /// Half-resolution plane over the crop: each value is the mean of one
 /// 2x2 CFA quad, black subtracted, linear DN.
-struct Gray {
-    width: usize,
-    height: usize,
-    data: Vec<f32>,
+pub(crate) struct Gray {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) data: Vec<f32>,
 }
 
-fn gray(frame: &SensorFrame) -> Gray {
+pub(crate) fn gray(frame: &SensorFrame) -> Gray {
     let c = frame.crop;
     let (w, h) = ((c.width / 2) as usize, (c.height / 2) as usize);
     let stride = frame.width as usize;
@@ -462,6 +462,15 @@ pub fn align_similarity(
     frame: &SensorFrame,
     global: Shift,
 ) -> Result<Transform> {
+    Ok(align_similarity_stages(reference, frame, global)?.1)
+}
+
+/// The coarse tile fit and its refinement, for scoring them separately.
+pub fn align_similarity_stages(
+    reference: &SensorFrame,
+    frame: &SensorFrame,
+    global: Shift,
+) -> Result<(Transform, Transform)> {
     ensure!(
         reference.width == frame.width
             && reference.height == frame.height
@@ -535,7 +544,18 @@ pub fn align_similarity(
     });
     matches.extend(results.into_iter().flatten());
     let coarse = fit_similarity(&mut matches, global);
-    Ok(refine_similarity(&ga, &gb, &ma, crop, coarse))
+    tracing::debug!(
+        ?global,
+        tiles = matches.len(),
+        coarse = %describe_transform(&coarse, 1.0),
+        "similarity: coarse fit"
+    );
+    for m in &matches {
+        tracing::trace!(p = ?m.p, q = ?m.q, w = m.w, "tile");
+    }
+    let refined = refine_similarity(&ga, &gb, &ma, crop, coarse);
+    tracing::debug!(refined = %describe_transform(&refined, 1.0), "similarity: refined");
+    Ok((coarse, refined))
 }
 
 /// Gauss-Newton refinement of a similarity on the half-resolution log
@@ -591,26 +611,11 @@ fn refine_similarity(
         tq[0] + a[0][0] * mx + a[0][1] * my - mx,
         tq[1] + a[1][0] * mx + a[1][1] * my - my,
     ];
-    let sample = |p: &[f32], x: f32, y: f32| -> Option<(f32, f32, f32)> {
-        if x < 1.0 || y < 1.0 || x >= (w - 2) as f32 || y >= (h - 2) as f32 {
-            return None;
-        }
-        let (x0, y0) = (x.floor() as usize, y.floor() as usize);
-        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
-        let at = |i: usize, j: usize| p[j * w + i];
-        let v = at(x0, y0) * (1.0 - fx) * (1.0 - fy)
-            + at(x0 + 1, y0) * fx * (1.0 - fy)
-            + at(x0, y0 + 1) * (1.0 - fx) * fy
-            + at(x0 + 1, y0 + 1) * fx * fy;
-        // Gradient by central differences of the bilinear surface.
-        let gx = (at(x0 + 1, y0) - at(x0 - 1, y0)) * (1.0 - fy) * 0.5
-            + (at(x0 + 1, y0 + 1) - at(x0 - 1, y0 + 1)) * fy * 0.5;
-        let gy = (at(x0, y0 + 1) - at(x0, y0 - 1)) * (1.0 - fx) * 0.5
-            + (at(x0 + 1, y0 + 1) - at(x0 + 1, y0 - 1)) * fx * 0.5;
-        Some((v, gx, gy))
-    };
     let mut residual_scale = f32::INFINITY;
     let mut last_rms = 0f32;
+    // The best state seen once the reweighting has settled, so a step
+    // that raises the residual is undone rather than compounded.
+    let mut best: Option<(f32, [[f32; 2]; 2], [f32; 2])> = None;
     for it in 0..ITERATIONS {
         // Parameters: (da, db, dtx, dty) on top of the current (a, b, t)
         // with A = [[a, -b], [b, a]] about the mask centre.
@@ -630,7 +635,7 @@ fn refine_similarity(
                     a[0][0] * dx + a[0][1] * dy + mx + tq[0],
                     a[1][0] * dx + a[1][1] * dy + my + tq[1],
                 );
-                let Some((vb, gx, gy)) = sample(&lb, wx, wy) else {
+                let Some((vb, gx, gy)) = sample_plane(&lb, w, h, wx, wy) else {
                     continue;
                 };
                 let r = vb - la[y * w + x];
@@ -661,9 +666,30 @@ fn refine_similarity(
             break;
         }
         last_rms = (sum_r2 / count).sqrt() as f32;
+        if it >= 3 {
+            match best {
+                Some((rms, ba, btq)) if last_rms > rms * 1.001 => {
+                    a = ba;
+                    tq = btq;
+                    last_rms = rms;
+                    break;
+                }
+                Some((rms, _, _)) if last_rms >= rms => {}
+                _ => best = Some((last_rms, a, tq)),
+            }
+        }
         let Some(delta) = solve4(hess, grad) else {
             break;
         };
+        tracing::trace!(
+            it,
+            rms = last_rms,
+            n = count,
+            ?delta,
+            a = ?a,
+            tq = ?tq,
+            "refine step"
+        );
         a[0][0] -= delta[0] as f32;
         a[1][1] -= delta[0] as f32;
         a[0][1] += delta[1] as f32;
@@ -1078,22 +1104,32 @@ pub fn merge(frames: &[&SensorFrame], shifts: &[Shift]) -> Result<Merged> {
 // ---------------------------------------------------------------------
 // Reconstruction: kernel regression onto an output grid
 
-/// Bilinear sample of a plane with its gradient; `None` outside.
-fn sample_plane(p: &[f32], w: usize, h: usize, x: f32, y: f32) -> Option<(f32, f32, f32)> {
+/// Bilinear sample of a plane; `None` within a pixel of the border.
+fn bilinear(p: &[f32], w: usize, h: usize, x: f32, y: f32) -> Option<f32> {
     if x < 1.0 || y < 1.0 || x >= (w - 2) as f32 || y >= (h - 2) as f32 {
         return None;
     }
     let (x0, y0) = (x.floor() as usize, y.floor() as usize);
     let (fx, fy) = (x - x0 as f32, y - y0 as f32);
     let at = |i: usize, j: usize| p[j * w + i];
-    let v = at(x0, y0) * (1.0 - fx) * (1.0 - fy)
-        + at(x0 + 1, y0) * fx * (1.0 - fy)
-        + at(x0, y0 + 1) * (1.0 - fx) * fy
-        + at(x0 + 1, y0 + 1) * fx * fy;
-    let gx = (at(x0 + 1, y0) - at(x0 - 1, y0)) * (1.0 - fy) * 0.5
-        + (at(x0 + 1, y0 + 1) - at(x0 - 1, y0 + 1)) * fy * 0.5;
-    let gy = (at(x0, y0 + 1) - at(x0, y0 - 1)) * (1.0 - fx) * 0.5
-        + (at(x0 + 1, y0 + 1) - at(x0 + 1, y0 - 1)) * fx * 0.5;
+    Some(
+        at(x0, y0) * (1.0 - fx) * (1.0 - fy)
+            + at(x0 + 1, y0) * fx * (1.0 - fy)
+            + at(x0, y0 + 1) * (1.0 - fx) * fy
+            + at(x0 + 1, y0 + 1) * fx * fy,
+    )
+}
+
+/// Bilinear sample of a plane with its gradient, the latter by central
+/// differences of bilinear samples one pixel either side of the point
+/// itself. (Differencing at the integer floor instead, as an earlier
+/// version did, biases every Gauss-Newton step the same way on
+/// point-like content, and the refinement then walks away from the
+/// coarse fit instead of converging: DESIGN.md, step 3 correction.)
+fn sample_plane(p: &[f32], w: usize, h: usize, x: f32, y: f32) -> Option<(f32, f32, f32)> {
+    let v = bilinear(p, w, h, x, y)?;
+    let gx = (bilinear(p, w, h, x + 1.0, y)? - bilinear(p, w, h, x - 1.0, y)?) * 0.5;
+    let gy = (bilinear(p, w, h, x, y + 1.0)? - bilinear(p, w, h, x, y - 1.0)?) * 0.5;
     Some((v, gx, gy))
 }
 
@@ -1410,6 +1446,18 @@ mod tests {
     /// A synthetic frame: sparse bright blobs on a dark noisy plane,
     /// like a night skyline, so the mask has something to pass.
     fn synthetic(width: u32, height: u32, shift: (f32, f32), seed: u32) -> SensorFrame {
+        synthetic_blobs(width, height, shift, seed, 50.0)
+    }
+
+    /// `falloff` is the blob's exp(-d²/falloff): 50 gives 5 px blobs,
+    /// 3 gives point-like lights about a pixel wide.
+    fn synthetic_blobs(
+        width: u32,
+        height: u32,
+        shift: (f32, f32),
+        seed: u32,
+        falloff: f32,
+    ) -> SensorFrame {
         let mut rng = seed.wrapping_mul(2654435761).wrapping_add(12345);
         let mut next = move || {
             rng ^= rng << 13;
@@ -1438,7 +1486,7 @@ mod tests {
                 for &(bx, by, amp) in &blobs {
                     let d2 = (rx - bx).powi(2) + (ry - by).powi(2);
                     if d2 < 400.0 {
-                        s += amp * (-d2 / 50.0).exp();
+                        s += amp * (-d2 / falloff).exp();
                     }
                 }
                 let noise = (next() + next() + next() - 1.5) * 8.0;
@@ -1677,5 +1725,29 @@ mod tests {
         for w in &out.mean_weight {
             assert!(*w > 0.8, "{:?}", out.mean_weight);
         }
+    }
+
+    #[test]
+    fn refinement_converges_on_point_like_content() {
+        // Sharp lights at fractional positions: the case the night sets
+        // present. The refinement must not walk away from the coarse fit.
+        let reference = synthetic_blobs(1024, 768, (0.0, 0.0), 51, 3.0);
+        let frame = synthetic_blobs(1024, 768, (3.3, -2.6), 52, 3.0);
+        let g = align(&reference, &frame).unwrap();
+        let (coarse, refined) = align_similarity_stages(&reference, &frame, g).unwrap();
+        for (x, y) in [(200.0, 200.0), (800.0, 600.0), (512.0, 384.0)] {
+            let (cx, cy) = coarse.apply(x, y);
+            let (rx, ry) = refined.apply(x, y);
+            assert!(
+                (cx - x - 3.3).abs() < 0.5 && (cy - y + 2.6).abs() < 0.5,
+                "coarse {coarse:?}"
+            );
+            assert!(
+                (rx - x - 3.3).abs() < 0.15 && (ry - y + 2.6).abs() < 0.15,
+                "refined {refined:?} at ({x},{y}) -> ({rx},{ry})"
+            );
+        }
+        assert!(refined.rotation_deg().abs() < 0.01, "{refined:?}");
+        assert!((refined.scale() - 1.0).abs() < 2e-4, "{refined:?}");
     }
 }
