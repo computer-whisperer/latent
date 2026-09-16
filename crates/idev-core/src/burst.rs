@@ -22,7 +22,7 @@ use anyhow::{Context, Result, ensure};
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
-use crate::sensor::{self, ExifSummary, SensorFrame};
+use crate::sensor::{self, ExifSummary, Rect, SensorFrame};
 use crate::source::CameraRgb;
 
 /// Longest gap between consecutive frames of one burst, on top of the
@@ -1269,7 +1269,10 @@ pub fn noise_model(
     const BINS_PER_OCTAVE: f32 = 4.0;
     const MIN_SAMPLES: usize = 500;
     let c = reference.crop;
-    let (w, h) = (reference.width as i32, reference.height as i32);
+    // The raster beyond the crop is padding, not image: a shifted
+    // sample landing there is missing.
+    let (x0, y0) = (c.x as i32, c.y as i32);
+    let (x1, y1) = ((c.x + c.width) as i32, (c.y + c.height) as i32);
     let stride = reference.width as usize;
     let site = |x: u32, y: u32| ((y & 1) * 2 + (x & 1)) as usize;
     let mut bins: Vec<(Vec<f32>, f64)> = vec![(Vec::new(), 0.0); 64];
@@ -1278,7 +1281,7 @@ pub fn noise_model(
         let mut x = c.x;
         while x < c.x + c.width {
             let (fx, fy) = (x as i32 + shift.0, y as i32 + shift.1);
-            if fx >= 0 && fy >= 0 && fx < w && fy < h {
+            if fx >= x0 && fy >= y0 && fx < x1 && fy < y1 {
                 let s = site(x, y);
                 let black = reference.black[s];
                 let white = reference.white[s] - black;
@@ -1359,7 +1362,12 @@ fn median(v: &mut [f32]) -> f32 {
 
 /// A merged burst: the reference frame with the merged plane.
 pub struct Merged {
+    /// The reference with the merged plane. Its crop is inset from the
+    /// reference's by `inset` on every side: the region every frame
+    /// covers, so the edges carry no single-frame strip.
     pub frame: SensorFrame,
+    /// Even pixels taken off each side of the crop, x and y.
+    pub inset: (u32, u32),
     /// Single-frame noise model the robustness weights used.
     pub noise: NoiseModel,
     /// Shifts as applied, even sensor pixels, one per input frame.
@@ -1396,8 +1404,10 @@ pub fn merge(frames: &[&SensorFrame], shifts: &[Shift]) -> Result<Merged> {
             NoiseModel { a: 0.0, b: s * s }
         });
 
-    let (w, h) = (reference.width as i32, reference.height as i32);
     let stride = reference.width as usize;
+    let c = reference.crop;
+    let (cx0, cy0) = (c.x as i32, c.y as i32);
+    let (cx1, cy1) = ((c.x + c.width) as i32, (c.y + c.height) as i32);
     let n = frames.len();
     let mut out = vec![0u16; reference.data.len()];
     let sums = std::sync::Mutex::new((vec![0f64; n], vec![0u64; n]));
@@ -1417,7 +1427,8 @@ pub fn merge(frames: &[&SensorFrame], shifts: &[Shift]) -> Result<Merged> {
                 let mut who = [0u8; 64];
                 for (i, (f, &(ox, oy))) in frames.iter().zip(&offsets).enumerate() {
                     let (fx, fy) = (x + ox, y + oy);
-                    if fx >= 0 && fy >= 0 && fx < w && fy < h {
+                    // Padding beyond the crop is not image.
+                    if fx >= cx0 && fy >= cy0 && fx < cx1 && fy < cy1 {
                         who[vals.len()] = i as u8;
                         vals.push(f.data[fy as usize * stride + fx as usize] as f32 - black);
                     }
@@ -1468,8 +1479,31 @@ pub fn merge(frames: &[&SensorFrame], shifts: &[Shift]) -> Result<Merged> {
         .collect();
     let mut frame = reference.clone();
     frame.data = out;
+    // Inset the crop to what every frame covers. The same amount on
+    // both sides keeps the lens tables' centre where it was, and an
+    // even amount keeps the CFA phase; the loss is at most the largest
+    // shift on the far side (tens of pixels of 6000).
+    let reach = |axis: usize| {
+        offsets
+            .iter()
+            .map(|o| if axis == 0 { o.0 } else { o.1 }.unsigned_abs())
+            .max()
+            .unwrap_or(0)
+            .next_multiple_of(2)
+    };
+    let inset = (
+        reach(0).min((c.width / 4) & !1),
+        reach(1).min((c.height / 4) & !1),
+    );
+    frame.crop = Rect {
+        x: c.x + inset.0,
+        y: c.y + inset.1,
+        width: c.width - 2 * inset.0,
+        height: c.height - 2 * inset.1,
+    };
     Ok(Merged {
         frame,
+        inset,
         noise,
         offsets,
         mean_weight,
@@ -1749,6 +1783,9 @@ pub struct Report {
     pub reference: usize,
     pub frames: Vec<FrameReport>,
     pub noise: NoiseModel,
+    /// Even pixels taken off each side of the crop, x and y
+    /// ([`Merged::inset`]).
+    pub inset: (u32, u32),
 }
 
 impl Report {
@@ -1833,12 +1870,14 @@ pub fn merge_frames(frames: &[SensorFrame]) -> Result<(Merged, Report)> {
         report[i] = r;
     }
     let noise = merged.noise;
+    let inset = merged.inset;
     Ok((
         merged,
         Report {
             reference,
             frames: report,
             noise,
+            inset,
         },
     ))
 }

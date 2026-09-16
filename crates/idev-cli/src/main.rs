@@ -653,6 +653,13 @@ fn develop(
                         };
                         println!("  {}  {}{tag}", f.display(), r.describe());
                     }
+                    println!(
+                        "  crop inset {} x {} px per side -> {} x {}",
+                        report.inset.0,
+                        report.inset.1,
+                        merged.frame.crop.width,
+                        merged.frame.crop.height
+                    );
                     Ok((Source::Raw(Box::new(merged.frame)), name))
                 }
                 Some(Burst::Superres { scale, kernel }) => {

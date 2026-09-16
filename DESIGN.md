@@ -1421,6 +1421,39 @@ the selecting merge would do):
   (no input tool to toggle Info).
 - Not done: excluding or re-weighting a frame by hand from the GUI.
 
+### The stretched fringe (2026-09-16)
+
+Reported: the merged develop shows a stretched fringe around the
+image, like the distortion correction's but wider. Cause, found on
+the merged sensor plane of DSC01146–1156: the merge treated the
+raster beyond the crop (Sony pads the 6656 × 4608 raster; the image
+is 6272 × 4168 at the origin) as valid samples. Where most frames
+drift toward an edge their samples land in the padding, the median
+goes to zero, and the merged strip is black: the last columns before
+the crop's right edge read 0 where the reference reads 545/557. The
+distortion correction, sampling clamped at the edge, then stretches
+that band into the fringe. The old `burst --stats` "below-black σ
+merged 12" on the 0.6 s set was this band, not noise.
+
+Fix, in the merge and the noise model: a shifted sample outside the
+crop is missing. And the merged frame's crop is inset on every side
+by the largest applied shift on that axis, rounded up to even, the
+same on both sides: the region every used frame covers, so no edge
+strip is a single-frame or few-frame merge. Symmetric keeps the lens
+tables' centre exact; even keeps the CFA phase; the loss is tens of
+pixels of 6000 (34 × 6 px per side on the 11-frame set). The report
+carries the inset; the CLI prints it and the GUI's Burst group shows
+"edges inset 34 × 6 px". Verified on the merged plane (the right edge
+now holds image data) and in the develop (6124 × 4116 out of
+6192 × 4128).
+
+Not a crop preset, because the merge knows its coverage exactly and
+a preset would have to guess it. The distortion correction's own
+fringe is the same shape of problem with a computable valid rectangle
+(where the mapped source stays inside), and would fit the same slot:
+a source-declared content rectangle that the default crop honours.
+Not done.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

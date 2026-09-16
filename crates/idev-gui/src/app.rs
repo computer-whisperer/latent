@@ -2692,6 +2692,13 @@ fn burst_group(s: &Session) -> Vec<El> {
                 .caption()
                 .muted(),
             );
+            if r.inset != (0, 0) {
+                items.push(
+                    text(format!("edges inset {} × {} px", r.inset.0, r.inset.1))
+                        .caption()
+                        .muted(),
+                );
+            }
             // Its own line: the sidebar is too narrow for both.
             if r.reference != 0 {
                 items.push(
