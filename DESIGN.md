@@ -1369,6 +1369,13 @@ needed for night bursts. Script: scratchpad `night/corner_check.py`.
 - Fixed beside this: `idev-gui FILE` indexed the file's position in
   `files` but opened `view[selected]`, so with hidden JPEG pairs it
   opened a different file (DSC01128 for DSC01126).
+- Reported after: cropping showed the image tiled several times until
+  the file was reopened. The preview texture was rebuilt only when the
+  zoom scale changed (a condition from the first develop window, before
+  straighten and crop made the output size depend on the parameters),
+  so a crop at the same scale rendered into a texture of the old size.
+  The preview now keys on its size as well. Fixed by reading the code;
+  not reproduced interactively (no input tool on this host).
 - Not in this chunk: an edited burst's regenerated thumbnail is
   developed from the single raw (the thumbnail worker does not merge);
   a merged-plane cache; choosing the sharpest frame as reference; the

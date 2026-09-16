@@ -169,6 +169,9 @@ impl GpuState {
 
 struct Preview {
     scale: u32,
+    /// Texture size: the output size for `scale` and the geometry it
+    /// was made for. Straighten and crop change it at the same scale.
+    size: (u32, u32),
     texture: AppTexture,
     view: wgpu::TextureView,
 }
@@ -2609,8 +2612,11 @@ impl WinitWgpuApp for IdevApp {
         }
         let prepared = g.prepared.as_ref().expect("prepared above");
 
-        if g.preview.as_ref().is_none_or(|p| p.scale != scale) {
-            let (w, h) = Developer::output_size(prepared, &params, scale);
+        let (w, h) = Developer::output_size(prepared, &params, scale);
+        if g.preview
+            .as_ref()
+            .is_none_or(|p| p.scale != scale || p.size != (w, h))
+        {
             let texture = g.gpu.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("idev::preview"),
                 size: wgpu::Extent3d {
@@ -2629,6 +2635,7 @@ impl WinitWgpuApp for IdevApp {
             let texture = damascene_wgpu::app_texture(Arc::new(texture));
             g.preview = Some(Preview {
                 scale,
+                size: (w, h),
                 texture,
                 view,
             });
@@ -2641,7 +2648,6 @@ impl WinitWgpuApp for IdevApp {
         if g.rendered.as_ref() != Some(&want) {
             g.dev
                 .render(&g.gpu, prepared, &want.0, render, &preview.view);
-            let (w, h) = Developer::output_size(prepared, &want.0, scale);
             g.rendered = Some(want);
             // One histogram in flight at a time; a newer render just
             // waits for the next frame. The zebra overlay would pollute
