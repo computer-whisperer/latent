@@ -644,13 +644,14 @@ fn develop(
                         files
                     };
                     let name = burst::source_name(files);
-                    let (merged, shifts) = burst::merge_files(files)?;
-                    for ((f, s), (o, w)) in files
-                        .iter()
-                        .zip(&shifts)
-                        .zip(merged.offsets.iter().zip(&merged.mean_weight))
-                    {
-                        println!("  {}  {}", f.display(), burst::describe(s, *o, *w));
+                    let (merged, report) = burst::merge_files(files)?;
+                    for (i, (f, r)) in files.iter().zip(&report.frames).enumerate() {
+                        let tag = if i == report.reference {
+                            "  reference"
+                        } else {
+                            ""
+                        };
+                        println!("  {}  {}{tag}", f.display(), r.describe());
                     }
                     Ok((Source::Raw(Box::new(merged.frame)), name))
                 }
@@ -874,6 +875,37 @@ fn burst_stats(inputs: &[PathBuf], pgm: Option<&Path>) -> Result<()> {
     let t_merge = t.elapsed();
     let n = files.len();
     println!("{n} frames  load {t_load:.1?}  align {t_align:.1?}  merge {t_merge:.1?}");
+    // The statistics below merge onto frame 0; say what the selecting
+    // merge (`develop --merge`, the GUI) would do instead.
+    let sharp = burst::sharpness_all(&frames);
+    let sharpest = sharp.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
+    let rel: Vec<f32> = sharp.iter().map(|s| s / sharpest).collect();
+    println!(
+        "sharpness (relative to the sharpest):  {}",
+        rel.iter()
+            .zip(&files)
+            .map(|(s, f)| format!("{} {s:.2}", file_name(f)))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+    let reference = (0..n)
+        .max_by(|&a, &b| rel[a].total_cmp(&rel[b]))
+        .expect("frames");
+    let dropped: Vec<String> = files
+        .iter()
+        .zip(&rel)
+        .filter(|(_, r)| **r < burst::DROP_SHARPNESS)
+        .map(|(f, _)| file_name(f))
+        .collect();
+    println!(
+        "selecting merge would take {} as reference and drop {}",
+        file_name(&files[reference]),
+        if dropped.is_empty() {
+            "nothing".to_string()
+        } else {
+            dropped.join(", ")
+        }
+    );
     for (i, f) in files.iter().enumerate() {
         println!(
             "  {}  {}",

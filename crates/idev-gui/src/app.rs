@@ -395,12 +395,9 @@ impl Drop for Library {
 enum Merge {
     /// Not started: not a burst, or the single frame was wanted.
     Idle,
-    Running(Receiver<Result<burst::Merged>>),
-    /// Landed; `weight` is the mean robustness weight of the other
-    /// frames (1 when they agreed with the reference everywhere).
-    Done {
-        weight: f32,
-    },
+    Running(Receiver<Result<(burst::Merged, burst::Report)>>),
+    /// Landed, with how each member was treated.
+    Done(burst::Report),
     Failed(String),
 }
 
@@ -540,7 +537,7 @@ impl Session {
             .name("idev-merge".into())
             .spawn(move || {
                 let t = Instant::now();
-                let r = burst::merge_files(&members).map(|(m, _)| m);
+                let r = burst::merge_files(&members);
                 tracing::info!("merged {} frames in {:.1?}", members.len(), t.elapsed());
                 let _ = tx.send(r);
                 wake(&wakeup);
@@ -1203,11 +1200,9 @@ impl IdevApp {
             }
             if let Merge::Running(rx) = &s.merge {
                 match rx.try_recv() {
-                    Ok(Ok(m)) => {
-                        let others = &m.mean_weight[1..];
-                        let weight = others.iter().sum::<f32>() / others.len().max(1) as f32;
+                    Ok(Ok((m, report))) => {
                         s.merged = Some(Arc::new(Source::Raw(Box::new(m.frame))));
-                        s.merge = Merge::Done { weight };
+                        s.merge = Merge::Done(report);
                         changed |= s.params.stack;
                     }
                     Ok(Err(e)) => s.merge = Merge::Failed(format!("{e:#}")),
@@ -1463,6 +1458,9 @@ impl IdevApp {
     /// The sidebar in info mode: every metadata group as name/value rows.
     fn metadata_panel(&self, s: &Session) -> El {
         let mut sections: Vec<El> = Vec::new();
+        if s.members.len() > 1 {
+            sections.push(sidebar_group(burst_members(s)));
+        }
         match s.frame() {
             None => sections.push(sidebar_group([text("loading…").muted()])),
             Some(f) if f.metadata().is_empty() => {
@@ -2673,23 +2671,80 @@ impl WinitWgpuApp for IdevApp {
 /// The burst sidebar group: the stack switch and the merge's state.
 fn burst_group(s: &Session) -> Vec<El> {
     let n = s.members.len();
-    let state = match (&s.merge, s.params.stack) {
-        (Merge::Failed(e), _) => text(e.clone()).caption().text_color(tokens::DESTRUCTIVE),
-        (Merge::Idle, _) => text("single frame").caption().muted(),
-        (Merge::Running(_), true) => text("merging…").caption().muted(),
-        (Merge::Running(_), false) => text("single frame · merging…").caption().muted(),
-        (Merge::Done { weight }, true) => {
-            text(format!("merged from {n} frames · mean weight {weight:.2}"))
-                .caption()
-                .muted()
-        }
-        (Merge::Done { .. }, false) => text("single frame · merge ready").caption().muted(),
-    };
-    vec![
+    let mut items = vec![
         sidebar_group_label("Burst"),
         field_row(format!("Merge {n} frames"), switch("stack", s.params.stack)),
-        state,
-    ]
+    ];
+    match (&s.merge, s.params.stack) {
+        (Merge::Failed(e), _) => {
+            items.push(text(e.clone()).caption().text_color(tokens::DESTRUCTIVE))
+        }
+        (Merge::Idle, _) => items.push(text("single frame").caption().muted()),
+        (Merge::Running(_), true) => items.push(text("merging…").caption().muted()),
+        (Merge::Running(_), false) => items.push(text("single frame · merging…").caption().muted()),
+        (Merge::Done(r), true) => {
+            items.push(
+                text(format!(
+                    "merged from {} of {n} frames · mean weight {:.2}",
+                    r.used(),
+                    r.mean_weight()
+                ))
+                .caption()
+                .muted(),
+            );
+            // Its own line: the sidebar is too narrow for both.
+            if r.reference != 0 {
+                items.push(
+                    text(format!("reference {}", file_name(&s.members[r.reference])))
+                        .caption()
+                        .muted(),
+                );
+            }
+        }
+        (Merge::Done(_), false) => items.push(text("single frame · merge ready").caption().muted()),
+    }
+    items
+}
+
+/// The info panel's burst section: every member with its part in the
+/// merge.
+fn burst_members(s: &Session) -> Vec<El> {
+    let mut rows = vec![sidebar_group_label("Burst")];
+    for (i, m) in s.members.iter().enumerate() {
+        let value = match &s.merge {
+            Merge::Done(r) => {
+                let f = &r.frames[i];
+                if i == r.reference {
+                    format!("reference · sharp {:.2}", f.sharpness)
+                } else if f.used {
+                    format!(
+                        "{:+.0}, {:+.0} px · w {:.2} · sharp {:.2}",
+                        f.shift.dx, f.shift.dy, f.weight, f.sharpness
+                    )
+                } else {
+                    format!("dropped · sharp {:.2}", f.sharpness)
+                }
+            }
+            Merge::Running(_) => "merging…".into(),
+            Merge::Idle => "single frame".into(),
+            Merge::Failed(e) => e.clone(),
+        };
+        rows.push(
+            row([
+                text(file_name(m)).caption().muted(),
+                spacer(),
+                text(value).caption(),
+            ])
+            .gap(tokens::SPACE_3),
+        );
+    }
+    rows
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// The lens sidebar group: three switches, or a note when the file has

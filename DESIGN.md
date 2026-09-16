@@ -1382,6 +1382,45 @@ needed for night bursts. Script: scratchpad `night/corner_check.py`.
   merged plane stays u16 (rounding adds 0.29 DN against a merged floor
   near 0.6 DN).
 
+### Reference choice and blurred frames (2026-09-16)
+
+`burst::sharpness`: mean squared Laplacian of the quad plane over
+the signal mask. Frames of a burst share exposure, so noise adds the
+same to each and the ratio ranks them. On the night sets:
+
+| set | relative sharpness | note |
+|---|---|---|
+| DSC01126–1132 (0.6 s) | 0.90–1.00 | uniform; frame 1130's 5.9 % centre rejection was not blur |
+| DSC01233–1238 (1/8 s) | 0.71 → 1.00, rising through the burst | the leader is among the softest |
+| DSC01146–1156 (11 frames) | two at 0.10 and 0.32, the rest 0.84–1.00 | motion blur; the merge's mean weights (0.97) never noticed |
+
+Kill test on the 11-frame set, merges developed at +2 EV and measured
+around the brightest cluster of lights: with all eleven frames the
+lights' Laplacian energy was 732, without the two blurred ones 927
+(single frame 1178, which includes its noise); sky high-pass σ 0.45
+against 0.47. The robustness gate rejects most of a smeared light but
+not its skirt, which stays within 3σ_d of the median at those levels.
+
+Design, in `merge_frames` (used by `develop --merge` and the GUI; the
+diagnostic `burst --stats` still merges onto frame 0 and prints what
+the selecting merge would do):
+- Reference: the sharpest frame. The merged plane is on its grid, so
+  the single-frame view (stack off) can sit a few pixels away from it.
+- Frames below `DROP_SHARPNESS` = 0.5 of the sharpest are left out;
+  the rest keep the per-pixel robust weights, which handle the local
+  disagreements a mildly softer frame has.
+- `Report` (per input: shift, applied offset, weight, sharpness, used;
+  the reference index) travels with the merge. The CLI prints it per
+  file with "dropped" and "reference" tags; the GUI's Burst group says
+  "merged from 9 of 11 frames · mean weight 0.97" with the reference
+  on its own line when it is not the leader, and the info panel lists
+  every member with its part.
+- Verified: `develop --merge` on DSC01146 drops 1147 and 1148 and
+  takes 1153; the GUI merged the eleven in 2.1 s and shows the line
+  (screenshot). The info panel's list is built but not screenshotted
+  (no input tool to toggle Info).
+- Not done: excluding or re-weighting a frame by hand from the GUI.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

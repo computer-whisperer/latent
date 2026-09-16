@@ -37,6 +37,12 @@ const MIN_COVERAGE: f32 = 0.001;
 /// Robustness: a sample this many sigmas of the pair difference from
 /// the median has weight e^-½.
 const ROBUST_SIGMAS: f32 = 3.0;
+/// Frames whose sharpness falls below this fraction of the burst's
+/// sharpest are left out of the merge: their smeared lights leak past
+/// the robustness gate (on DSC01146–1156 two motion-blurred frames at
+/// 0.10 and 0.32 cost the merged lights 21 % of their Laplacian energy
+/// and bought 4 % in sky noise).
+pub const DROP_SHARPNESS: f32 = 0.5;
 
 // ---------------------------------------------------------------------
 // Grouping
@@ -195,6 +201,34 @@ pub(crate) fn gray(frame: &SensorFrame) -> Gray {
         height: h,
         data,
     }
+}
+
+/// How much fine detail a frame holds: mean squared Laplacian of the
+/// quad plane over the quads that carry signal (the alignment mask).
+/// Frames of one burst share exposure, so their noise contributes the
+/// same and the ratio between frames ranks their sharpness: defocus
+/// or motion in a frame lowers it. Only comparable within a burst.
+pub fn sharpness(frame: &SensorFrame) -> f32 {
+    let g = gray(frame);
+    let quad_sigma = dark_sigma(frame) * 0.5;
+    let blurred = box_blur(&g.data, g.width, g.height);
+    let threshold = (MASK_SIGMAS * quad_sigma).max(2.0);
+    let (w, h) = (g.width, g.height);
+    let mut sum = 0f64;
+    let mut n = 0u64;
+    for y in 1..h.saturating_sub(1) {
+        for x in 1..w.saturating_sub(1) {
+            let i = y * w + x;
+            if blurred[i] <= threshold {
+                continue;
+            }
+            let d = &g.data;
+            let l = 4.0 * d[i] - d[i - 1] - d[i + 1] - d[i - w] - d[i + w];
+            sum += (l * l) as f64;
+            n += 1;
+        }
+    }
+    if n == 0 { 0.0 } else { (sum / n as f64) as f32 }
 }
 
 /// Read-noise estimate in DN: RMS of the below-black tail inside the
@@ -1670,21 +1704,154 @@ pub fn describe_transform(t: &Transform, weight: f32) -> String {
     )
 }
 
-/// Load the files as one burst, align each to the first and merge.
-/// Returns the merge and the measured shifts (index 0 is zero).
-pub fn merge_files(paths: &[impl AsRef<Path>]) -> Result<(Merged, Vec<Shift>)> {
+/// Load the files as one burst and [`merge_frames`] them.
+pub fn merge_files(paths: &[impl AsRef<Path>]) -> Result<(Merged, Report)> {
     ensure!(paths.len() >= 2, "a burst needs at least two frames");
     let frames = load_all(paths)?;
     merge_frames(&frames)
 }
 
-/// Align each frame to the first and merge.
-pub fn merge_frames(frames: &[SensorFrame]) -> Result<(Merged, Vec<Shift>)> {
+/// One input frame's part in a merge ([`Report`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameReport {
+    /// Measured shift relative to the reference (zero for it).
+    pub shift: Shift,
+    /// Even-pixel offset applied; zero when the frame was not used.
+    pub offset: (i32, i32),
+    /// Mean robustness weight inside the crop; 0 when not used.
+    pub weight: f32,
+    /// [`sharpness`] relative to the burst's sharpest frame, 0..1.
+    pub sharpness: f32,
+    pub used: bool,
+}
+
+impl FrameReport {
+    pub fn describe(&self) -> String {
+        if self.used {
+            format!(
+                "{}  sharp {:.2}",
+                describe(&self.shift, self.offset, self.weight),
+                self.sharpness
+            )
+        } else {
+            format!(
+                "dx {:+7.2} dy {:+7.2} px  peak {:.3}  sharp {:.2}  dropped",
+                self.shift.dx, self.shift.dy, self.shift.peak, self.sharpness
+            )
+        }
+    }
+}
+
+/// How [`merge_frames`] treated each input, in input order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Report {
+    /// Index of the frame the others were merged onto: the sharpest.
+    pub reference: usize,
+    pub frames: Vec<FrameReport>,
+    pub noise: NoiseModel,
+}
+
+impl Report {
+    pub fn used(&self) -> usize {
+        self.frames.iter().filter(|f| f.used).count()
+    }
+
+    /// Mean robustness weight of the used frames other than the
+    /// reference (whose weight is 1 by construction).
+    pub fn mean_weight(&self) -> f32 {
+        let others: Vec<f32> = self
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(i, f)| f.used && *i != self.reference)
+            .map(|(_, f)| f.weight)
+            .collect();
+        if others.is_empty() {
+            1.0
+        } else {
+            others.iter().sum::<f32>() / others.len() as f32
+        }
+    }
+}
+
+/// Merge a burst: the sharpest frame is the reference, frames below
+/// [`DROP_SHARPNESS`] of it are left out, the rest are aligned to it
+/// and merged.
+pub fn merge_frames(frames: &[SensorFrame]) -> Result<(Merged, Report)> {
     ensure!(frames.len() >= 2, "a burst needs at least two frames");
-    let refs: Vec<&SensorFrame> = frames.iter().collect();
+    let n = frames.len();
+    let sharp = sharpness_all(frames);
+    let max = sharp.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
+    let rel: Vec<f32> = sharp.iter().map(|s| s / max).collect();
+    let reference = (0..n)
+        .max_by(|&a, &b| rel[a].partial_cmp(&rel[b]).unwrap_or(Ordering::Equal))
+        .expect("at least two frames");
+    // Alignment and the low-level merge take frames[0] as reference.
+    let order: Vec<usize> = std::iter::once(reference)
+        .chain((0..n).filter(|&i| i != reference))
+        .collect();
+    let refs: Vec<&SensorFrame> = order.iter().map(|&i| &frames[i]).collect();
     let shifts = align_all(&refs)?;
-    let merged = merge(&refs, &shifts)?;
-    Ok((merged, shifts))
+    let used: Vec<bool> = order.iter().map(|&i| rel[i] >= DROP_SHARPNESS).collect();
+    let kept: Vec<&SensorFrame> = refs
+        .iter()
+        .zip(&used)
+        .filter(|(_, u)| **u)
+        .map(|(f, _)| *f)
+        .collect();
+    let kept_shifts: Vec<Shift> = shifts
+        .iter()
+        .zip(&used)
+        .filter(|(_, u)| **u)
+        .map(|(s, _)| *s)
+        .collect();
+    let merged = merge(&kept, &kept_shifts)?;
+    let mut report = vec![
+        FrameReport {
+            shift: Shift::ZERO,
+            offset: (0, 0),
+            weight: 0.0,
+            sharpness: 0.0,
+            used: false,
+        };
+        n
+    ];
+    let mut k = 0;
+    for (j, &i) in order.iter().enumerate() {
+        let mut r = FrameReport {
+            shift: shifts[j],
+            offset: (0, 0),
+            weight: 0.0,
+            sharpness: rel[i],
+            used: used[j],
+        };
+        if used[j] {
+            r.offset = merged.offsets[k];
+            r.weight = merged.mean_weight[k];
+            k += 1;
+        }
+        report[i] = r;
+    }
+    let noise = merged.noise;
+    Ok((
+        merged,
+        Report {
+            reference,
+            frames: report,
+            noise,
+        },
+    ))
+}
+
+/// [`sharpness`] of every frame, in parallel.
+pub fn sharpness_all(frames: &[SensorFrame]) -> Vec<f32> {
+    let mut out = vec![0f32; frames.len()];
+    std::thread::scope(|s| {
+        for (o, f) in out.iter_mut().zip(frames) {
+            s.spawn(move || *o = sharpness(f));
+        }
+    });
+    out
 }
 
 /// How a burst's files are named in reports and the develop note:
@@ -1913,6 +2080,40 @@ mod tests {
         // Sum of three uniforms scaled by 8: variance 3/12 * 64 = 16.
         assert!((m.b - 16.0).abs() < 4.0, "{m:?}");
         assert!(m.a < 0.5, "{m:?}");
+    }
+
+    #[test]
+    fn merge_frames_drops_the_blurred_frame_and_takes_the_sharpest() {
+        let mut frames: Vec<SensorFrame> = (0..4)
+            .map(|i| synthetic(256, 192, (2.0 * i as f32, -2.0 * i as f32), 20 + i as u32))
+            .collect();
+        // Smear frame 0 along rows over same-colour sites.
+        let w = frames[0].width as usize;
+        let src = frames[0].data.clone();
+        for (i, v) in frames[0].data.iter_mut().enumerate() {
+            let x = i % w;
+            let taps: Vec<u32> = (-3..=3)
+                .filter_map(|k| {
+                    let xx = x as i64 + 2 * k;
+                    (xx >= 0 && (xx as usize) < w).then(|| src[i - x + xx as usize] as u32)
+                })
+                .collect();
+            *v = (taps.iter().sum::<u32>() / taps.len() as u32) as u16;
+        }
+        let (merged, report) = merge_frames(&frames).unwrap();
+        assert_ne!(report.reference, 0, "{report:?}");
+        assert!(!report.frames[0].used, "{:?}", report.frames[0]);
+        assert!(report.frames[0].sharpness < DROP_SHARPNESS);
+        assert_eq!(report.used(), 3);
+        assert!((report.frames[report.reference].sharpness - 1.0).abs() < 1e-6);
+        assert!(
+            report
+                .frames
+                .iter()
+                .enumerate()
+                .all(|(i, f)| f.used || i == 0)
+        );
+        assert_eq!(merged.offsets.len(), 3);
     }
 
     #[test]
