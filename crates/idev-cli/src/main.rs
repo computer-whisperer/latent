@@ -4,12 +4,13 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use idev_core::gpu::{Developer, Gpu, OutputTarget};
-use idev_core::metadata;
 use idev_core::params::{
     Demosaic, DevelopParams, Highlights, LensParams, ToneCurve, WhiteBalance, sidecar_path,
 };
+use idev_core::sensor::{self, ExifSummary};
 use idev_core::source::Source;
 use idev_core::{WorkingImage, output};
+use idev_core::{burst, metadata};
 
 #[derive(Parser)]
 #[command(name = "idev", about = "Raw developer")]
@@ -333,8 +334,25 @@ enum Cmd {
         /// Write the resolved parameters to each raw's sidecar.
         #[arg(long)]
         save_params: bool,
+        /// Treat the inputs as one burst: align them to the first,
+        /// merge on the sensor plane, develop the result with the first
+        /// frame's parameters. Needs -o.
+        #[arg(long, requires = "out")]
+        merge: bool,
         #[command(flatten)]
         overrides: Overrides,
+    },
+    /// List the continuous-drive bursts among raw files (or in a
+    /// directory), or with --stats align and merge the given frames as
+    /// one burst and report shifts, weights and the noise reduction.
+    Burst {
+        inputs: Vec<PathBuf>,
+        /// Align and merge the inputs as one burst and print statistics.
+        #[arg(long)]
+        stats: bool,
+        /// With --stats: write the merged sensor plane as 16-bit PGM.
+        #[arg(long, requires = "stats")]
+        pgm: Option<PathBuf>,
     },
     /// Dump the raw sensor plane as 16-bit PGM (for decoder cross-checks).
     DumpBayer {
@@ -366,6 +384,7 @@ fn main() -> Result<()> {
             size,
             force,
             save_params,
+            merge,
             overrides,
         } => develop(
             &files,
@@ -377,8 +396,16 @@ fn main() -> Result<()> {
             size,
             force,
             save_params,
+            merge,
             &overrides,
         ),
+        Cmd::Burst { inputs, stats, pgm } => {
+            if stats {
+                burst_stats(&inputs, pgm.as_deref())
+            } else {
+                list_bursts(&inputs)
+            }
+        }
         Cmd::DumpBayer { file, out } => {
             let Source::Raw(frame) = Source::load(&file)? else {
                 bail!("{}: not a camera raw", file.display());
@@ -523,6 +550,7 @@ fn develop(
     size: Option<u32>,
     force: bool,
     save_params: bool,
+    merge: bool,
     overrides: &Overrides,
 ) -> Result<()> {
     if files.is_empty() {
@@ -531,8 +559,8 @@ fn develop(
     // Resolve each input's output path and format up front.
     let jobs: Vec<(PathBuf, PathBuf, Format)> = match (out, out_dir) {
         (Some(o), None) => {
-            if files.len() != 1 {
-                bail!("-o takes exactly one input; use --out-dir for several");
+            if files.len() != 1 && !merge {
+                bail!("-o takes exactly one input; use --out-dir for several, or --merge");
             }
             let fmt = format
                 .or_else(|| Format::from_path(o))
@@ -576,10 +604,27 @@ fn develop(
             );
             continue;
         }
+        let load = || -> Result<(Source, String)> {
+            if merge {
+                let (merged, shifts) = burst::merge_files(files)?;
+                for ((f, s), (o, w)) in files
+                    .iter()
+                    .zip(&shifts)
+                    .zip(merged.offsets.iter().zip(&merged.mean_weight))
+                {
+                    println!("  {}  {}", f.display(), burst::describe(s, *o, *w));
+                }
+                let name = format!("{}+{}", file_name(input), files.len() - 1);
+                Ok((Source::Raw(Box::new(merged.frame)), name))
+            } else {
+                Ok((Source::load(input)?, file_name(input)))
+            }
+        };
         match develop_one(
             &gpu,
             &dev,
             input,
+            load,
             output_path,
             *fmt,
             target,
@@ -602,11 +647,20 @@ fn develop(
     Ok(())
 }
 
+fn file_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Develop one source. `input` names the sidecar and the report line;
+/// `load` produces the source (a file, or a merged burst).
 #[allow(clippy::too_many_arguments)]
 fn develop_one(
     gpu: &Gpu,
     dev: &Developer,
     input: &Path,
+    load: impl FnOnce() -> Result<(Source, String)>,
     output_path: &Path,
     fmt: Format,
     target: OutputTarget,
@@ -618,14 +672,10 @@ fn develop_one(
 ) -> Result<()> {
     let params = overrides.resolve(input)?;
     let t0 = Instant::now();
-    let source = Source::load(input)?;
+    let (source, name) = load()?;
     let t1 = Instant::now();
     let img: WorkingImage = dev.develop_sized(gpu, &source, &params, target, size)?;
     let t2 = Instant::now();
-    let name = input
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
     let note = metadata::develop_note(&name, &params);
     let exif = metadata::exif_for_output(
         &source.metadata().tags,
@@ -651,6 +701,195 @@ fn develop_one(
         t2 - t1,
         t3 - t2
     );
+    Ok(())
+}
+
+/// Raw files among the inputs, directories expanded one level, sorted.
+fn raw_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for p in inputs {
+        if p.is_dir() {
+            for entry in std::fs::read_dir(p).with_context(|| format!("read {}", p.display()))? {
+                let f = entry?.path();
+                if f.is_file() && idev_core::source::is_raw(&f) {
+                    files.push(f);
+                }
+            }
+        } else if idev_core::source::is_raw(p) {
+            files.push(p.clone());
+        } else {
+            eprintln!("{}: not a camera raw, skipped", p.display());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn list_bursts(inputs: &[PathBuf]) -> Result<()> {
+    let files = raw_inputs(inputs)?;
+    if files.is_empty() {
+        bail!("no raw files");
+    }
+    let t = Instant::now();
+    let summaries: Vec<Option<ExifSummary>> = files
+        .iter()
+        .map(|f| match sensor::summary(f) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("{}: {e:#}", f.display());
+                None
+            }
+        })
+        .collect();
+    let refs: Vec<Option<&ExifSummary>> = summaries.iter().map(|s| s.as_ref()).collect();
+    let groups = burst::group(&refs);
+    let bursts: Vec<&Vec<usize>> = groups.iter().filter(|g| g.len() > 1).collect();
+    println!(
+        "{} raw files, {} bursts, {} single frames  ({:.1?})",
+        files.len(),
+        bursts.len(),
+        groups.len() - bursts.len(),
+        t.elapsed()
+    );
+    for g in bursts {
+        let first = summaries[g[0]]
+            .as_ref()
+            .expect("grouped frames have summaries");
+        let last = summaries[*g.last().unwrap()]
+            .as_ref()
+            .expect("grouped frames have summaries");
+        let span = match (first.timestamp_secs(), last.timestamp_secs()) {
+            (Some(a), Some(b)) => format!("{:.1} s", b - a),
+            _ => "?".into(),
+        };
+        let exposure = first
+            .exposure_time
+            .map(|(n, d)| format!("{n}/{d} s"))
+            .unwrap_or_default();
+        println!(
+            "{}..{}  {:2} frames  {}  {}  f/{}  ISO {}  {} mm  span {}",
+            file_name(&files[g[0]]),
+            file_name(&files[*g.last().unwrap()]),
+            g.len(),
+            first.date().unwrap_or_default(),
+            exposure,
+            first
+                .f_number
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_default(),
+            first.iso.map(|v| v.to_string()).unwrap_or_default(),
+            first
+                .focal_length_mm
+                .map(|v| format!("{v:.0}"))
+                .unwrap_or_default(),
+            span
+        );
+    }
+    Ok(())
+}
+
+fn burst_stats(inputs: &[PathBuf], pgm: Option<&Path>) -> Result<()> {
+    let files = raw_inputs(inputs)?;
+    if files.len() < 2 {
+        bail!("--stats needs at least two raw frames");
+    }
+    let t = Instant::now();
+    let frames = burst::load_all(&files)?;
+    let t_load = t.elapsed();
+    let refs: Vec<&idev_core::sensor::SensorFrame> = frames.iter().collect();
+    let t = Instant::now();
+    let shifts = burst::align_all(&refs)?;
+    let t_align = t.elapsed();
+    let t = Instant::now();
+    let merged = burst::merge(&refs, &shifts)?;
+    let t_merge = t.elapsed();
+    let n = files.len();
+    println!("{n} frames  load {t_load:.1?}  align {t_align:.1?}  merge {t_merge:.1?}");
+    for (i, f) in files.iter().enumerate() {
+        println!(
+            "  {}  {}",
+            file_name(f),
+            burst::describe(&shifts[i], merged.offsets[i], merged.mean_weight[i])
+        );
+    }
+    let single = merged.noise;
+    println!(
+        "single-frame noise model  σ² = {:.4}·s + {:.2}   σ(0) {:.2}  σ(100) {:.2}  σ(1000) {:.2} DN",
+        single.a,
+        single.b,
+        single.sigma(0.0),
+        single.sigma(100.0),
+        single.sigma(1000.0)
+    );
+    let below = |f: &idev_core::sensor::SensorFrame| {
+        let c = f.crop;
+        let mut n = 0u64;
+        for y in c.y..c.y + c.height {
+            let row =
+                &f.data[y as usize * f.width as usize..][c.x as usize..(c.x + c.width) as usize];
+            for (i, &v) in row.iter().enumerate() {
+                if (v as f32) < f.black[((y & 1) * 2 + ((c.x + i as u32) & 1)) as usize] {
+                    n += 1;
+                }
+            }
+        }
+        n as f32 / (c.width * c.height) as f32
+    };
+    let before = burst::dark_sigma(&frames[0]);
+    let after = burst::dark_sigma(&merged.frame);
+    println!(
+        "below-black σ  reference {before:.2} ({:.1}% of sites)  merged {after:.2} ({:.1}%)  ratio {:.2}  (√N = {:.2}; only meaningful with a real dark tail)",
+        below(&frames[0]) * 100.0,
+        below(&merged.frame) * 100.0,
+        before / after.max(1e-6),
+        (n as f32).sqrt()
+    );
+    // Halves merged separately: the model between them is the noise of
+    // an N/2-frame merge, at every signal level.
+    let evens: Vec<&idev_core::sensor::SensorFrame> = refs.iter().step_by(2).copied().collect();
+    let odds: Vec<&idev_core::sensor::SensorFrame> =
+        refs.iter().skip(1).step_by(2).copied().collect();
+    let even_shifts: Vec<burst::Shift> = shifts.iter().step_by(2).copied().collect();
+    let mut odd_shifts: Vec<burst::Shift> = shifts.iter().skip(1).step_by(2).copied().collect();
+    // Odd frames merge onto frame 1; express their shifts relative to it.
+    let base = odd_shifts[0];
+    for s in odd_shifts.iter_mut() {
+        s.dx -= base.dx;
+        s.dy -= base.dy;
+    }
+    let half_a = burst::merge(&evens, &even_shifts)?;
+    let half_b = burst::merge(&odds, &odd_shifts)?;
+    // Both halves live on their own reference's grid: frame 1 sits at
+    // `base` relative to frame 0.
+    if let Some(half) = burst::noise_model(&half_a.frame, &half_b.frame, base.even()) {
+        let k = (n as f32 / 2.0).sqrt();
+        println!(
+            "half-split model (N/2 = {} frames each)  σ² = {:.4}·s + {:.2}   σ(0) {:.2}  σ(100) {:.2}  σ(1000) {:.2} DN",
+            evens.len(),
+            half.a,
+            half.b,
+            half.sigma(0.0),
+            half.sigma(100.0),
+            half.sigma(1000.0)
+        );
+        println!(
+            "single / half ratio  at 0: {:.2}  at 100: {:.2}  at 1000: {:.2}   (√(N/2) = {k:.2})",
+            single.sigma(0.0) / half.sigma(0.0).max(1e-6),
+            single.sigma(100.0) / half.sigma(100.0).max(1e-6),
+            single.sigma(1000.0) / half.sigma(1000.0).max(1e-6)
+        );
+    } else {
+        println!("half-split model: not enough samples");
+    }
+    if let Some(p) = pgm {
+        idev_formats::write_pgm16(
+            p,
+            merged.frame.width,
+            merged.frame.height,
+            &merged.frame.data,
+        )?;
+        println!("merged plane -> {}", p.display());
+    }
     Ok(())
 }
 

@@ -34,7 +34,7 @@ pub const THUMB_EDGE: u32 = 512;
 /// the key, so old entries age out through the sweep.
 // 2: rendered images honour their EXIF orientation.
 // 3: the EXIF summary rides along for library sorting and filtering.
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 const MAGIC: [u8; 4] = *b"IDTH";
 const HEADER_LEN: usize = 4 + 4 + 4 + 4 + 1 + 4;
 const MAX_DIM: u32 = 16_384;

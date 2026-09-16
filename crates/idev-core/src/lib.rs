@@ -11,7 +11,10 @@
 //!   own device.
 //! - [`output`] — CPU output transforms from the working space to
 //!   export encodings.
+//! - [`burst`] — continuous-drive bursts: grouping, alignment and the
+//!   merge into one sensor frame.
 
+pub mod burst;
 pub mod color;
 pub mod geometry;
 pub mod gpu;

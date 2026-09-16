@@ -43,6 +43,10 @@ pub struct Metadata {
     pub groups: Vec<Group>,
     /// The parsed tags kept for re-export into developed files.
     pub tags: Tags,
+    /// Continuous-drive sequence number (Sony makernote 0xb04a), 1 for
+    /// the first frame of a burst; `None` for single shots and other
+    /// makers.
+    pub sequence: Option<u32>,
 }
 
 /// IFD0, Exif IFD and GPS IFD entries as parsed (structural and bulky
@@ -135,6 +139,11 @@ impl Metadata {
                 }
             }
             out.push("Sony", fields);
+            out.sequence = mn
+                .get_entry(TAG_SONY_SEQUENCE)
+                .and_then(|e| first_int(&e.value))
+                .filter(|&n| n > 0 && n != 65535)
+                .map(|n| n as u32);
             for (tag, entry) in mn.entries() {
                 if SONY_SPECS.iter().any(|s| s.tag == *tag)
                     || entry.value.count() > 8
@@ -189,6 +198,9 @@ pub struct Output<'a> {
 }
 
 /// IFD0 tags carried over as they are.
+/// Sony makernote: continuous-drive sequence number.
+const TAG_SONY_SEQUENCE: u16 = 0xb04a;
+
 const IFD0_KEPT: &[u16] = &[
     0x010e, 0x010f, 0x0110, 0x011a, 0x011b, 0x0128, 0x0132, 0x013b, 0x8298,
 ];
@@ -298,15 +310,17 @@ pub fn from_image_file(path: &Path) -> Result<Option<Embedded>> {
             .and_then(|e| text(&e.value))
             .unwrap_or_default()
     };
-    let summary = ExifSummary::from_exif(&exif, ascii(ExifTag::Make), ascii(ExifTag::Model));
+    let mut summary = ExifSummary::from_exif(&exif, ascii(ExifTag::Make), ascii(ExifTag::Model));
     let orientation = match exif.orientation {
         Some(o @ 1..=8) => Orientation::from_u16(o),
         _ => Orientation::Normal,
     };
+    let metadata = Metadata::from_tiff(&tiff, &mut cursor);
+    summary.sequence = metadata.sequence;
     Ok(Some(Embedded {
         summary,
         orientation,
-        metadata: Metadata::from_tiff(&tiff, &mut cursor),
+        metadata,
     }))
 }
 
@@ -1435,7 +1449,7 @@ const SONY_SPECS: &[Spec] = &[
     spec(0x202c, "Metering", Fmt::Enum(SONY_METERING)),
     spec(0x202d, "Exposure standard adjustment", Fmt::Ev),
     spec(0xb049, "Release mode", Fmt::Enum(SONY_RELEASE_MODE)),
-    spec(0xb04a, "Sequence number", Fmt::SonySequence),
+    spec(TAG_SONY_SEQUENCE, "Sequence number", Fmt::SonySequence),
     spec(0x201a, "Electronic front curtain", Fmt::Enum(SONY_ON_OFF)),
     spec(0x201b, "Focus mode", Fmt::Enum(SONY_FOCUS_MODE)),
     spec(0x201c, "AF area mode", Fmt::Enum(SONY_AF_AREA_MODE)),

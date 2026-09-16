@@ -876,6 +876,122 @@ Cost: within the develop time (~125 ms at 25 MP including the pass).
 Default stays 0 because every existing sidecar deserialises the
 default; turning it on by default would change their renders.
 
+## Burst arc (2026-09-15)
+
+Survey of the night sets (2026-09-15, 239 frames, a6700, Lossless
+Compressed, ISO 320 throughout, 20 continuous-drive bursts of 4–16
+frames at 1/20–1.6 s): median signal 5–10 DN above black on a 14848 DN
+range, 1–2 % of each frame above 30 DN. Phase correlation on the
+log green plane: consecutive frames move 6–15 px with non-integer
+fractions (stabilisation on), drift across a 13-frame burst reaches
+74 px, rotation ~0.04° (1 px across 1500 px). Unmasked correlation on
+dark tiles locks onto fixed-pattern noise and reports exactly 0.0 —
+the aligner must vote only where there is signal. Gain: Photons to
+Photos shows the a6700 ISO-invariant from 100 to 4000 with one small
+step at 5000; the "second base at ISO 320" folklore is not in the data.
+
+Reference pipeline: HDR+ (Hasinoff 2016) and handheld multi-frame
+super-resolution (Wronski 2019): merge on the Bayer plane before
+demosaic, coarse-to-fine alignment, robust merge weighted by a
+shot+read noise model. Staged here:
+
+1. Burst grouping from metadata.
+2. Global signal-masked alignment, even-pixel quantised, robust
+   Bayer-plane mean → one `SensorFrame`, developed as usual. (This
+   section.)
+3. Sub-pixel alignment and kernel-regression reconstruction replacing
+   demosaic (1x), then 2x. Not started.
+
+### Step 2 design (target, written before implementation)
+
+- `sensor::ExifSummary` gains `sequence: Option<u32>` (Sony makernote
+  0xb04a, `None` for single-shot) and `subsec_ms: Option<u32>`
+  (`SubSecTimeOriginal`), so the thumbnail cache can group without
+  reopening files (cache format 3 → 4). `Metadata::from_tiff` exposes
+  the sequence number; `embedded_preview` parses the TIFF structure
+  for it (a few ms beside the JPEG decode).
+- `burst::group(&[Option<&ExifSummary>]) -> Vec<Vec<usize>>`: sort by
+  timestamp, continue a burst while the sequence number increments,
+  the gap is under 2 s plus the exposure time, and shutter, ISO,
+  aperture and focal length are unchanged. Frames without a sequence
+  number are singleton groups.
+- `burst::align(reference, frame) -> Shift {dx, dy, peak}` in sensor
+  pixels, `frame(x + dx, y + dy) ≈ reference(x, y)`: quad-mean gray of
+  the crop (half resolution), black-subtracted, log1p; mask = 7×7 box
+  blur of the linear gray above 6× the quad noise (from the below-black
+  tail), fail if under 0.1 % of quads pass; phase correlation (rustfft)
+  of the masked, mean-removed log gray, parabolic sub-pixel peak.
+  Global translation only: the measured rotation is under one merge
+  grid step at the frame edge, and with 2 of 12 tiles holding content
+  a local field would be undefined almost everywhere.
+- `burst::noise_model(a, b, shift) -> σ²(s) = a·s + b` (DN above
+  black) from the difference of two aligned planes: bin by the pair
+  mean (independent of the difference for equal-variance noise), MAD
+  variance per bin, weighted least squares over bins.
+- `burst::merge(frames, shifts) -> Merged {frame, noise, weights}`:
+  shifts rounded to even sensor pixels (CFA phase preserved); per
+  pixel the median of the aligned values anchors a Gaussian robustness
+  weight `exp(-½ (d / 3σ_d)²)`, σ_d² = 2σ²(median), applied to every
+  frame including the reference (so the reference's own hot pixels
+  are outvoted); out-of-bounds samples get weight 0. Output is the
+  reference frame's `SensorFrame` with the merged plane. CPU, row
+  bands over `std::thread::scope`: this is a load-time step like
+  unpack, not an interactive stage.
+- CLI: `idev burst FILES|DIR` lists groups; `idev burst --stats
+  FILES` aligns and merges the given frames as one burst and prints
+  shifts, weights, the noise model, the below-black σ before and
+  after, and a half-split check (evens vs odds merged separately,
+  model between them; expected σ ratio √(N/2)). `--pgm` dumps the
+  merged plane. `idev develop --merge FILES -o OUT` merges and
+  develops with the first frame's sidecar.
+- GUI: the library's Stack toggle also collapses a burst onto its
+  first frame with an "×N" badge. Merging in the GUI waits for the
+  merge to be worth caching (step 3).
+
+### Step 2 results (2026-09-15)
+
+Built as designed: `burst.rs` (grouping, `align`, `noise_model`,
+`merge`, parallel loaders), `ExifSummary::{subsec_ms, sequence}` with
+the thumbnail cache at format 4, `idev burst` / `idev burst --stats`
+/ `idev develop --merge`, and the library's Stack toggle collapsing
+bursts with an "×N" caption. rustfft is the one new dependency; the
+merge and the FFT rows run over `std::thread::scope` bands.
+
+- Grouping: 239 frames of the first session and ~300 of the second
+  fall into the same bursts the hand-made table found; `idev burst`
+  on a folder takes ~270 ms per file (rawler metadata plus the
+  makernote parse, on ceph).
+- Alignment on the real bursts: shifts drift smoothly (4 → 35 px over
+  a 7-frame 0.6 s set; 4 → 43 px over a 6-frame 1/8 s set), fractions
+  non-integer, correlation peaks 0.014–0.085. Mean robustness weight
+  0.966–0.973 for every frame: nothing is being rejected wholesale.
+- Timing, 7 frames: load 1.2 s, align 0.8 s, merge 0.3 s.
+- Noise, 7-frame 0.6 s set (DSC01126–1132), half-split check (evens
+  vs odds merged separately, model between the halves, expected
+  ratio √(N/2) = 1.87): σ(100 DN) 12.3 → 6.7 (1.83), σ(1000) 38.7 →
+  21.2 (1.83). 11-frame set (DSC01146–1156, expected 2.35): 2.42 at
+  100 and 1000 DN. 6-frame 1/8 s set (DSC01233–1238, expected 1.73):
+  1.98 / 2.03; below-black σ (2.6 % of sites below black, so
+  meaningful there) 3.49 → 1.51 against √6 = 2.45.
+- Single-frame model at ISO 320: σ² ≈ 1.3–1.5·s + 2.1–2.5 DN². The
+  pair method cancels fixed-pattern noise, so its read-noise floor
+  (~1.5 DN) sits below Photons to Photos' single-frame 5.9 DN, which
+  includes the pattern; a hand-held stack dithers the pattern
+  against the scene, which is why the below-black σ falls with N.
+  Lens-cap frames will separate the two terms.
+- Where the numbers deviate: the single-pair `a` on sharp sets is
+  inflated by residual sub-pixel misalignment at point lights (the
+  ratio then exceeds √(N/2)); at zero signal the merged planes are
+  quantised to u16, so the half-split read-noise term is not
+  resolvable below ~2 DN. Step 3 should keep the merged plane in
+  float.
+- The 0.6 s 17 mm sets are soft (defocus or intra-frame motion): the
+  merge cleans the sky and water and leaves the lights as they were,
+  no ghosting. They are noise tests, not resolution tests.
+- Not done: developed-image comparison beyond a visual check;
+  merging in the GUI; a GUI screenshot of the "×N" caption (the
+  build and tests pass, the layout is unreviewed).
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

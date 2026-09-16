@@ -52,6 +52,11 @@ pub struct ExifSummary {
     pub iso: Option<u32>,
     pub focal_length_mm: Option<f32>,
     pub date_time_original: Option<String>,
+    /// `SubSecTimeOriginal` in milliseconds.
+    pub subsec_ms: Option<u32>,
+    /// Continuous-drive sequence number, 1 for the first frame of a
+    /// burst; `None` for single shots.
+    pub sequence: Option<u32>,
 }
 
 impl ExifSummary {
@@ -75,6 +80,28 @@ impl ExifSummary {
         )
     }
 
+    /// Shooting time as seconds since the Unix epoch, taken as UTC
+    /// (EXIF carries no zone; only differences are used).
+    pub fn timestamp_secs(&self) -> Option<f64> {
+        let d = self.date_time_original.as_ref()?;
+        let mut parts = d.split([':', ' ']).map(|p| p.trim().parse::<i64>().ok());
+        let mut next = || parts.next().flatten();
+        let (y, m, day, h, min, s) = (next()?, next()?, next()?, next()?, next()?, next()?);
+        if !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+            return None;
+        }
+        // Days from civil (Howard Hinnant's algorithm).
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let mp = (m + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146097 + doe - 719468;
+        let secs = days * 86400 + h * 3600 + min * 60 + s;
+        Some(secs as f64 + self.subsec_ms.unwrap_or(0) as f64 / 1000.0)
+    }
+
     pub fn from_exif(exif: &rawler::exif::Exif, make: String, model: String) -> ExifSummary {
         ExifSummary {
             make,
@@ -85,8 +112,23 @@ impl ExifSummary {
             iso: exif.iso_speed_ratings.map(u32::from),
             focal_length_mm: exif.focal_length.map(|r| r.as_f32()),
             date_time_original: exif.date_time_original.clone(),
+            subsec_ms: exif
+                .sub_sec_time_original
+                .as_deref()
+                .and_then(subsec_millis),
+            sequence: None,
         }
     }
+}
+
+/// EXIF `SubSecTime` digits ("946", "5") to milliseconds.
+fn subsec_millis(digits: &str) -> Option<u32> {
+    let digits = digits.trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let padded: String = digits.chars().chain("000".chars()).take(3).collect();
+    padded.parse().ok()
 }
 
 /// One unpacked raw file: the Bayer plane and how to interpret it.
@@ -215,6 +257,39 @@ pub struct Preview {
     pub exif: ExifSummary,
 }
 
+/// The shooting metadata alone: EXIF through rawler plus the
+/// continuous-drive sequence number from the makernote. No pixel data
+/// is decoded.
+pub fn summary(path: &Path) -> Result<ExifSummary> {
+    let source = RawSource::new(path).with_context(|| format!("open {}", path.display()))?;
+    let decoder = rawler::get_decoder(&source)
+        .with_context(|| format!("no decoder for {}", path.display()))?;
+    Ok(read_summary(decoder.as_ref(), &source, &RawDecodeParams::default())?.0)
+}
+
+/// The summary and the EXIF orientation (`Normal` when absent).
+fn read_summary(
+    decoder: &dyn rawler::decoders::Decoder,
+    source: &RawSource,
+    params: &RawDecodeParams,
+) -> Result<(ExifSummary, Orientation)> {
+    let meta = decoder
+        .raw_metadata(source, params)
+        .with_context(|| format!("metadata {}", source.path().display()))?;
+    let mut exif = ExifSummary::from_exif(&meta.exif, meta.make.clone(), meta.model.clone());
+    if let Some(l) = &meta.lens {
+        exif.lens = Some(l.lens_name.clone());
+    }
+    exif.sequence = GenericTiffReader::new(&mut source.reader(), 0, 0, None, &[GPS_IFD_TAG])
+        .ok()
+        .and_then(|tiff| Metadata::from_tiff(&tiff, &mut source.reader()).sequence);
+    let orientation = match meta.exif.orientation {
+        Some(o @ 1..=8) => Orientation::from_u16(o),
+        _ => Orientation::Normal,
+    };
+    Ok((exif, orientation))
+}
+
 /// Read the embedded JPEG preview without decoding the raw data.
 pub fn embedded_preview(path: &Path) -> Result<Preview> {
     let source = RawSource::new(path).with_context(|| format!("open {}", path.display()))?;
@@ -225,17 +300,7 @@ pub fn embedded_preview(path: &Path) -> Result<Preview> {
         .preview_image(&source, &params)
         .with_context(|| format!("preview {}", path.display()))?
         .with_context(|| format!("{}: no embedded preview", path.display()))?;
-    let meta = decoder
-        .raw_metadata(&source, &params)
-        .with_context(|| format!("metadata {}", path.display()))?;
-    let orientation = match meta.exif.orientation {
-        Some(o @ 1..=8) => Orientation::from_u16(o),
-        _ => Orientation::Normal,
-    };
-    let mut exif = ExifSummary::from_exif(&meta.exif, meta.make.clone(), meta.model.clone());
-    if let Some(l) = &meta.lens {
-        exif.lens = Some(l.lens_name.clone());
-    }
+    let (exif, orientation) = read_summary(decoder.as_ref(), &source, &params)?;
     let rgb = image.into_rgb8();
     Ok(Preview {
         width: rgb.width(),
@@ -365,6 +430,7 @@ pub fn unpack(path: &Path) -> Result<SensorFrame> {
     if let Some(l) = &meta.lens {
         summary.lens = Some(l.lens_name.clone());
     }
+    summary.sequence = metadata.sequence;
 
     Ok(SensorFrame {
         width: raw.width as u32,

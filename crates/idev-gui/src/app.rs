@@ -29,6 +29,7 @@ use damascene_core::widgets::number_scrubber::{self, ScrubDrag, ScrubberOpts};
 use damascene_core::widgets::{switch, tabs, text_input};
 use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent, UiEventKind};
 use damascene_winit_wgpu::{Wakeup, WinitWgpuApp};
+use idev_core::burst;
 use idev_core::color::Gamut;
 use idev_core::geometry;
 use idev_core::gpu::{
@@ -252,6 +253,12 @@ struct Library {
     exifs: Vec<Option<ExifSummary>>,
     /// Raw + rendered partner by stem (see `library::pairs`).
     pair: Vec<Option<usize>>,
+    /// Continuous-drive bursts (`burst::group` over the raws' summaries):
+    /// for each file, the burst's first frame when the file is a later
+    /// member, else `None`.
+    burst_lead: Vec<Option<usize>>,
+    /// Frames in the burst a file leads; 1 outside bursts.
+    burst_len: Vec<usize>,
     loader: Loader,
     results: LoaderResults,
     loaded: usize,
@@ -260,7 +267,8 @@ struct Library {
     sort: SortKey,
     query: String,
     query_sel: Selection,
-    /// Hide rendered files that have a raw partner.
+    /// Hide rendered files that have a raw partner, and the later
+    /// frames of a burst.
     stack: bool,
     /// File indices in display order.
     view: Vec<usize>,
@@ -294,6 +302,8 @@ impl Library {
             errors: vec![None; n],
             exifs: vec![None; n],
             pair,
+            burst_lead: vec![None; n],
+            burst_len: vec![1; n],
             loader,
             results,
             loaded: 0,
@@ -309,7 +319,7 @@ impl Library {
 
     /// Whether the view depends on summaries that may still be loading.
     fn view_uses_metadata(&self) -> bool {
-        self.sort != SortKey::Name || !self.query.trim().is_empty()
+        self.sort != SortKey::Name || !self.query.trim().is_empty() || self.stack
     }
 
     fn drain(&mut self) -> bool {
@@ -341,9 +351,24 @@ impl Library {
                 exif: self.exifs[i].as_ref(),
             })
             .collect();
+        // Bursts among the raws whose summaries have arrived; frames still
+        // loading stand alone until they do.
+        let raw_exifs: Vec<Option<&ExifSummary>> = items
+            .iter()
+            .map(|it| if it.raw { it.exif } else { None })
+            .collect();
+        self.burst_lead = vec![None; self.files.len()];
+        self.burst_len = vec![1; self.files.len()];
+        for g in burst::group(&raw_exifs) {
+            self.burst_len[g[0]] = g.len();
+            for &i in &g[1..] {
+                self.burst_lead[i] = Some(g[0]);
+            }
+        }
         let filter = Filter::parse(&self.query);
         let mut view: Vec<usize> = (0..self.files.len())
             .filter(|&i| !(self.stack && !items[i].raw && self.pair[i].is_some()))
+            .filter(|&i| !(self.stack && self.burst_lead[i].is_some()))
             .filter(|&i| filter.matches(&items[i]))
             .collect();
         sort_indices(&mut view, &items, self.sort);
@@ -1124,6 +1149,9 @@ impl IdevApp {
         let paired: Vec<bool> = (0..lib.files.len())
             .map(|i| lib.stack && lib.pair[i].is_some() && source::is_raw(&lib.files[i]))
             .collect();
+        let bursts: Vec<usize> = (0..lib.files.len())
+            .map(|i| if lib.stack { lib.burst_len[i] } else { 1 })
+            .collect();
         let selected = lib.view.get(self.selected).copied();
         let ring = cx.theme().palette().ring;
         let loader = lib.loader.clone();
@@ -1154,6 +1182,9 @@ impl IdevApp {
                 let mut caption = vec![text(names[i].clone()).caption().muted()];
                 if paired[i] {
                     caption.push(text("+JPG").caption().muted());
+                }
+                if bursts[i] > 1 {
+                    caption.push(text(format!("×{}", bursts[i])).caption());
                 }
                 if developed[i] {
                     caption.push(spacer());

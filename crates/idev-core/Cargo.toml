@@ -13,6 +13,7 @@ bytemuck.workspace = true
 half.workspace = true
 pollster.workspace = true
 rawler.workspace = true
+rustfft.workspace = true
 achromat.workspace = true
 serde.workspace = true
 toml.workspace = true

@@ -19,6 +19,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 png = "0.18"
 pollster = "0.4"
 rawler = "0.8"
+rustfft = "6"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 tracing = "0.1"
