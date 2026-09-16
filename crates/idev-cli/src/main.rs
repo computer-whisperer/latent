@@ -643,9 +643,9 @@ fn develop(
                     Ok((Source::Raw(Box::new(merged.frame)), name))
                 }
                 Some(Burst::Superres { scale, kernel }) => {
-                    let (rgb, transforms) = burst::reconstruct_files(files, scale, kernel)?;
-                    for ((f, t), w) in files.iter().zip(&transforms).zip(&rgb.mean_weight) {
-                        println!("  {}  {}", f.display(), burst::describe_transform(t, *w));
+                    let (rgb, fields) = burst::reconstruct_files(files, scale, kernel)?;
+                    for ((f, t), w) in files.iter().zip(&fields).zip(&rgb.mean_weight) {
+                        println!("  {}  {}", f.display(), burst::describe_field(t, *w));
                     }
                     println!(
                         "  reconstructed {}x{} at {scale}x, kernel {kernel} px, {:.3}% uncovered",
@@ -1004,7 +1004,7 @@ fn burst_score(inputs: &[PathBuf]) -> Result<()> {
         t.elapsed()
     );
     println!("residuals in sensor pixels over matched corners (rms / median / max):");
-    let mut totals = [(0f64, 0usize); 5];
+    let mut totals = [(0f64, 0usize); 6];
     for i in 1..files.len() {
         let pairs = corners::matches(&corner_sets[0], &corner_sets[i], shifts[i], 4.0);
         let (coarse, refined) = match stages[i].take().expect("filled") {
@@ -1016,7 +1016,15 @@ fn burst_score(inputs: &[PathBuf]) -> Result<()> {
         };
         let shift = shifts[i];
         let homography = corners::fit_homography(&pairs);
-        let models: [Model; 4] = [
+        let field = burst::align_field(refs[0], refs[i], refined)?;
+        let field_note = format!(
+            "field {}/{} tiles corrected, mean {:.2} max {:.2} px",
+            field.valid_tiles(),
+            field.d.len(),
+            field.correction_stats().0,
+            field.correction_stats().1
+        );
+        let models: [Model; 5] = [
             (
                 "translation",
                 Box::new(move |x, y| (x + shift.dx, y + shift.dy)),
@@ -1036,9 +1044,10 @@ fn burst_score(inputs: &[PathBuf]) -> Result<()> {
                     None => (f32::NAN, f32::NAN),
                 }),
             ),
+            ("local field", Box::new(move |x, y| field.apply(x, y))),
         ];
         println!(
-            "  {}  {} pairs  shift ({:+.2}, {:+.2})  refined rotation {:+.4}° scale {:.5}",
+            "  {}  {} pairs  shift ({:+.2}, {:+.2})  refined rotation {:+.4}° scale {:.5}  {field_note}",
             file_name(&files[i]),
             pairs.len(),
             shift.dx,
@@ -1078,8 +1087,8 @@ fn burst_score(inputs: &[PathBuf]) -> Result<()> {
             "local bound", "", local
         );
         if local.is_finite() {
-            totals[4].0 += local as f64;
-            totals[4].1 += 1;
+            totals[5].0 += local as f64;
+            totals[5].1 += 1;
         }
         let grid = corners::residual_grid(&strong, |x, y| refined.apply(x, y), refs[0], 4, 3);
         println!("    refined residual field (mean dx,dy per cell, 4 columns × 3 rows):");
@@ -1100,6 +1109,7 @@ fn burst_score(inputs: &[PathBuf]) -> Result<()> {
         "coarse similarity",
         "refined similarity",
         "homography (in-sample)",
+        "local field",
         "local bound",
     ]
     .iter()

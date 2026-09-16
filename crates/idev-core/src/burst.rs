@@ -859,6 +859,311 @@ fn solve_similarity(matches: &[TileMatch]) -> Transform {
 }
 
 // ---------------------------------------------------------------------
+// Local alignment field
+
+/// Tiles with fewer masked quads than this, in either frame, keep the
+/// global fit.
+const FIELD_MIN_QUADS: usize = 150;
+/// A tile correction beyond this many sensor pixels is distrusted.
+const FIELD_MAX_CORRECTION: f32 = 12.0;
+
+/// A frame's alignment: the global similarity plus a translation
+/// correction per tile, interpolated bilinearly between tile centres,
+/// so `frame ≈ T(p) + d(p)`. Tiles without signal carry no correction,
+/// which leaves the global fit there. Built by [`align_field`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Field {
+    pub global: Transform,
+    /// Tile-centre x coordinates (sensor px), then y.
+    pub nodes_x: Vec<f32>,
+    pub nodes_y: Vec<f32>,
+    /// Row-major `nodes_y.len() × nodes_x.len()` corrections, sensor px.
+    pub d: Vec<[f32; 2]>,
+    pub valid: Vec<bool>,
+}
+
+impl Field {
+    /// The global transform alone.
+    pub fn global(t: Transform) -> Field {
+        Field {
+            global: t,
+            nodes_x: Vec::new(),
+            nodes_y: Vec::new(),
+            d: Vec::new(),
+            valid: Vec::new(),
+        }
+    }
+
+    pub fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        let (gx, gy) = self.global.apply(x, y);
+        if self.d.is_empty() {
+            return (gx, gy);
+        }
+        let (ix, fx) = Self::locate(&self.nodes_x, x);
+        let (iy, fy) = Self::locate(&self.nodes_y, y);
+        let cols = self.nodes_x.len();
+        let at = |i: usize, j: usize| self.d[j * cols + i];
+        let (ix1, iy1) = ((ix + 1).min(cols - 1), (iy + 1).min(self.nodes_y.len() - 1));
+        // A single node per axis cannot interpolate: constant there.
+        let (fx, fy) = (
+            if ix1 == ix { 0.0 } else { fx },
+            if iy1 == iy { 0.0 } else { fy },
+        );
+        let top = [
+            at(ix, iy)[0] * (1.0 - fx) + at(ix1, iy)[0] * fx,
+            at(ix, iy)[1] * (1.0 - fx) + at(ix1, iy)[1] * fx,
+        ];
+        let bottom = [
+            at(ix, iy1)[0] * (1.0 - fx) + at(ix1, iy1)[0] * fx,
+            at(ix, iy1)[1] * (1.0 - fx) + at(ix1, iy1)[1] * fx,
+        ];
+        (
+            gx + top[0] * (1.0 - fy) + bottom[0] * fy,
+            gy + top[1] * (1.0 - fy) + bottom[1] * fy,
+        )
+    }
+
+    /// Node interval and fraction for a coordinate. Beyond the outer
+    /// nodes the fraction runs past 0..1, i.e. the field extrapolates
+    /// linearly from the outer two tiles: the outer half-tiles of the
+    /// frame would otherwise hold their neighbour's correction.
+    fn locate(nodes: &[f32], v: f32) -> (usize, f32) {
+        if nodes.len() < 2 {
+            return (0, 0.0);
+        }
+        let i = nodes.partition_point(|&n| n <= v).clamp(1, nodes.len() - 1) - 1;
+        (i, (v - nodes[i]) / (nodes[i + 1] - nodes[i]))
+    }
+
+    pub fn valid_tiles(&self) -> usize {
+        self.valid.iter().filter(|&&v| v).count()
+    }
+
+    /// Mean and largest correction over valid tiles, sensor px.
+    pub fn correction_stats(&self) -> (f32, f32) {
+        let mut sum = 0f32;
+        let mut max = 0f32;
+        let mut n = 0;
+        for (d, &v) in self.d.iter().zip(&self.valid) {
+            if v {
+                let m = d[0].hypot(d[1]);
+                sum += m;
+                max = max.max(m);
+                n += 1;
+            }
+        }
+        (if n > 0 { sum / n as f32 } else { 0.0 }, max)
+    }
+}
+
+/// Gauss-Newton for a translation `d` (quads) over one region of the
+/// reference's mask: minimise Σ (B(W(q) + d) − A(q))², `W` the global
+/// map in quad space. Returns the correction and the rms before and
+/// after, or `None` when the region has too little signal.
+fn refine_tile_translation(
+    la: &[f32],
+    lb: &[f32],
+    masked_a: &[f32],
+    w: usize,
+    h: usize,
+    region: (usize, usize, usize, usize),
+    warp: &dyn Fn(f32, f32) -> (f32, f32),
+) -> Option<([f32; 2], f32, f32)> {
+    const ITERATIONS: usize = 10;
+    let (x0, y0, x1, y1) = region;
+    let mut d = [0f32; 2];
+    let mut residual_scale = f32::INFINITY;
+    let mut first_rms = None;
+    let mut best: Option<(f32, [f32; 2])> = None;
+    for it in 0..ITERATIONS {
+        let (mut h00, mut h01, mut h11) = (0f64, 0f64, 0f64);
+        let (mut g0, mut g1) = (0f64, 0f64);
+        let mut sum_r2 = 0f64;
+        let mut count = 0f64;
+        let mut abs_res = Vec::new();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if masked_a[y * w + x] == 0.0 {
+                    continue;
+                }
+                let (wx, wy) = warp(x as f32, y as f32);
+                let Some((vb, gx, gy)) = sample_plane(lb, w, h, wx + d[0], wy + d[1]) else {
+                    continue;
+                };
+                let r = vb - la[y * w + x];
+                let wgt = if residual_scale.is_finite() {
+                    1.0 / (1.0 + (r / residual_scale).powi(2))
+                } else {
+                    1.0
+                };
+                abs_res.push(r.abs());
+                let (gx, gy, r, wgt) = (gx as f64, gy as f64, r as f64, wgt as f64);
+                h00 += wgt * gx * gx;
+                h01 += wgt * gx * gy;
+                h11 += wgt * gy * gy;
+                g0 += wgt * gx * r;
+                g1 += wgt * gy * r;
+                sum_r2 += wgt * r * r;
+                count += wgt;
+            }
+        }
+        if abs_res.len() < FIELD_MIN_QUADS {
+            return None;
+        }
+        let rms = (sum_r2 / count).sqrt() as f32;
+        if first_rms.is_none() {
+            first_rms = Some(rms);
+        }
+        if it >= 3 {
+            match best {
+                Some((b, bd)) if rms > b * 1.001 => {
+                    d = bd;
+                    return Some((d, first_rms.unwrap_or(rms), b));
+                }
+                Some((b, _)) if rms >= b => {}
+                _ => best = Some((rms, d)),
+            }
+        }
+        let det = h00 * h11 - h01 * h01;
+        if det.abs() < 1e-12 {
+            break;
+        }
+        let dx = (h11 * g0 - h01 * g1) / det;
+        let dy = (-h01 * g0 + h00 * g1) / det;
+        d[0] -= dx as f32;
+        d[1] -= dy as f32;
+        if it >= 1 {
+            let mut v = abs_res;
+            residual_scale = (2.0 * median(&mut v)).max(1e-3);
+        }
+        if dx.hypot(dy) < 1e-3 {
+            best = Some((rms, d));
+            break;
+        }
+    }
+    let (rms, d) = best.unwrap_or((first_rms.unwrap_or(0.0), d));
+    Some((d, first_rms.unwrap_or(rms), rms))
+}
+
+/// The global similarity plus a per-tile translation correction,
+/// tiles of [`TILE`] quads over the crop.
+pub fn align_field(
+    reference: &SensorFrame,
+    frame: &SensorFrame,
+    global: Transform,
+) -> Result<Field> {
+    ensure!(
+        reference.width == frame.width
+            && reference.height == frame.height
+            && reference.crop == frame.crop,
+        "frames differ in size or crop"
+    );
+    let ga = gray(reference);
+    let gb = gray(frame);
+    let (w, h) = (ga.width, ga.height);
+    let quad_sigma = dark_sigma(reference).max(dark_sigma(frame)) * 0.5;
+    let (ma, _) = masked_log(&ga, quad_sigma);
+    let (mb, _) = masked_log(&gb, quad_sigma);
+    let la: Vec<f32> = ga.data.iter().map(|v| v.max(0.0).ln_1p()).collect();
+    let lb: Vec<f32> = gb.data.iter().map(|v| v.max(0.0).ln_1p()).collect();
+    let crop = reference.crop;
+    // Global map in quad space: q = (p - crop - 0.5) / 2.
+    let (cx, cy) = (crop.x as f32 + 0.5, crop.y as f32 + 0.5);
+    let warp = move |qx: f32, qy: f32| -> (f32, f32) {
+        let (px, py) = global.apply(cx + 2.0 * qx, cy + 2.0 * qy);
+        ((px - cx) * 0.5, (py - cy) * 0.5)
+    };
+    let cols = w.div_ceil(TILE);
+    let rows = h.div_ceil(TILE);
+    let bounds = |n: usize, i: usize| (i * TILE, ((i + 1) * TILE).min(n));
+    let nodes_x: Vec<f32> = (0..cols)
+        .map(|i| {
+            let (a, b) = bounds(w, i);
+            cx + 2.0 * ((a + b) as f32 * 0.5 - 0.5)
+        })
+        .collect();
+    let nodes_y: Vec<f32> = (0..rows)
+        .map(|j| {
+            let (a, b) = bounds(h, j);
+            cy + 2.0 * ((a + b) as f32 * 0.5 - 0.5)
+        })
+        .collect();
+    let mut cells: Vec<Option<([f32; 2], f32, f32)>> = (0..cols * rows).map(|_| None).collect();
+    par_rows(&mut cells, 1, |i0, band| {
+        for (k, slot) in band.iter_mut().enumerate() {
+            let idx = i0 + k;
+            let (i, j) = (idx % cols, idx / cols);
+            let (x0, x1) = bounds(w, i);
+            let (y0, y1) = bounds(h, j);
+            // The frame must have signal in the tile too (its tile sits
+            // within a global shift of the reference's; for shifts
+            // small against the tile this is the same region).
+            let signal_b = (y0..y1)
+                .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+                .filter(|&(x, y)| mb[y * w + x] != 0.0)
+                .count();
+            if signal_b < FIELD_MIN_QUADS {
+                continue;
+            }
+            *slot = refine_tile_translation(&la, &lb, &ma, w, h, (x0, y0, x1, y1), &warp);
+        }
+    });
+    let mut d = vec![[0f32; 2]; cols * rows];
+    let mut valid = vec![false; cols * rows];
+    for (k, cell) in cells.into_iter().enumerate() {
+        if let Some((dq, before, after)) = cell {
+            let px = [2.0 * dq[0], 2.0 * dq[1]];
+            let m = px[0].hypot(px[1]);
+            // Keep a correction only where it helped and stayed sane.
+            if after <= before && m <= FIELD_MAX_CORRECTION {
+                d[k] = px;
+                valid[k] = true;
+            }
+            tracing::trace!(tile = k, ?px, before, after, kept = valid[k], "field tile");
+        }
+    }
+    Ok(Field {
+        global,
+        nodes_x,
+        nodes_y,
+        d,
+        valid,
+    })
+}
+
+/// Field of every frame relative to the first, in parallel, from the
+/// refined similarities.
+pub fn fields_all(frames: &[&SensorFrame], transforms: &[Transform]) -> Result<Vec<Field>> {
+    let mut slots: Vec<Option<Result<Field>>> = (0..frames.len()).map(|_| None).collect();
+    slots[0] = Some(Ok(Field::global(Transform::IDENTITY)));
+    let reference = frames[0];
+    std::thread::scope(|s| {
+        for ((slot, f), t) in slots.iter_mut().zip(frames).zip(transforms).skip(1) {
+            s.spawn(move || {
+                *slot = Some(align_field(reference, f, *t));
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|s| s.expect("every slot filled"))
+        .collect()
+}
+
+/// A frame's field printed for reports.
+pub fn describe_field(f: &Field, weight: f32) -> String {
+    let (mean, max) = f.correction_stats();
+    format!(
+        "{}  tiles {}/{} corrected, mean {:.2} max {:.2} px",
+        describe_transform(&f.global, weight),
+        f.valid_tiles(),
+        f.d.len(),
+        mean,
+        max
+    )
+}
+
+// ---------------------------------------------------------------------
 // Noise model
 
 /// Sensor noise as `σ²(s) = a·s + b`, `s` in DN above black: shot noise
@@ -1134,7 +1439,7 @@ fn sample_plane(p: &[f32], w: usize, h: usize, x: f32, y: f32) -> Option<(f32, f
 }
 
 /// Reconstruct camera RGB on the reference crop at `scale`× by kernel
-/// regression over every frame's sites. `transforms[i]` maps reference
+/// regression over every frame's sites. `fields[i]` maps reference
 /// sensor coordinates into frame `i` (index 0 is the identity). Each
 /// frame contributes the 3×3 sites around the mapped point, weighted by
 /// an isotropic Gaussian of `kernel_sigma` sensor pixels and by a
@@ -1143,13 +1448,13 @@ fn sample_plane(p: &[f32], w: usize, h: usize, x: f32, y: f32) -> Option<(f32, f
 /// before white balance.
 pub fn reconstruct(
     frames: &[&SensorFrame],
-    transforms: &[Transform],
+    fields: &[Field],
     noise: NoiseModel,
     scale: u32,
     kernel_sigma: f32,
 ) -> Result<CameraRgb> {
     ensure!(!frames.is_empty(), "no frames");
-    ensure!(frames.len() == transforms.len(), "one transform per frame");
+    ensure!(frames.len() == fields.len(), "one field per frame");
     ensure!((1..=4).contains(&scale), "scale must be 1..=4");
     ensure!(kernel_sigma > 0.05, "kernel sigma too small");
     let reference = frames[0];
@@ -1192,7 +1497,7 @@ pub fn reconstruct(
                 let k_rob = 1.0 / (ROBUST_SIGMAS * ROBUST_SIGMAS * sigma2.max(0.25));
                 let mut acc = [0f32; 3];
                 let mut wgt = [0f32; 3];
-                for (i, (f, t)) in frames.iter().zip(transforms).enumerate() {
+                for (i, (f, t)) in frames.iter().zip(fields).enumerate() {
                     let (px_f, py_f) = if i == 0 { (x, y) } else { t.apply(x, y) };
                     let w_frame = if i == 0 {
                         1.0
@@ -1272,18 +1577,19 @@ pub fn reconstruct(
     })
 }
 
-/// Load the files as one burst, fit a similarity per frame and
-/// reconstruct at `scale`×.
+/// Load the files as one burst, fit a similarity and a local field per
+/// frame, and reconstruct at `scale`×.
 pub fn reconstruct_files(
     paths: &[impl AsRef<Path>],
     scale: u32,
     kernel_sigma: f32,
-) -> Result<(CameraRgb, Vec<Transform>)> {
+) -> Result<(CameraRgb, Vec<Field>)> {
     ensure!(!paths.is_empty(), "no frames");
     let frames = load_all(paths)?;
     let refs: Vec<&SensorFrame> = frames.iter().collect();
     let shifts = align_all(&refs)?;
     let transforms = similarity_all(&refs, &shifts)?;
+    let fields = fields_all(&refs, &transforms)?;
     let noise = frames
         .get(1)
         .and_then(|f| noise_model(&frames[0], f, shifts[1].even()))
@@ -1291,8 +1597,8 @@ pub fn reconstruct_files(
             let s = dark_sigma(&frames[0]);
             NoiseModel { a: 0.0, b: s * s }
         });
-    let out = reconstruct(&refs, &transforms, noise, scale, kernel_sigma)?;
-    Ok((out, transforms))
+    let out = reconstruct(&refs, &fields, noise, scale, kernel_sigma)?;
+    Ok((out, fields))
 }
 
 /// Similarity of every frame relative to the first, in parallel, from
@@ -1690,7 +1996,7 @@ mod tests {
         let f = synthetic(256, 192, (0.0, 0.0), 31);
         let out = reconstruct(
             &[&f],
-            &[Transform::IDENTITY],
+            &[Field::global(Transform::IDENTITY)],
             NoiseModel { a: 0.0, b: 16.0 },
             1,
             0.7,
@@ -1719,7 +2025,8 @@ mod tests {
         let refs: Vec<&SensorFrame> = frames.iter().collect();
         let shifts = align_all(&refs).unwrap();
         let transforms = similarity_all(&refs, &shifts).unwrap();
-        let out = reconstruct(&refs, &transforms, NoiseModel { a: 0.0, b: 16.0 }, 2, 0.7).unwrap();
+        let fields: Vec<Field> = transforms.into_iter().map(Field::global).collect();
+        let out = reconstruct(&refs, &fields, NoiseModel { a: 0.0, b: 16.0 }, 2, 0.7).unwrap();
         assert_eq!((out.width, out.height), (496, 368));
         assert!(out.uncovered == 0.0);
         for w in &out.mean_weight {
@@ -1749,5 +2056,107 @@ mod tests {
         }
         assert!(refined.rotation_deg().abs() < 0.01, "{refined:?}");
         assert!((refined.scale() - 1.0).abs() < 2e-4, "{refined:?}");
+    }
+
+    const WARP_BLOBS: usize = 160;
+
+    /// Blobs displaced by a position-dependent map: a similarity cannot
+    /// fit different scales along x and y, a local field can. The
+    /// reference is drawn with the same blob list, unwarped.
+    fn synthetic_warped(
+        width: u32,
+        height: u32,
+        seed: u32,
+        warp: impl Fn(f32, f32) -> (f32, f32),
+    ) -> SensorFrame {
+        let mut f = synthetic_blobs(width, height, (0.0, 0.0), seed, 6.0);
+        let mut rng = seed.wrapping_mul(2654435761).wrapping_add(12345);
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            (rng >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let blobs: Vec<(f32, f32, f32)> = (0..WARP_BLOBS)
+            .map(|i| {
+                let t = i as f32 * 0.618;
+                (
+                    (t.fract() * width as f32 * 0.8 + width as f32 * 0.1),
+                    (((t * 3.7).fract()) * height as f32 * 0.8 + height as f32 * 0.1),
+                    200.0 + 800.0 * (t * 7.3).fract(),
+                )
+            })
+            .collect();
+        for y in 0..height {
+            for x in 0..width {
+                let mut s = 0.0;
+                for &(bx, by, amp) in &blobs {
+                    let (wx, wy) = warp(bx, by);
+                    let d2 = (x as f32 - wx).powi(2) + (y as f32 - wy).powi(2);
+                    if d2 < 400.0 {
+                        s += amp * (-d2 / 6.0).exp();
+                    }
+                }
+                let noise = (next() + next() + next() - 1.5) * 8.0;
+                f.data[(y * width + x) as usize] = (512.0 + s + noise).round().max(0.0) as u16;
+            }
+        }
+        f
+    }
+
+    #[test]
+    fn field_recovers_an_anisotropic_warp() {
+        let warp = |x: f32, y: f32| (x + 3.0 + 0.004 * (x - 512.0), y - 2.0 - 0.003 * (y - 384.0));
+        let reference = synthetic_warped(1024, 768, 61, |x, y| (x, y));
+        let frame = synthetic_warped(1024, 768, 62, warp);
+        let g = align(&reference, &frame).unwrap();
+        let t = align_similarity(&reference, &frame, g).unwrap();
+        let field = align_field(&reference, &frame, t).unwrap();
+        assert!(field.valid_tiles() >= 2, "{:?}", field.valid);
+        // Inside the hull of tile centres the field interpolates; at the
+        // frame corners it extrapolates, where node errors get a lever
+        // arm, so the bound is looser there.
+        let (mut worst_global, mut worst_inside, mut worst_outside) = (0f32, 0f32, 0f32);
+        for (x, y, inside) in [
+            (300.0, 300.0, true),
+            (600.0, 500.0, true),
+            (512.0, 384.0, true),
+            (150.0, 120.0, false),
+            (900.0, 650.0, false),
+        ] {
+            let (tx, ty) = warp(x, y);
+            let (gx, gy) = t.apply(x, y);
+            let (fx, fy) = field.apply(x, y);
+            worst_global = worst_global.max((gx - tx).hypot(gy - ty));
+            let e = (fx - tx).hypot(fy - ty);
+            if inside {
+                worst_inside = worst_inside.max(e);
+            } else {
+                worst_outside = worst_outside.max(e);
+            }
+        }
+        assert!(
+            worst_global > 0.5,
+            "the similarity should not fit this warp: {worst_global}"
+        );
+        assert!(
+            worst_inside < 0.3,
+            "field inside {worst_inside}, global {worst_global}"
+        );
+        assert!(worst_outside < 0.5, "field extrapolated {worst_outside}");
+    }
+
+    #[test]
+    fn field_falls_back_to_the_global_fit_without_signal() {
+        let reference = synthetic_blobs(1024, 768, (0.0, 0.0), 71, 3.0);
+        let mut dark = reference.clone();
+        for v in dark.data.iter_mut() {
+            *v = 512;
+        }
+        let t = Transform::translation(2.0, -1.0);
+        // The frame is dark: no tile can vote, the field is the global map.
+        let field = align_field(&reference, &dark, t).unwrap();
+        assert_eq!(field.valid_tiles(), 0);
+        assert_eq!(field.apply(100.0, 100.0), (102.0, 99.0));
     }
 }

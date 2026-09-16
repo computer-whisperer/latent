@@ -1195,6 +1195,64 @@ SCALE [--kernel σ]`, `idev burst --stats` prints the fits.
   same Gauss-Newton per tile, initialised from the global fit), then
   the reconstruction re-measured on the board and the room set.
 
+### Local alignment field (2026-09-16)
+
+`burst::Field`: the refined global similarity plus a translation
+correction per 512-px tile, fitted by the same Gauss-Newton on the log
+planes (translation only, Cauchy reweighting, best-state guard), kept
+only where it lowered the tile's residual and stayed under 12 px,
+interpolated bilinearly between tile centres and extrapolated linearly
+past the outer ones. Tiles with under 150 masked quads in either frame
+keep the global fit, which is what the night skylines get outside the
+horizon. The reconstruction now takes fields; `idev burst --score`
+reports the field as a model.
+
+Kill test, board bursts, strongest corners, rms px:
+
+| model | second burst, 1–8 px motion | first burst, 14–93 px motion |
+|---|---|---|
+| refined similarity | 0.32–0.47 | 0.34–2.08 |
+| homography (in-sample) | 0.24–0.39 | 0.25–0.41 |
+| local field | 0.22–0.38 | 0.21–0.29 |
+| local bound (per-cell translation) | 0.23–0.37 | 0.21–0.93 |
+
+The field reaches the corner-location floor on both bursts and beats
+the in-sample homography on the first, i.e. it absorbs the lens
+distortion a projective model cannot. Passed. Synthetic check: an
+anisotropic warp (0.4 % along x, −0.3 % along y) that a similarity
+misses by 1.7 px is recovered to 0.3 px inside the tile hull and
+0.5 px at the extrapolated corners.
+
+Reconstruction on the board (DSC01654–1663, 2×, kernel 0.5 px,
+developed with +2 EV), over the board's centre:
+
+| version | edge width 10–90 %, 2× px | flat-square noise, 8-bit codes |
+|---|---|---|
+| single RCD, Lanczos 2× | 6.70 | 2.3 |
+| 1-frame reconstruction | 7.10 | 2.2 |
+| 10-frame reconstruction, field | 7.05 | 1.2–1.4 |
+
+Noise halves (the 8-bit output floors the measured ratio below √10)
+and the 10-frame edge is clean where the single-frame versions show
+colour speckle and a faint fringe; edge width does not move. The
+single frame's native edge is 3.5 px 10–90 %: at 18 mm f/2.8 the lens
+delivers no energy near Nyquist, so there is nothing aliased for
+multi-frame sampling to recover, on this set or the room set shot
+the same way. The kernel costs ~0.4 px (2×) of width against RCD;
+0.35 px would narrow it at the price of grain.
+
+What a resolution test needs: a lens stopped to its sharpest
+(f/5.6–8), a subject with detail at or beyond Nyquist (distant text,
+fabric, a printed chart at a few metres) so the single frame's edges
+are 1–1.5 px, hand-held for the dither. The pipeline is ready to
+measure it: `--score` for the alignment, edge widths and flat noise
+on the develop.
+
+Carried notes: the corner scorer's 0.3 px real-data floor (markers in
+the window, untested); the robustness allowance scales with the
+gradient and let 5 px ghosts through before the fix, now moot with a
+correct field but still generous.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700
