@@ -23,6 +23,7 @@ use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
 use crate::sensor::{self, ExifSummary, SensorFrame};
+use crate::source::CameraRgb;
 
 /// Longest gap between consecutive frames of one burst, on top of the
 /// exposure time. The a6700 spaces frames by 160–800 ms.
@@ -252,6 +253,9 @@ fn masked_log(g: &Gray, quad_sigma: f32) -> (Vec<f32>, f32) {
 /// Run `f` over row bands of `data` on all cores; `f` gets the first
 /// row index of its band and the band.
 fn par_rows<T: Send>(data: &mut [T], width: usize, f: impl Fn(usize, &mut [T]) + Sync) {
+    if data.is_empty() {
+        return;
+    }
     let height = data.len() / width;
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -386,6 +390,446 @@ pub fn align(reference: &SensorFrame, frame: &SensorFrame) -> Result<Shift> {
         dy: 2.0 * dy,
         peak,
     })
+}
+
+// ---------------------------------------------------------------------
+// Sub-pixel alignment: a similarity per frame
+
+/// Reference sensor coordinates to frame sensor coordinates:
+/// `p' = a·p + t`. A similarity (rotation and uniform scale) in
+/// practice; stored as a general 2×2 so a fuller model can slot in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Transform {
+    pub a: [[f32; 2]; 2],
+    pub t: [f32; 2],
+    /// Tiles the coarse fit used.
+    pub tiles: u32,
+    /// RMS residual of the refinement on the log planes (log DN, over
+    /// the reference's signal mask).
+    pub residual: f32,
+}
+
+impl Transform {
+    pub const IDENTITY: Transform = Transform {
+        a: [[1.0, 0.0], [0.0, 1.0]],
+        t: [0.0, 0.0],
+        tiles: 0,
+        residual: 0.0,
+    };
+
+    pub fn translation(dx: f32, dy: f32) -> Transform {
+        Transform {
+            t: [dx, dy],
+            ..Transform::IDENTITY
+        }
+    }
+
+    pub fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.a[0][0] * x + self.a[0][1] * y + self.t[0],
+            self.a[1][0] * x + self.a[1][1] * y + self.t[1],
+        )
+    }
+
+    /// Rotation in degrees and scale, for reports.
+    pub fn rotation_deg(&self) -> f32 {
+        self.a[1][0].atan2(self.a[0][0]).to_degrees()
+    }
+
+    pub fn scale(&self) -> f32 {
+        self.a[0][0].hypot(self.a[1][0])
+    }
+}
+
+/// Tile side for the local correlations, in quads (half-resolution
+/// pixels).
+const TILE: usize = 256;
+/// Least fraction of a tile's quads above the noise for it to vote.
+const TILE_COVERAGE: f32 = 0.02;
+
+/// One tile's measurement: reference point and where it landed in the
+/// frame, both in sensor pixels, with the correlation peak as weight.
+struct TileMatch {
+    p: [f32; 2],
+    q: [f32; 2],
+    w: f32,
+}
+
+/// Fit a similarity from `frame` to `reference` around a global shift
+/// estimate (`global`, from [`align`]).
+pub fn align_similarity(
+    reference: &SensorFrame,
+    frame: &SensorFrame,
+    global: Shift,
+) -> Result<Transform> {
+    ensure!(
+        reference.width == frame.width
+            && reference.height == frame.height
+            && reference.crop == frame.crop,
+        "frames differ in size or crop"
+    );
+    let ga = gray(reference);
+    let gb = gray(frame);
+    let quad_sigma = dark_sigma(reference).max(dark_sigma(frame)) * 0.5;
+    let (ma, _) = masked_log(&ga, quad_sigma);
+    let (mb, _) = masked_log(&gb, quad_sigma);
+    let (gx, gy) = global.even();
+    let (qx, qy) = ((gx / 2) as isize, (gy / 2) as isize);
+    let crop = reference.crop;
+    let mut matches = Vec::new();
+    let (tw, th) = (ga.width / TILE, ga.height / TILE);
+    // Tiles run in parallel; each is a small FFT.
+    let cells: Vec<(usize, usize)> = (0..th)
+        .flat_map(|ty| (0..tw).map(move |tx| (tx, ty)))
+        .collect();
+    let mut results: Vec<Option<TileMatch>> = (0..cells.len()).map(|_| None).collect();
+    par_rows(&mut results, 1, |i0, band| {
+        for (k, slot) in band.iter_mut().enumerate() {
+            let (tx, ty) = cells[i0 + k];
+            // The frame's tile sits at the reference tile displaced by
+            // the global shift; tiles that would leave either plane are
+            // moved inward so both copies fit (they then overlap a
+            // neighbour, which is harmless).
+            let fit = |o: usize, q: isize, n: usize| -> Option<usize> {
+                let lo = (-q).max(0);
+                let hi = (n as isize - TILE as isize).min(n as isize - TILE as isize - q);
+                (lo <= hi).then(|| (o as isize).clamp(lo, hi) as usize)
+            };
+            let (Some(x0), Some(y0)) =
+                (fit(tx * TILE, qx, ga.width), fit(ty * TILE, qy, ga.height))
+            else {
+                continue;
+            };
+            let (bx, by) = ((x0 as isize + qx) as usize, (y0 as isize + qy) as usize);
+            let mut a = vec![0f32; TILE * TILE];
+            let mut b = vec![0f32; TILE * TILE];
+            let (mut ca, mut cb) = (0usize, 0usize);
+            for y in 0..TILE {
+                for x in 0..TILE {
+                    let va = ma[(y0 + y) * ga.width + x0 + x];
+                    let vb = mb[(by + y) * gb.width + bx + x];
+                    a[y * TILE + x] = va;
+                    b[y * TILE + x] = vb;
+                    ca += (va != 0.0) as usize;
+                    cb += (vb != 0.0) as usize;
+                }
+            }
+            let min = (TILE_COVERAGE * (TILE * TILE) as f32) as usize;
+            if ca < min || cb < min {
+                continue;
+            }
+            let (dx, dy, peak) = phase_correlate(&a, &b, TILE, TILE);
+            if peak <= 0.0 {
+                continue;
+            }
+            // Tile centre in sensor pixels; the quad at (qx, qy) covers
+            // sensor pixels crop + 2q .. crop + 2q + 1.
+            let cx = crop.x as f32 + 2.0 * (x0 as f32 + TILE as f32 * 0.5);
+            let cy = crop.y as f32 + 2.0 * (y0 as f32 + TILE as f32 * 0.5);
+            *slot = Some(TileMatch {
+                p: [cx, cy],
+                q: [cx + gx as f32 + 2.0 * dx, cy + gy as f32 + 2.0 * dy],
+                w: peak,
+            });
+        }
+    });
+    matches.extend(results.into_iter().flatten());
+    let coarse = fit_similarity(&mut matches, global);
+    Ok(refine_similarity(&ga, &gb, &ma, crop, coarse))
+}
+
+/// Gauss-Newton refinement of a similarity on the half-resolution log
+/// planes: minimise Σ m(x)·(B(W(x)) − A(x))² over the reference's
+/// signal mask, warping the frame plane with bilinear sampling. Pixel
+/// residuals are reweighted from the third iteration on so moving
+/// content and misalignment outliers stop pulling the fit.
+fn refine_similarity(
+    ga: &Gray,
+    gb: &Gray,
+    masked_a: &[f32],
+    crop: crate::sensor::Rect,
+    init: Transform,
+) -> Transform {
+    const ITERATIONS: usize = 12;
+    let (w, h) = (ga.width, ga.height);
+    let la: Vec<f32> = ga.data.iter().map(|v| v.max(0.0).ln_1p()).collect();
+    let lb: Vec<f32> = gb.data.iter().map(|v| v.max(0.0).ln_1p()).collect();
+    // Sensor → quad coordinates: q = (p - crop - 0.5) / 2. Conjugate the
+    // transform into quad space.
+    let (cx, cy) = (crop.x as f32 + 0.5, crop.y as f32 + 0.5);
+    let to_quad = |t: &Transform| -> ([[f32; 2]; 2], [f32; 2]) {
+        // p' = A p + t  ⇒  q' = A q + (A c + t - c) / 2
+        let (ax, ay) = (
+            t.a[0][0] * cx + t.a[0][1] * cy,
+            t.a[1][0] * cx + t.a[1][1] * cy,
+        );
+        (t.a, [(ax + t.t[0] - cx) * 0.5, (ay + t.t[1] - cy) * 0.5])
+    };
+    let from_quad = |a: [[f32; 2]; 2], tq: [f32; 2]| -> [f32; 2] {
+        let (ax, ay) = (a[0][0] * cx + a[0][1] * cy, a[1][0] * cx + a[1][1] * cy);
+        [2.0 * tq[0] - ax + cx, 2.0 * tq[1] - ay + cy]
+    };
+    let (mut a, mut tq) = to_quad(&init);
+    // Centre of the mask, for conditioning.
+    let (mut mx, mut my, mut mn) = (0f64, 0f64, 0f64);
+    for y in 0..h {
+        for x in 0..w {
+            if masked_a[y * w + x] != 0.0 {
+                mx += x as f64;
+                my += y as f64;
+                mn += 1.0;
+            }
+        }
+    }
+    if mn < 16.0 {
+        return init;
+    }
+    let (mx, my) = ((mx / mn) as f32, (my / mn) as f32);
+    // The iteration parameterises W(q) = A (q - m) + m + tq about the
+    // mask centre m; convert the origin-based initial translation.
+    tq = [
+        tq[0] + a[0][0] * mx + a[0][1] * my - mx,
+        tq[1] + a[1][0] * mx + a[1][1] * my - my,
+    ];
+    let sample = |p: &[f32], x: f32, y: f32| -> Option<(f32, f32, f32)> {
+        if x < 1.0 || y < 1.0 || x >= (w - 2) as f32 || y >= (h - 2) as f32 {
+            return None;
+        }
+        let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        let at = |i: usize, j: usize| p[j * w + i];
+        let v = at(x0, y0) * (1.0 - fx) * (1.0 - fy)
+            + at(x0 + 1, y0) * fx * (1.0 - fy)
+            + at(x0, y0 + 1) * (1.0 - fx) * fy
+            + at(x0 + 1, y0 + 1) * fx * fy;
+        // Gradient by central differences of the bilinear surface.
+        let gx = (at(x0 + 1, y0) - at(x0 - 1, y0)) * (1.0 - fy) * 0.5
+            + (at(x0 + 1, y0 + 1) - at(x0 - 1, y0 + 1)) * fy * 0.5;
+        let gy = (at(x0, y0 + 1) - at(x0, y0 - 1)) * (1.0 - fx) * 0.5
+            + (at(x0 + 1, y0 + 1) - at(x0 + 1, y0 - 1)) * fx * 0.5;
+        Some((v, gx, gy))
+    };
+    let mut residual_scale = f32::INFINITY;
+    let mut last_rms = 0f32;
+    for it in 0..ITERATIONS {
+        // Parameters: (da, db, dtx, dty) on top of the current (a, b, t)
+        // with A = [[a, -b], [b, a]] about the mask centre.
+        let mut hess = [[0f64; 4]; 4];
+        let mut grad = [0f64; 4];
+        let mut sum_r2 = 0f64;
+        let mut count = 0f64;
+        let mut abs_res: Vec<f32> = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let m = masked_a[y * w + x];
+                if m == 0.0 {
+                    continue;
+                }
+                let (dx, dy) = (x as f32 - mx, y as f32 - my);
+                let (wx, wy) = (
+                    a[0][0] * dx + a[0][1] * dy + mx + tq[0],
+                    a[1][0] * dx + a[1][1] * dy + my + tq[1],
+                );
+                let Some((vb, gx, gy)) = sample(&lb, wx, wy) else {
+                    continue;
+                };
+                let r = vb - la[y * w + x];
+                let wgt = if residual_scale.is_finite() {
+                    1.0 / (1.0 + (r / residual_scale).powi(2))
+                } else {
+                    1.0
+                };
+                abs_res.push(r.abs());
+                // dW/d(a,b,tx,ty) = [(dx,dy), (-dy,dx), (1,0), (0,1)]
+                let j = [
+                    (gx * dx + gy * dy) as f64,
+                    (-gx * dy + gy * dx) as f64,
+                    gx as f64,
+                    gy as f64,
+                ];
+                for i in 0..4 {
+                    grad[i] += wgt as f64 * j[i] * r as f64;
+                    for k in 0..4 {
+                        hess[i][k] += wgt as f64 * j[i] * j[k];
+                    }
+                }
+                sum_r2 += (wgt * r * r) as f64;
+                count += wgt as f64;
+            }
+        }
+        if count < 16.0 {
+            break;
+        }
+        last_rms = (sum_r2 / count).sqrt() as f32;
+        let Some(delta) = solve4(hess, grad) else {
+            break;
+        };
+        a[0][0] -= delta[0] as f32;
+        a[1][1] -= delta[0] as f32;
+        a[0][1] += delta[1] as f32;
+        a[1][0] -= delta[1] as f32;
+        tq[0] -= delta[2] as f32;
+        tq[1] -= delta[3] as f32;
+        if it >= 1 {
+            let mut v = abs_res;
+            residual_scale = (2.0 * median(&mut v)).max(1e-3);
+        }
+        let step = delta[2].hypot(delta[3]);
+        if step < 1e-3 && delta[0].abs() < 1e-6 && delta[1].abs() < 1e-6 {
+            break;
+        }
+    }
+    // Back to origin-based.
+    let tq = [
+        tq[0] - (a[0][0] * mx + a[0][1] * my - mx),
+        tq[1] - (a[1][0] * mx + a[1][1] * my - my),
+    ];
+    Transform {
+        a,
+        t: from_quad(a, tq),
+        tiles: init.tiles,
+        // RMS log-plane residual over the mask, not pixels.
+        residual: last_rms,
+    }
+}
+
+/// Solve a symmetric 4×4 system by Gaussian elimination with partial
+/// pivoting; `None` when singular.
+fn solve4(mut m: [[f64; 4]; 4], mut b: [f64; 4]) -> Option<[f64; 4]> {
+    for col in 0..4 {
+        let piv = (col..4).max_by(|&i, &j| m[i][col].abs().total_cmp(&m[j][col].abs()))?;
+        if m[piv][col].abs() < 1e-12 {
+            return None;
+        }
+        m.swap(col, piv);
+        b.swap(col, piv);
+        for row in col + 1..4 {
+            let f = m[row][col] / m[col][col];
+            let pivot_row = m[col];
+            for (mk, pk) in m[row].iter_mut().zip(pivot_row).skip(col) {
+                *mk -= f * pk;
+            }
+            b[row] -= f * b[col];
+        }
+    }
+    let mut x = [0f64; 4];
+    for i in (0..4).rev() {
+        let s: f64 = (i + 1..4).map(|k| m[i][k] * x[k]).sum();
+        x[i] = (b[i] - s) / m[i][i];
+    }
+    Some(x)
+}
+
+/// Weighted least squares for `q = [[a, -b], [b, a]]·p + t`, with three
+/// rounds of outlier rejection.
+fn fit_similarity(matches: &mut Vec<TileMatch>, global: Shift) -> Transform {
+    let fallback = Transform::translation(global.dx, global.dy);
+    for _round in 0..3 {
+        let n = matches.len();
+        let t = if n >= 3 {
+            solve_similarity(matches)
+        } else if n >= 1 {
+            let wsum: f32 = matches.iter().map(|m| m.w).sum();
+            let dx = matches.iter().map(|m| m.w * (m.q[0] - m.p[0])).sum::<f32>() / wsum;
+            let dy = matches.iter().map(|m| m.w * (m.q[1] - m.p[1])).sum::<f32>() / wsum;
+            Transform::translation(dx, dy)
+        } else {
+            return fallback;
+        };
+        let mut res: Vec<f32> = matches
+            .iter()
+            .map(|m| {
+                let (x, y) = t.apply(m.p[0], m.p[1]);
+                (x - m.q[0]).hypot(y - m.q[1])
+            })
+            .collect();
+        let mut sorted = res.clone();
+        let med = median(&mut sorted);
+        let limit = (3.0 * med).max(1.0);
+        let rms = (res.iter().map(|r| r * r).sum::<f32>() / n as f32).sqrt();
+        let keep: Vec<bool> = res.iter().map(|&r| r <= limit).collect();
+        if keep.iter().all(|&k| k) {
+            return Transform {
+                tiles: n as u32,
+                residual: rms,
+                ..t
+            };
+        }
+        let mut i = 0;
+        matches.retain(|_| {
+            i += 1;
+            keep[i - 1]
+        });
+        res.clear();
+    }
+    let n = matches.len();
+    if n == 0 {
+        return fallback;
+    }
+    let t = if n >= 3 {
+        solve_similarity(matches)
+    } else {
+        let wsum: f32 = matches.iter().map(|m| m.w).sum();
+        Transform::translation(
+            matches.iter().map(|m| m.w * (m.q[0] - m.p[0])).sum::<f32>() / wsum,
+            matches.iter().map(|m| m.w * (m.q[1] - m.p[1])).sum::<f32>() / wsum,
+        )
+    };
+    let rms = (matches
+        .iter()
+        .map(|m| {
+            let (x, y) = t.apply(m.p[0], m.p[1]);
+            (x - m.q[0]).powi(2) + (y - m.q[1]).powi(2)
+        })
+        .sum::<f32>()
+        / n as f32)
+        .sqrt();
+    Transform {
+        tiles: n as u32,
+        residual: rms,
+        ..t
+    }
+}
+
+/// Normal equations for the four similarity parameters. Coordinates
+/// are centred on the weighted mean first, which keeps the system well
+/// conditioned for points thousands of pixels from the origin.
+fn solve_similarity(matches: &[TileMatch]) -> Transform {
+    let wsum: f64 = matches.iter().map(|m| m.w as f64).sum();
+    let mean = |f: &dyn Fn(&TileMatch) -> f32| {
+        matches
+            .iter()
+            .map(|m| m.w as f64 * f(m) as f64)
+            .sum::<f64>()
+            / wsum
+    };
+    let (px, py) = (mean(&|m| m.p[0]), mean(&|m| m.p[1]));
+    let (qx, qy) = (mean(&|m| m.q[0]), mean(&|m| m.q[1]));
+    // With centred coordinates the translation drops out and
+    // (a, b) minimise Σ w |[[a,-b],[b,a]] p - q|²:
+    // a = Σ w (px qx + py qy) / Σ w |p|², b = Σ w (px qy - py qx) / Σ w |p|².
+    let (mut num_a, mut num_b, mut den) = (0f64, 0f64, 0f64);
+    for m in matches {
+        let w = m.w as f64;
+        let (x, y) = (m.p[0] as f64 - px, m.p[1] as f64 - py);
+        let (u, v) = (m.q[0] as f64 - qx, m.q[1] as f64 - qy);
+        num_a += w * (x * u + y * v);
+        num_b += w * (x * v - y * u);
+        den += w * (x * x + y * y);
+    }
+    let (a, b) = if den > 1e-9 {
+        (num_a / den, num_b / den)
+    } else {
+        (1.0, 0.0)
+    };
+    let tx = qx - (a * px - b * py);
+    let ty = qy - (b * px + a * py);
+    Transform {
+        a: [[a as f32, -b as f32], [b as f32, a as f32]],
+        t: [tx as f32, ty as f32],
+        tiles: matches.len() as u32,
+        residual: 0.0,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -631,6 +1075,223 @@ pub fn merge(frames: &[&SensorFrame], shifts: &[Shift]) -> Result<Merged> {
     })
 }
 
+// ---------------------------------------------------------------------
+// Reconstruction: kernel regression onto an output grid
+
+/// Bilinear sample of a plane with its gradient; `None` outside.
+fn sample_plane(p: &[f32], w: usize, h: usize, x: f32, y: f32) -> Option<(f32, f32, f32)> {
+    if x < 1.0 || y < 1.0 || x >= (w - 2) as f32 || y >= (h - 2) as f32 {
+        return None;
+    }
+    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    let at = |i: usize, j: usize| p[j * w + i];
+    let v = at(x0, y0) * (1.0 - fx) * (1.0 - fy)
+        + at(x0 + 1, y0) * fx * (1.0 - fy)
+        + at(x0, y0 + 1) * (1.0 - fx) * fy
+        + at(x0 + 1, y0 + 1) * fx * fy;
+    let gx = (at(x0 + 1, y0) - at(x0 - 1, y0)) * (1.0 - fy) * 0.5
+        + (at(x0 + 1, y0 + 1) - at(x0 - 1, y0 + 1)) * fy * 0.5;
+    let gy = (at(x0, y0 + 1) - at(x0, y0 - 1)) * (1.0 - fx) * 0.5
+        + (at(x0 + 1, y0 + 1) - at(x0 + 1, y0 - 1)) * fx * 0.5;
+    Some((v, gx, gy))
+}
+
+/// Reconstruct camera RGB on the reference crop at `scale`× by kernel
+/// regression over every frame's sites. `transforms[i]` maps reference
+/// sensor coordinates into frame `i` (index 0 is the identity). Each
+/// frame contributes the 3×3 sites around the mapped point, weighted by
+/// an isotropic Gaussian of `kernel_sigma` sensor pixels and by a
+/// robustness weight from the half-resolution planes (see DESIGN.md,
+/// step 3). Output values are black-subtracted and normalised to white,
+/// before white balance.
+pub fn reconstruct(
+    frames: &[&SensorFrame],
+    transforms: &[Transform],
+    noise: NoiseModel,
+    scale: u32,
+    kernel_sigma: f32,
+) -> Result<CameraRgb> {
+    ensure!(!frames.is_empty(), "no frames");
+    ensure!(frames.len() == transforms.len(), "one transform per frame");
+    ensure!((1..=4).contains(&scale), "scale must be 1..=4");
+    ensure!(kernel_sigma > 0.05, "kernel sigma too small");
+    let reference = frames[0];
+    for f in frames {
+        ensure!(
+            f.width == reference.width && f.height == reference.height && f.cfa == reference.cfa,
+            "frames differ in raster or CFA"
+        );
+    }
+    let grays: Vec<Gray> = frames.iter().map(|f| gray(f)).collect();
+    let crop = reference.crop;
+    let (gw, gh) = (grays[0].width, grays[0].height);
+    let (out_w, out_h) = (crop.width * scale, crop.height * scale);
+    let mut rgba = vec![half::f16::ZERO; (out_w * out_h * 4) as usize];
+    let n = frames.len();
+    let (raster_w, raster_h) = (reference.width as i32, reference.height as i32);
+    let stride = reference.width as usize;
+    let inv_2s2 = -1.0 / (2.0 * kernel_sigma * kernel_sigma);
+    let stats = std::sync::Mutex::new((vec![0f64; n], 0u64, 0u64));
+    par_rows(&mut rgba, out_w as usize * 4, |y0, band| {
+        let mut wsum_local = vec![0f64; n];
+        let mut pixels = 0u64;
+        let mut uncovered = 0u64;
+        for (dy, row) in band.chunks_mut(out_w as usize * 4).enumerate() {
+            let oy = (y0 + dy) as u32;
+            let y = crop.y as f32 + (oy as f32 + 0.5) / scale as f32 - 0.5;
+            for (ox, px) in row.chunks_mut(4).enumerate() {
+                let x = crop.x as f32 + (ox as f32 + 0.5) / scale as f32 - 0.5;
+                let qx = (x - crop.x as f32 - 0.5) * 0.5;
+                let qy = (y - crop.y as f32 - 0.5) * 0.5;
+                let (g_ref, grad) = match sample_plane(&grays[0].data, gw, gh, qx, qy) {
+                    Some((v, gx, gy)) => (v, gx.hypot(gy)),
+                    None => (0.0, 0.0),
+                };
+                // Noise of a quad mean is a quarter of a site's; the
+                // difference of two carries twice that; misalignment of
+                // 0.25 sensor px (an eighth of a quad) adds along ∇.
+                let sigma2 =
+                    2.0 * (noise.a * g_ref.max(0.0) + noise.b) * 0.25 + (0.125 * grad).powi(2);
+                let k_rob = 1.0 / (ROBUST_SIGMAS * ROBUST_SIGMAS * sigma2.max(0.25));
+                let mut acc = [0f32; 3];
+                let mut wgt = [0f32; 3];
+                for (i, (f, t)) in frames.iter().zip(transforms).enumerate() {
+                    let (px_f, py_f) = if i == 0 { (x, y) } else { t.apply(x, y) };
+                    let w_frame = if i == 0 {
+                        1.0
+                    } else {
+                        let fqx = (px_f - crop.x as f32 - 0.5) * 0.5;
+                        let fqy = (py_f - crop.y as f32 - 0.5) * 0.5;
+                        match sample_plane(&grays[i].data, gw, gh, fqx, fqy) {
+                            Some((g, _, _)) => {
+                                let d = g - g_ref;
+                                (-0.5 * d * d * k_rob).exp()
+                            }
+                            None => continue,
+                        }
+                    };
+                    wsum_local[i] += w_frame as f64;
+                    let (cx, cy) = (px_f.round() as i32, py_f.round() as i32);
+                    for sy in cy - 1..=cy + 1 {
+                        if sy < 0 || sy >= raster_h {
+                            continue;
+                        }
+                        for sx in cx - 1..=cx + 1 {
+                            if sx < 0 || sx >= raster_w {
+                                continue;
+                            }
+                            let site = ((sy & 1) * 2 + (sx & 1)) as usize;
+                            let colour = reference.cfa[site] as usize;
+                            let v = (f.data[sy as usize * stride + sx as usize] as f32
+                                - reference.black[site])
+                                / (reference.white[site] - reference.black[site]);
+                            let ddx = sx as f32 - px_f;
+                            let ddy = sy as f32 - py_f;
+                            let kw = w_frame * ((ddx * ddx + ddy * ddy) * inv_2s2).exp();
+                            acc[colour] += kw * v;
+                            wgt[colour] += kw;
+                        }
+                    }
+                }
+                pixels += 1;
+                for c in 0..3 {
+                    px[c] = if wgt[c] > 1e-6 {
+                        half::f16::from_f32(acc[c] / wgt[c])
+                    } else {
+                        uncovered += 1;
+                        half::f16::ZERO
+                    };
+                }
+                px[3] = half::f16::ONE;
+            }
+        }
+        let mut g = stats.lock().unwrap();
+        for (a, b) in g.0.iter_mut().zip(&wsum_local) {
+            *a += b;
+        }
+        g.1 += pixels;
+        g.2 += uncovered;
+    });
+    let (wsum, pixels, uncovered) = stats.into_inner().unwrap();
+    let mean_weight = wsum
+        .iter()
+        .map(|&s| {
+            if pixels > 0 {
+                (s / pixels as f64) as f32
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let mut frame = reference.clone();
+    frame.data = Vec::new();
+    Ok(CameraRgb {
+        frame,
+        width: out_w,
+        height: out_h,
+        rgba,
+        mean_weight,
+        uncovered: uncovered as f32 / (pixels.max(1) * 3) as f32,
+    })
+}
+
+/// Load the files as one burst, fit a similarity per frame and
+/// reconstruct at `scale`×.
+pub fn reconstruct_files(
+    paths: &[impl AsRef<Path>],
+    scale: u32,
+    kernel_sigma: f32,
+) -> Result<(CameraRgb, Vec<Transform>)> {
+    ensure!(!paths.is_empty(), "no frames");
+    let frames = load_all(paths)?;
+    let refs: Vec<&SensorFrame> = frames.iter().collect();
+    let shifts = align_all(&refs)?;
+    let transforms = similarity_all(&refs, &shifts)?;
+    let noise = frames
+        .get(1)
+        .and_then(|f| noise_model(&frames[0], f, shifts[1].even()))
+        .unwrap_or_else(|| {
+            let s = dark_sigma(&frames[0]);
+            NoiseModel { a: 0.0, b: s * s }
+        });
+    let out = reconstruct(&refs, &transforms, noise, scale, kernel_sigma)?;
+    Ok((out, transforms))
+}
+
+/// Similarity of every frame relative to the first, in parallel, from
+/// the global shifts.
+pub fn similarity_all(frames: &[&SensorFrame], shifts: &[Shift]) -> Result<Vec<Transform>> {
+    let mut slots: Vec<Option<Result<Transform>>> = (0..frames.len()).map(|_| None).collect();
+    slots[0] = Some(Ok(Transform::IDENTITY));
+    let reference = frames[0];
+    std::thread::scope(|s| {
+        for ((slot, f), shift) in slots.iter_mut().zip(frames).zip(shifts).skip(1) {
+            s.spawn(move || {
+                *slot = Some(align_similarity(reference, f, *shift));
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|s| s.expect("every slot filled"))
+        .collect()
+}
+
+/// A frame's similarity printed for reports.
+pub fn describe_transform(t: &Transform, weight: f32) -> String {
+    format!(
+        "shift ({:+8.2}, {:+8.2}) px  rotation {:+.4}°  scale {:.5}  tiles {:2}  residual {:.3}  weight {:.3}",
+        t.t[0],
+        t.t[1],
+        t.rotation_deg(),
+        t.scale(),
+        t.tiles,
+        t.residual,
+        weight
+    )
+}
+
 /// Load the files as one burst, align each to the first and merge.
 /// Returns the merge and the measured shifts (index 0 is zero).
 pub fn merge_files(paths: &[impl AsRef<Path>]) -> Result<(Merged, Vec<Shift>)> {
@@ -748,7 +1409,7 @@ mod tests {
 
     /// A synthetic frame: sparse bright blobs on a dark noisy plane,
     /// like a night skyline, so the mask has something to pass.
-    fn synthetic(width: u32, height: u32, shift: (i32, i32), seed: u32) -> SensorFrame {
+    fn synthetic(width: u32, height: u32, shift: (f32, f32), seed: u32) -> SensorFrame {
         let mut rng = seed.wrapping_mul(2654435761).wrapping_add(12345);
         let mut next = move || {
             rng ^= rng << 13;
@@ -772,7 +1433,7 @@ mod tests {
         for y in 0..height {
             for x in 0..width {
                 // Content of the reference at (x - sx, y - sy) appears here.
-                let (rx, ry) = (x as f32 - shift.0 as f32, y as f32 - shift.1 as f32);
+                let (rx, ry) = (x as f32 - shift.0, y as f32 - shift.1);
                 let mut s = 0.0;
                 for &(bx, by, amp) in &blobs {
                     let d2 = (rx - bx).powi(2) + (ry - by).powi(2);
@@ -813,8 +1474,8 @@ mod tests {
 
     #[test]
     fn align_recovers_a_known_shift() {
-        let reference = synthetic(256, 192, (0, 0), 1);
-        let frame = synthetic(256, 192, (6, -10), 2);
+        let reference = synthetic(256, 192, (0.0, 0.0), 1);
+        let frame = synthetic(256, 192, (6.0, -10.0), 2);
         let s = align(&reference, &frame).unwrap();
         assert!((s.dx - 6.0).abs() < 0.6, "{s:?}");
         assert!((s.dy + 10.0).abs() < 0.6, "{s:?}");
@@ -824,7 +1485,7 @@ mod tests {
 
     #[test]
     fn align_refuses_a_dark_frame() {
-        let mut reference = synthetic(128, 96, (0, 0), 1);
+        let mut reference = synthetic(128, 96, (0.0, 0.0), 1);
         for v in reference.data.iter_mut() {
             *v = 512;
         }
@@ -834,8 +1495,8 @@ mod tests {
     #[test]
     fn noise_model_recovers_read_noise() {
         // Two frames of the same scene, independent noise, no shift.
-        let a = synthetic(256, 192, (0, 0), 3);
-        let b = synthetic(256, 192, (0, 0), 4);
+        let a = synthetic(256, 192, (0.0, 0.0), 3);
+        let b = synthetic(256, 192, (0.0, 0.0), 4);
         let m = noise_model(&a, &b, (0, 0)).unwrap();
         // Sum of three uniforms scaled by 8: variance 3/12 * 64 = 16.
         assert!((m.b - 16.0).abs() < 4.0, "{m:?}");
@@ -845,7 +1506,7 @@ mod tests {
     #[test]
     fn merge_reduces_noise_and_keeps_signal() {
         let frames: Vec<SensorFrame> = (0..8)
-            .map(|i| synthetic(256, 192, (2 * i, -2 * i), 10 + i as u32))
+            .map(|i| synthetic(256, 192, (2.0 * i as f32, -2.0 * i as f32), 10 + i as u32))
             .collect();
         let refs: Vec<&SensorFrame> = frames.iter().collect();
         let shifts = align_all(&refs).unwrap();
@@ -873,7 +1534,7 @@ mod tests {
     #[test]
     fn merge_outvotes_an_outlier() {
         let mut frames: Vec<SensorFrame> = (0..5)
-            .map(|i| synthetic(256, 192, (0, 0), 20 + i as u32))
+            .map(|i| synthetic(256, 192, (0.0, 0.0), 20 + i as u32))
             .collect();
         // A hot pixel in the reference, on a dark site.
         let at = 33 * 256 + 20;
@@ -884,5 +1545,137 @@ mod tests {
         let merged = merge(&refs, &shifts).unwrap();
         assert!(merged.frame.data[at] < 600, "{}", merged.frame.data[at]);
         assert!(merged.mean_weight[0] > 0.9, "{:?}", merged.mean_weight);
+    }
+
+    #[test]
+    fn similarity_fit_recovers_rotation_and_shift() {
+        let t = Transform {
+            a: [[0.9999, -0.0007], [0.0007, 0.9999]],
+            t: [12.3, -7.9],
+            tiles: 0,
+            residual: 0.0,
+        };
+        let mut matches: Vec<TileMatch> = (0..12)
+            .map(|i| {
+                let p = [
+                    500.0 + 480.0 * (i % 6) as f32,
+                    1000.0 + 700.0 * (i / 6) as f32,
+                ];
+                let (x, y) = t.apply(p[0], p[1]);
+                TileMatch {
+                    p,
+                    q: [x, y],
+                    w: 0.05,
+                }
+            })
+            .collect();
+        // One bad tile.
+        matches[4].q[0] += 30.0;
+        let f = fit_similarity(&mut matches, Shift::ZERO);
+        assert_eq!(f.tiles, 11);
+        assert!((f.rotation_deg() - t.rotation_deg()).abs() < 1e-3, "{f:?}");
+        assert!(
+            (f.t[0] - t.t[0]).abs() < 0.05 && (f.t[1] - t.t[1]).abs() < 0.05,
+            "{f:?}"
+        );
+        assert!(f.residual < 0.05, "{f:?}");
+    }
+
+    #[test]
+    fn similarity_on_synthetic_frames() {
+        // 1024 x 768 gives 2 x 1 tiles of 256 quads; content across both.
+        let reference = synthetic(1024, 768, (0.0, 0.0), 7);
+        let frame = synthetic(1024, 768, (5.3, -3.7), 8);
+        let g = align(&reference, &frame).unwrap();
+        let t = align_similarity(&reference, &frame, g).unwrap();
+        let (x, y) = t.apply(300.0, 300.0);
+        assert!(
+            (x - 305.3).abs() < 0.1 && (y - 296.3).abs() < 0.1,
+            "{t:?} global {g:?}"
+        );
+        assert!(t.rotation_deg().abs() < 0.01, "{t:?}");
+    }
+
+    /// A rotated frame: content of the reference at p appears at R p + t.
+    fn synthetic_rotated(
+        width: u32,
+        height: u32,
+        deg: f32,
+        shift: (f32, f32),
+        seed: u32,
+    ) -> SensorFrame {
+        let mut f = synthetic(width, height, (0.0, 0.0), seed);
+        let base = synthetic(width, height, (0.0, 0.0), seed);
+        let (s, c) = deg.to_radians().sin_cos();
+        let (cx, cy) = (width as f32 * 0.5, height as f32 * 0.5);
+        for y in 0..height {
+            for x in 0..width {
+                // Inverse map: reference point for this frame pixel.
+                let (dx, dy) = (x as f32 - shift.0 - cx, y as f32 - shift.1 - cy);
+                let (rx, ry) = (c * dx + s * dy + cx, -s * dx + c * dy + cy);
+                let (ix, iy) = (rx.round() as i32, ry.round() as i32);
+                let v = if ix >= 0 && iy >= 0 && ix < width as i32 && iy < height as i32 {
+                    base.data[(iy as u32 * width + ix as u32) as usize]
+                } else {
+                    512
+                };
+                f.data[(y * width + x) as usize] = v;
+            }
+        }
+        f
+    }
+
+    #[test]
+    fn similarity_recovers_a_small_rotation() {
+        let reference = synthetic(1024, 768, (0.0, 0.0), 7);
+        let frame = synthetic_rotated(1024, 768, 0.3, (4.0, -2.0), 7);
+        let g = align(&reference, &frame).unwrap();
+        let t = align_similarity(&reference, &frame, g).unwrap();
+        assert!((t.rotation_deg() - 0.3).abs() < 0.03, "{t:?}");
+        // Nearest-neighbour resampling in the fixture limits accuracy to ~0.5 px.
+        let (x, y) = t.apply(512.0, 384.0);
+        assert!((x - 516.0).abs() < 0.6 && (y - 382.0).abs() < 0.6, "{t:?}");
+    }
+
+    #[test]
+    fn reconstruct_single_frame_is_a_soft_demosaic() {
+        let f = synthetic(256, 192, (0.0, 0.0), 31);
+        let out = reconstruct(
+            &[&f],
+            &[Transform::IDENTITY],
+            NoiseModel { a: 0.0, b: 16.0 },
+            1,
+            0.7,
+        )
+        .unwrap();
+        assert_eq!((out.width, out.height), (248, 184));
+        assert!(out.uncovered == 0.0, "{}", out.uncovered);
+        // The brightest blob keeps its level (within the kernel's blur).
+        let peak = out
+            .rgba
+            .chunks(4)
+            .map(|p| p[1].to_f32())
+            .fold(0.0f32, f32::max);
+        let raw_peak = (*f.data.iter().max().unwrap() as f32 - 512.0) / (16383.0 - 512.0);
+        assert!(
+            peak > raw_peak * 0.5 && peak <= raw_peak * 1.01,
+            "{peak} vs {raw_peak}"
+        );
+    }
+
+    #[test]
+    fn reconstruct_at_2x_doubles_the_grid() {
+        let frames: Vec<SensorFrame> = (0..3)
+            .map(|i| synthetic(256, 192, (1.5 * i as f32, -0.5 * i as f32), 40 + i as u32))
+            .collect();
+        let refs: Vec<&SensorFrame> = frames.iter().collect();
+        let shifts = align_all(&refs).unwrap();
+        let transforms = similarity_all(&refs, &shifts).unwrap();
+        let out = reconstruct(&refs, &transforms, NoiseModel { a: 0.0, b: 16.0 }, 2, 0.7).unwrap();
+        assert_eq!((out.width, out.height), (496, 368));
+        assert!(out.uncovered == 0.0);
+        for w in &out.mean_weight {
+            assert!(*w > 0.8, "{:?}", out.mean_weight);
+        }
     }
 }

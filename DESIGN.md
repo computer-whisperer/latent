@@ -992,6 +992,145 @@ merge and the FFT rows run over `std::thread::scope` bands.
   merging in the GUI; a GUI screenshot of the "×N" caption (the
   build and tests pass, the layout is unreviewed).
 
+### Lens-cap series (2026-09-15, DSC01616–1643): the gain switch is real
+
+1/200 s with the cap on, ISO 100–32000, pairs up to ISO 800. One
+green site over the crop, std of the core (±6 MAD, so the integer
+quantisation of the MAD does not bite), temporal noise from the pair
+difference / √2:
+
+| ISO | σ total DN | σ/ISO ×100 | σ temporal DN | FPN DN |
+|---|---|---|---|---|
+| 100 | 1.45 | 1.45 | 1.42 | 0.3 |
+| 200 | 2.57 | 1.29 | 2.49 | 0.6 |
+| 400 | 2.07 | 0.52 | 2.16 | 0.0 |
+| 500 | 2.72 | 0.54 | 2.62 | 0.7 |
+| 640 | 3.29 | 0.51 | 3.36 | 0.0 |
+| 800 | 4.23 | 0.53 | 4.25 | 0.0 |
+| 1600 | 8.11 | 0.51 | | |
+| 3200 | 15.4 | 0.48 | | |
+| 6400 | 29.5 | 0.46 | | |
+| 12800 | 52.0 | 0.41 | | |
+| 16000 | 56.5 | 0.35 | | |
+| 32000 | 105 | 0.33 | | |
+
+Input-referred read noise drops 2.5× between ISO 200 and 400, so
+the a6700's second conversion gain engages between them (the series
+skipped 250 and 320; the forum figure of 320 is consistent). Above
+that it declines slowly to 12800, then a second smaller step at
+16000 coincides with hot pixels vanishing (0.1 % → 0.002 % of sites
+beyond 10σ), i.e. in-camera raw noise reduction. Fixed pattern is
+under 1 DN at every ISO. This contradicts the Photons to Photos
+curve read earlier in the day (smooth through 320) and confirms the
+user's recollection; the burst pair model's ~1.5 DN at ISO 320 on
+the night frames matches the interpolated lens-cap value. Shooting
+consequence: ISO 320 sits exactly at the switch, which is the right
+choice for these bursts; ISO 100–200 would cost 2.5× in read noise.
+
+### Step 3 design (target, written before implementation)
+
+Wronski 2019 in its simplest workable form, on the CPU first: the
+method's parameters (kernel width, robustness) are unsettled, and a
+CPU pass over 26 MP × N frames is seconds, which is enough to measure
+whether resolution is recovered on these sets. The GPU port follows
+once the parameters are settled (decision 2 stands for the interactive
+pipeline; this is a load-time step like unpack until then).
+
+- **Alignment model: a similarity per frame** (`burst::Transform`,
+  reference sensor coords → frame sensor coords, `p' = A·p + t`).
+  The measured motion is a translation plus ~0.04° of roll; a
+  similarity is the physical model and, unlike a full affine, is
+  constrained by content that lies along the horizon (rotation and
+  scale from the horizontal extent). Fitted from tile
+  phase-correlations: 256-quad (512 px) tiles of the masked log gray,
+  each pre-shifted by the frame's global even shift, tiles with under
+  2 % coverage skipped, peak as the weight, weighted least squares in
+  (a, b, tx, ty), three rounds dropping tiles beyond max(1 px, 3×
+  median residual). Under three tiles: translation only from the
+  tile mean; none: the global shift. Reports tiles used and residual
+  RMS.
+- **Reconstruction** (`burst::reconstruct(frames, transforms, noise,
+  scale, kernel_sigma) -> CameraRgb`): output grid is the reference
+  crop at `scale`×, pixel centres mapped to reference sensor
+  coordinates, then through each frame's transform. Each frame
+  contributes the 3×3 sites around the mapped point, weighted by an
+  isotropic Gaussian in sensor pixels (`kernel_sigma`, default 0.7)
+  times a per-frame robustness weight; sums per CFA colour give the
+  output RGB, black-subtracted and normalised to white, before white
+  balance. Isotropic first; the structure-tensor kernel of the paper
+  is a later refinement if edges show it is needed.
+- **Robustness** from the half-resolution quad-gray planes: the
+  frame's gray at the mapped point (bilinear) against the
+  reference's, normalised by √2 × the quad noise from the model plus
+  a misalignment term (|∇gray| × 0.25 px), Gaussian weight at 3σ as
+  in step 2. The reference has weight 1.
+- **Into the pipeline**: `Source::Rgb(CameraRgb)` carries the
+  reference `SensorFrame` (metadata, plane dropped) and an RGBA f16
+  plane; `Developer::prepare` uploads it as the camera-RGB texture
+  after applying the white-balance multipliers, sharing the colour
+  setup with the raw path. Highlights, lens tables (normalised
+  radius, so scale-free), geometry and everything downstream are
+  unchanged. 2× of the a6700 crop is 12384 × 8256, inside the 16384
+  texture limit the headless device already requests.
+- **CLI**: `idev develop --superres SCALE [--kernel SIGMA] FILES -o
+  OUT`; `idev burst --stats` also prints each frame's similarity fit.
+- **Evaluation**: on a sharp 28 mm 1/8 s skyline set, the width of
+  isolated point lights in (a) the single frame's RCD develop
+  upscaled 2× against (b) the 2× reconstruction, and at 1× the
+  reconstruction against RCD of the step-2 merge; timing; memory.
+
+### Step 3 results (2026-09-15)
+
+Built as designed, with one addition the tests forced: the parabolic
+sub-pixel peak of the phase correlation was 0.6 px off on synthetic
+data, so `align_similarity` finishes with a Gauss-Newton refinement
+of the four similarity parameters on the half-resolution log planes
+over the reference's signal mask (Cauchy reweighting from the third
+iteration). Synthetic checks: a (5.3, −3.7) px shift recovered within
+0.1 px, a 0.3° roll within 0.03°. `burst::reconstruct`,
+`Source::Rgb(CameraRgb)` with `Developer::prepare_rgb` (the colour
+setup is now shared with the raw path), `idev develop --superres
+SCALE [--kernel σ]`, `idev burst --stats` prints the fits.
+
+- Fits on real bursts: 9–16 tiles per frame, rolls of −0.18° to
+  +0.32° between frames, scale within 0.3 %; robustness weights
+  0.94–0.96; no uncovered output values at 1× or 2×.
+- Timing, 6 frames, 24 threads, debug profile with idev-core at
+  opt-level 2: 1× 10.5 s wall (load + align + reconstruct 5 s,
+  develop 0.5 s, PNG 5 s); 2× 27 s (8 s, 2 s, 16 s). The 2× plane is
+  816 MB f16, doubled once for the white-balance upload.
+- Resolution evidence, 28 mm 1/8 s skyline (DSC01233–1238), energy
+  of the horizontal spectrum above the single-frame Nyquist
+  (0.25–0.5 cycles per 2× pixel) in a horizon band of content versus
+  a sky band of noise, on the developed 8-bit output:
+
+  | version | horizon high band | sky high band |
+  |---|---|---|
+  | single RCD, Lanczos 2× | 1.08e9 | 2.9e8 |
+  | 1-frame reconstruction, σ 0.7 | 3.75e9 | 3.8e8 |
+  | 6-frame reconstruction, σ 0.7 | 5.43e9 | 0.83e8 |
+  | 6-frame reconstruction, σ 0.5 | 9.51e9 | 1.9e8 |
+
+  Against the 1-frame reconstruction (same estimator, same
+  nonlinearity) the 6-frame one has 1.45× the high-band energy where
+  there is content and 4.6× less where there is only noise, so the
+  gain is content. Visually the pier and lamp posts are finer and
+  cleaner at 2×; σ 0.5 is crisper with more grain. Point-light
+  widths are identical in every version (σ ≈ 2.2 sensor px): the
+  lights are optically limited and cannot show resolution.
+- Not evidence: the 37 mm 1/60 s set (DSC01468–1475) is too dark;
+  there the 1-frame reconstruction has more high-band energy than
+  the 8-frame one, i.e. the band is noise. A hand-held daytime burst
+  of a detailed static subject is the real resolution test and has
+  not been shot.
+- Seen and not fixed: at a saturated light the 2× reconstruction
+  shows a red fringe the RCD path does not. Candidates: lateral CA
+  that colour-difference demosaicing hides (the lens CA tables still
+  apply downstream), or per-colour kernels straddling the clip.
+  Needs a look at the camera-RGB plane before the colour pass.
+- Not done: the GPU port; the structure-tensor kernel; merging or
+  reconstruction from the GUI; the merged plane in float (step 2).
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700

@@ -54,11 +54,27 @@ pub struct ImageSource {
     pub metadata: Metadata,
 }
 
+/// Camera RGB reconstructed from a burst (`burst::reconstruct`): the
+/// reference frame's metadata (its sensor plane dropped) and an RGBA
+/// f16 plane at some multiple of the crop, black-subtracted and
+/// normalised to white, before white balance.
+pub struct CameraRgb {
+    pub frame: SensorFrame,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<f16>,
+    /// Mean robustness weight per input frame.
+    pub mean_weight: Vec<f32>,
+    /// Fraction of output channel values no site reached.
+    pub uncovered: f32,
+}
+
 pub enum Source {
-    /// Both boxed: each carries a few hundred bytes of tables and
+    /// All boxed: each carries a few hundred bytes of tables and
     /// metadata beside its pixel data.
     Raw(Box<SensorFrame>),
     Image(Box<ImageSource>),
+    Rgb(Box<CameraRgb>),
 }
 
 impl Source {
@@ -86,6 +102,7 @@ impl Source {
         match self {
             Source::Raw(f) => (f.crop.width, f.crop.height),
             Source::Image(i) => (i.width, i.height),
+            Source::Rgb(r) => (r.width, r.height),
         }
     }
 
@@ -93,6 +110,7 @@ impl Source {
         match self {
             Source::Raw(f) => f.orientation,
             Source::Image(i) => i.orientation,
+            Source::Rgb(r) => r.frame.orientation,
         }
     }
 
@@ -100,6 +118,7 @@ impl Source {
         match self {
             Source::Raw(f) => &f.exif,
             Source::Image(i) => &i.exif,
+            Source::Rgb(r) => &r.frame.exif,
         }
     }
 
@@ -107,12 +126,16 @@ impl Source {
         match self {
             Source::Raw(f) => &f.metadata,
             Source::Image(i) => &i.metadata,
+            Source::Rgb(r) => &r.frame.metadata,
         }
     }
 
+    /// The sensor frame behind a raw or a reconstruction (whose plane
+    /// is empty; its tables and metadata are valid).
     pub fn as_raw(&self) -> Option<&SensorFrame> {
         match self {
             Source::Raw(f) => Some(f),
+            Source::Rgb(r) => Some(&r.frame),
             Source::Image(_) => None,
         }
     }

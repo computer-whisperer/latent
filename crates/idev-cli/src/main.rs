@@ -337,8 +337,16 @@ enum Cmd {
         /// Treat the inputs as one burst: align them to the first,
         /// merge on the sensor plane, develop the result with the first
         /// frame's parameters. Needs -o.
-        #[arg(long, requires = "out")]
+        #[arg(long, requires = "out", conflicts_with = "superres")]
         merge: bool,
+        /// Treat the inputs as one burst and reconstruct camera RGB at
+        /// this scale (1 or 2) by kernel regression over all frames,
+        /// replacing demosaic. Needs -o.
+        #[arg(long, requires = "out", value_name = "SCALE")]
+        superres: Option<u32>,
+        /// Kernel width for --superres, in sensor pixels.
+        #[arg(long, default_value_t = 0.7)]
+        kernel: f32,
         #[command(flatten)]
         overrides: Overrides,
     },
@@ -385,6 +393,8 @@ fn main() -> Result<()> {
             force,
             save_params,
             merge,
+            superres,
+            kernel,
             overrides,
         } => develop(
             &files,
@@ -396,7 +406,7 @@ fn main() -> Result<()> {
             size,
             force,
             save_params,
-            merge,
+            Burst::from_flags(merge, superres, kernel),
             &overrides,
         ),
         Cmd::Burst { inputs, stats, pgm } => {
@@ -456,6 +466,7 @@ fn inspect(file: &Path, all: bool) -> Result<()> {
     }
     let f = match &source {
         Source::Raw(f) => f,
+        Source::Rgb(r) => &r.frame,
         Source::Image(i) => {
             println!("image        {} x {}  {}", i.width, i.height, i.encoding);
             println!("orientation  {:?}", i.orientation);
@@ -550,7 +561,7 @@ fn develop(
     size: Option<u32>,
     force: bool,
     save_params: bool,
-    merge: bool,
+    burst_mode: Option<Burst>,
     overrides: &Overrides,
 ) -> Result<()> {
     if files.is_empty() {
@@ -559,8 +570,10 @@ fn develop(
     // Resolve each input's output path and format up front.
     let jobs: Vec<(PathBuf, PathBuf, Format)> = match (out, out_dir) {
         (Some(o), None) => {
-            if files.len() != 1 && !merge {
-                bail!("-o takes exactly one input; use --out-dir for several, or --merge");
+            if files.len() != 1 && burst_mode.is_none() {
+                bail!(
+                    "-o takes exactly one input; use --out-dir for several, --merge or --superres"
+                );
             }
             let fmt = format
                 .or_else(|| Format::from_path(o))
@@ -605,19 +618,33 @@ fn develop(
             continue;
         }
         let load = || -> Result<(Source, String)> {
-            if merge {
-                let (merged, shifts) = burst::merge_files(files)?;
-                for ((f, s), (o, w)) in files
-                    .iter()
-                    .zip(&shifts)
-                    .zip(merged.offsets.iter().zip(&merged.mean_weight))
-                {
-                    println!("  {}  {}", f.display(), burst::describe(s, *o, *w));
+            let name = format!("{}+{}", file_name(input), files.len() - 1);
+            match burst_mode {
+                Some(Burst::Merge) => {
+                    let (merged, shifts) = burst::merge_files(files)?;
+                    for ((f, s), (o, w)) in files
+                        .iter()
+                        .zip(&shifts)
+                        .zip(merged.offsets.iter().zip(&merged.mean_weight))
+                    {
+                        println!("  {}  {}", f.display(), burst::describe(s, *o, *w));
+                    }
+                    Ok((Source::Raw(Box::new(merged.frame)), name))
                 }
-                let name = format!("{}+{}", file_name(input), files.len() - 1);
-                Ok((Source::Raw(Box::new(merged.frame)), name))
-            } else {
-                Ok((Source::load(input)?, file_name(input)))
+                Some(Burst::Superres { scale, kernel }) => {
+                    let (rgb, transforms) = burst::reconstruct_files(files, scale, kernel)?;
+                    for ((f, t), w) in files.iter().zip(&transforms).zip(&rgb.mean_weight) {
+                        println!("  {}  {}", f.display(), burst::describe_transform(t, *w));
+                    }
+                    println!(
+                        "  reconstructed {}x{} at {scale}x, kernel {kernel} px, {:.3}% uncovered",
+                        rgb.width,
+                        rgb.height,
+                        rgb.uncovered * 100.0
+                    );
+                    Ok((Source::Rgb(Box::new(rgb)), name))
+                }
+                None => Ok((Source::load(input)?, file_name(input))),
             }
         };
         match develop_one(
@@ -645,6 +672,25 @@ fn develop(
         bail!("{failures} of {} inputs failed", jobs.len());
     }
     Ok(())
+}
+
+/// How `develop` combines several inputs into one image.
+#[derive(Clone, Copy)]
+enum Burst {
+    /// Step 2: robust mean on the sensor plane, then the usual demosaic.
+    Merge,
+    /// Step 3: kernel regression onto the output grid.
+    Superres { scale: u32, kernel: f32 },
+}
+
+impl Burst {
+    fn from_flags(merge: bool, superres: Option<u32>, kernel: f32) -> Option<Burst> {
+        match (merge, superres) {
+            (true, _) => Some(Burst::Merge),
+            (false, Some(scale)) => Some(Burst::Superres { scale, kernel }),
+            (false, None) => None,
+        }
+    }
 }
 
 fn file_name(p: &Path) -> String {
@@ -811,6 +857,12 @@ fn burst_stats(inputs: &[PathBuf], pgm: Option<&Path>) -> Result<()> {
             file_name(f),
             burst::describe(&shifts[i], merged.offsets[i], merged.mean_weight[i])
         );
+    }
+    let t = Instant::now();
+    let transforms = burst::similarity_all(&refs, &shifts)?;
+    println!("similarity fits ({:.1?}):", t.elapsed());
+    for (f, tr) in files.iter().zip(&transforms) {
+        println!("  {}  {}", file_name(f), burst::describe_transform(tr, 1.0));
     }
     let single = merged.noise;
     println!(

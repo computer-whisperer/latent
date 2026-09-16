@@ -30,7 +30,7 @@ use crate::params::{
     sigmoid_constants,
 };
 use crate::sensor::{LensCorrection, SensorFrame};
-use crate::source::{ImageSource, Source};
+use crate::source::{CameraRgb, ImageSource, Source};
 use crate::whitepoint::{self, Temperature, xy_from_temperature};
 
 /// A device and queue the pipeline runs on.
@@ -495,6 +495,51 @@ pub fn sized(width: u32, height: u32, long_edge: u32) -> (u32, u32) {
     }
 }
 
+/// What the colour pass needs from a frame's characterisation and the
+/// chosen white balance.
+struct ColourSetup {
+    /// White-balance multipliers, RGB.
+    wb: [f32; 3],
+    to_working: Mat3,
+    /// Luminance weights in camera WB space: Y row of XYZ←BT.2020
+    /// composed with camera→BT.2020.
+    ylum_cam: [f32; 3],
+}
+
+fn colour_setup(frame: &SensorFrame, params: &DevelopParams) -> Result<ColourSetup> {
+    let white = match params.white_balance {
+        WhiteBalance::AsShot => {
+            whitepoint::white_from_neutral(&frame.matrices, frame.neutral_as_shot())
+        }
+        WhiteBalance::Multipliers { red, blue } => {
+            whitepoint::white_from_neutral(&frame.matrices, [1.0 / red, 1.0, 1.0 / blue])
+        }
+        WhiteBalance::Temperature { kelvin, tint } => whitepoint::white_from_xy(
+            &frame.matrices,
+            xy_from_temperature(Temperature { kelvin, tint }),
+        ),
+    }
+    .context("white balance does not resolve to a valid white")?;
+    let wb = white.multipliers();
+    tracing::debug!(?wb, temperature = ?white.temperature, "white balance");
+    let to_working: Mat3 = white
+        .bt2020_from_camera_wb()
+        .context("camera matrix is singular")?;
+    let ylum_cam = {
+        let y2020 = XYZ_FROM_BT2020[1];
+        let mut w = [0.0f32; 3];
+        for (j, wj) in w.iter_mut().enumerate() {
+            *wj = (0..3).map(|i| y2020[i] * to_working[i][j]).sum();
+        }
+        w
+    };
+    Ok(ColourSetup {
+        wb,
+        to_working,
+        ylum_cam,
+    })
+}
+
 impl Developer {
     pub fn new(gpu: &Gpu) -> Developer {
         use Slot::*;
@@ -845,6 +890,7 @@ impl Developer {
         match source {
             Source::Raw(frame) => self.prepare_raw(gpu, frame, params),
             Source::Image(img) => Ok(Self::prepare_image(gpu, img, params)),
+            Source::Rgb(rgb) => Self::prepare_rgb(gpu, rgb, params),
         }
     }
 
@@ -893,6 +939,69 @@ impl Developer {
         }
     }
 
+    /// A reconstructed burst: camera RGB already on the crop grid (at
+    /// some scale), so only white balance is applied on upload; the
+    /// sensor-space steps downstream (highlights, lens) read the
+    /// reference frame's tables as for a raw.
+    fn prepare_rgb(gpu: &Gpu, rgb: &CameraRgb, params: &DevelopParams) -> Result<Prepared> {
+        let frame = &rgb.frame;
+        let ColourSetup {
+            wb,
+            to_working,
+            ylum_cam,
+        } = colour_setup(frame, params)?;
+        let size = wgpu::Extent3d {
+            width: rgb.width,
+            height: rgb.height,
+            depth_or_array_layers: 1,
+        };
+        let cam_rgb = texture(
+            &gpu.device,
+            "idev::cam_rgb",
+            size,
+            wgpu::TextureFormat::Rgba16Float,
+            wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
+        );
+        let wbh = wb.map(f16::from_f32);
+        let balanced: Vec<f16> = rgb
+            .rgba
+            .chunks_exact(4)
+            .flat_map(|p| [p[0] * wbh[0], p[1] * wbh[1], p[2] * wbh[2], p[3]])
+            .collect();
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &cam_rgb.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&balanced),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(rgb.width * 8),
+                rows_per_image: Some(rgb.height),
+            },
+            size,
+        );
+        Ok(Prepared {
+            width: rgb.width,
+            height: rgb.height,
+            white_balance: params.white_balance,
+            demosaic: params.demosaic,
+            impulse: params.denoise.impulse.clamp(0.0, 1.0),
+            is_image: false,
+            orientation: frame.orientation,
+            wb,
+            to_working,
+            ylum_cam,
+            lens: frame.lens.clone(),
+            cam_rgb,
+            denoised: RefCell::new(None),
+        })
+    }
+
     fn prepare_raw(
         &self,
         gpu: &Gpu,
@@ -902,21 +1011,11 @@ impl Developer {
         let device = &gpu.device;
         let queue = &gpu.queue;
 
-        let white = match params.white_balance {
-            WhiteBalance::AsShot => {
-                whitepoint::white_from_neutral(&frame.matrices, frame.neutral_as_shot())
-            }
-            WhiteBalance::Multipliers { red, blue } => {
-                whitepoint::white_from_neutral(&frame.matrices, [1.0 / red, 1.0, 1.0 / blue])
-            }
-            WhiteBalance::Temperature { kelvin, tint } => whitepoint::white_from_xy(
-                &frame.matrices,
-                xy_from_temperature(Temperature { kelvin, tint }),
-            ),
-        }
-        .context("white balance does not resolve to a valid white")?;
-        let wb = white.multipliers();
-        tracing::debug!(?wb, temperature = ?white.temperature, "white balance");
+        let ColourSetup {
+            wb,
+            to_working,
+            ylum_cam,
+        } = colour_setup(frame, params)?;
         let mut black = [0.0f32; 4];
         let mut scale = [0.0f32; 4];
         for pos in 0..4 {
@@ -931,19 +1030,6 @@ impl Developer {
             black[pos] = frame.black[pos];
             scale[pos] = wb[frame.cfa[pos] as usize] / range;
         }
-        let to_working: Mat3 = white
-            .bt2020_from_camera_wb()
-            .context("camera matrix is singular")?;
-        // Luminance weights in camera WB space: Y row of XYZ←BT.2020
-        // composed with camera→BT.2020.
-        let ylum_cam = {
-            let y2020 = XYZ_FROM_BT2020[1];
-            let mut w = [0.0f32; 3];
-            for (j, wj) in w.iter_mut().enumerate() {
-                *wj = (0..3).map(|i| y2020[i] * to_working[i][j]).sum();
-            }
-            w
-        };
         let cfa = frame.cfa.map(|c| c as u32);
         let crop = frame.crop;
         let (out_w, out_h) = (crop.width, crop.height);
