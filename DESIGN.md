@@ -1253,6 +1253,54 @@ the window, untested); the robustness allowance scales with the
 gradient and let 5 px ghosts through before the fix, now moot with a
 correct field but still generous.
 
+### Resolution test attempts (2026-09-16)
+
+Three more sets, none a resolution test yet, each for a different
+reason; and one instrument that finally gives a yes/no answer.
+
+- **Room at f/8 and f/16, 1/160 s, ISO 320 (DSC01687–1722).** f/16:
+  green median 4 DN, pure noise. f/8: median 14 DN, a quarter of the
+  frame above 100 DN, single-frame edges 2.5–4.5 px. Stopping down
+  removed the light; the room holds no detail near Nyquist. The field
+  corrected ~105 of 117 tiles with 1–2 px mean and up to 10 px
+  (parallax between shelves and wall), so the field is earning its
+  place in rooms. The step-2 merge through RCD denoised better than
+  the 2× kernel regression (0.9 vs 1.3 codes): with no resolution to
+  gain, the merge is the better tool. The f/8 frame's sharpest edges
+  (2.5 px) beat f/2.8's (3.2 px): the lens does sharpen stopped down.
+- **Mesh chair, 17 frames, 1/100 s, f/5, ISO 3200 (DSC01737–1753).**
+  Exposure right at last (green median 257 DN, p90 2440, no clipping)
+  but the black mesh sits at 16/255 in the develop. Weave pitch
+  5.9–6.2 px. The 17-frame reconstruction at kernel 0.35 shows a
+  fine dot lattice the single frames and the 17-frame merge do not,
+  and its spectrum holds a forest of peaks above 0.16 cycles per 2×
+  px at ~12× local background. That looked like super-resolution.
+  It is not: **the half-split coherence test** (odd and even frames
+  reconstructed separately onto the same reference, normalised
+  cross-spectrum per band, CFA-locked frequencies excluded) gives
+  0.94 in the weave band and 0.10–0.16 above 0.2 cycles per 2× px,
+  against 0.10 on a flat wall. The high band is not reproducible
+  between halves, i.e. noise plus sampling artefacts: texture
+  multiplied by the uneven union of 17 shifted CFA lattices produces
+  sidebands that a narrow kernel passes, and the per-pixel
+  normalisation removes the gain modulation but not the bandwidth
+  modulation. A single-frame kernel regression also carries a
+  texture-locked peak at the CFA frequency (82× background in the
+  mesh, 1× on the wall), 3× weaker with 17 frames.
+- **What this means.** (1) A narrow-kernel multi-frame reconstruction
+  can manufacture convincing fine texture; no visual or single-image
+  spectral metric catches it, the split does. The coherence test
+  should gate any resolution claim and belongs in the CLI. (2) At low
+  SNR the reconstruction's high band is untrustworthy; the robust
+  merge plus RCD is the safer default, and kernel width should widen
+  with noise or with sample sparsity (Wronski's adaptive kernel is
+  about this, not only about edges). (3) The shoot still owed:
+  daylight, f/5.6, ISO ≤ 800, a textured subject at a quarter of
+  white or brighter, single-frame edges 1–1.5 px; then the split
+  coherence above 0.25 cycles per 2× px is the pass/fail.
+- Oddity noted, not chased: the two merged halves cohere at only 0.38
+  in the weave band where the reconstructions reach 0.94.
+
 ## Milestones
 
 1. **Pipeline proof (CLI only).** Workspace, rawler unpack of an a6700
