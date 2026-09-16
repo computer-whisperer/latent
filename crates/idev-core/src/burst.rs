@@ -15,7 +15,7 @@
 //!   more than the noise model allows.
 
 use std::cmp::Ordering;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
@@ -92,6 +92,42 @@ fn continues(prev: &ExifSummary, cur: &ExifSummary) -> bool {
         && prev.iso == cur.iso
         && prev.f_number == cur.f_number
         && prev.focal_length_mm == cur.focal_length_mm
+}
+
+/// The burst `path` leads, itself first, found by walking its
+/// neighbours by name in its folder while the burst rule holds (a
+/// summary read per neighbour, plus one past each end). `summary` is
+/// the file's own. A file that is not a burst's first frame, or not in
+/// one, is alone.
+pub fn members_of(path: &Path, summary: &ExifSummary) -> Result<Vec<PathBuf>> {
+    if summary.sequence.is_none() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut siblings: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("list {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| crate::source::is_raw(p))
+        .collect();
+    siblings.sort();
+    let Some(at) = siblings.iter().position(|p| p == path) else {
+        return Ok(vec![path.to_path_buf()]);
+    };
+    // Led by an earlier frame: not a leader.
+    if at > 0 && continues(&sensor::summary(&siblings[at - 1])?, summary) {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let mut members = vec![path.to_path_buf()];
+    let mut prev = summary.clone();
+    for next in &siblings[at + 1..] {
+        let cur = sensor::summary(next)?;
+        if !continues(&prev, &cur) {
+            break;
+        }
+        members.push(next.clone());
+        prev = cur;
+    }
+    Ok(members)
 }
 
 // ---------------------------------------------------------------------
@@ -1639,10 +1675,32 @@ pub fn describe_transform(t: &Transform, weight: f32) -> String {
 pub fn merge_files(paths: &[impl AsRef<Path>]) -> Result<(Merged, Vec<Shift>)> {
     ensure!(paths.len() >= 2, "a burst needs at least two frames");
     let frames = load_all(paths)?;
+    merge_frames(&frames)
+}
+
+/// Align each frame to the first and merge.
+pub fn merge_frames(frames: &[SensorFrame]) -> Result<(Merged, Vec<Shift>)> {
+    ensure!(frames.len() >= 2, "a burst needs at least two frames");
     let refs: Vec<&SensorFrame> = frames.iter().collect();
     let shifts = align_all(&refs)?;
     let merged = merge(&refs, &shifts)?;
     Ok((merged, shifts))
+}
+
+/// How a burst's files are named in reports and the develop note:
+/// the reference, then the others, then the count.
+pub fn source_name(paths: &[impl AsRef<Path>]) -> String {
+    let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    let mut names = paths.iter().filter_map(|p| name(p.as_ref()));
+    let Some(first) = names.next() else {
+        return String::new();
+    };
+    let rest: Vec<String> = names.collect();
+    if rest.is_empty() {
+        first
+    } else {
+        format!("{first} + {} ({} frames)", rest.join(", "), rest.len() + 1)
+    }
 }
 
 /// Unpack every file, in parallel.

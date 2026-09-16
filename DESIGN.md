@@ -1299,7 +1299,81 @@ reason; and one instrument that finally gives a yes/no answer.
   white or brighter, single-frame edges 1–1.5 px; then the split
   coherence above 0.25 cycles per 2× px is the pass/fail.
 - Oddity noted, not chased: the two merged halves cohere at only 0.38
-  in the weave band where the reconstructions reach 0.94.
+  in the weave band where the reconstructions reach 0.94. Likely cause
+  (unverified): each half was merged onto its own reference, and the
+  two references differ by a sub-pixel shift the even-pixel merge
+  cannot remove; a 1 px offset at 0.2 cycles/px costs cos 72° ≈ 0.3.
+  The reconstructions shared one reference.
+
+### Merge in the GUI (2026-09-16)
+
+Back to the night sets, and to shipping what works on them: the
+step-2 merge (global even-pixel shift, robust mean, then the usual
+demosaic).
+
+**Corner check first.** The similarity fits report rotations up to
+0.17° and one 0.9 % scale on the 0.6 s set, which would put a frame's
+corners 6–37 px off the global shift. Reproducing the merge's own
+weighting per 800 px region (nine regions across the crop) for the
+global shift and for the fitted similarity rounded per pixel to an
+even offset:
+
+| set, frame | global: mean w, rejected | similarity: mean w, rejected | achieved σ gain |
+|---|---|---|---|
+| DSC01233 set, 1234 (rot −0.12°) | 0.92–0.95, 0.4–2.6 % | 0.93–0.95, 0.4–1.2 % | 2.2–2.7 (√6 = 2.45) |
+| DSC01126 set, 1130 (scale 1.009) | 0.89–0.95, 0–5.9 % | 0.90–0.95, 0–4.6 % | 2.4–2.7 (√7 = 2.65) |
+
+The merged plane reaches the full √N noise gain in every region,
+corners included: the scenes are dark and flat, and the few percent
+of misaligned structure (lights, edges) fall back to the reference
+where shot noise dominates anyway. The 0.9 % scale did not improve
+frame 1130's corners, so that fit is wrong (soft 0.6 s frames). The
+global-shift merge is what to integrate; a field-driven merge is not
+needed for night bursts. Script: scratchpad `night/corner_check.py`.
+
+**Design.**
+
+- `DevelopParams.stack: bool` (default true): when the image leads a
+  continuous-drive burst, develop the burst merged onto it. Per image,
+  in the sidecar, so a burst can be switched back to its single frame
+  and compared. The CLI's `--merge` declares its inputs one burst; it
+  does not group siblings (a folder scan is ~270 ms per file on ceph).
+- The session holds the burst's member paths, the single reference
+  frame and, once it lands, the merge. The members come from the
+  library's grouping while its Stack view is on; a file opened before
+  its summary arrived, or directly (`idev-gui FILE`), has the load
+  thread find them with `burst::members_of`, which walks the folder's
+  raws by name from the file while the burst rule holds (one summary
+  read per member plus one past each end; 8 reads in ~1 s on ceph for
+  the 7-frame set). A file that is not its burst's first frame is
+  alone. `idev develop --merge FILE` with one input uses the same
+  lookup. The reference shows
+  immediately as before; the merge runs on its own thread
+  (`burst::merge_files` over the members, reloading the reference:
+  ~0.1 s of ~2 s for seven frames) and replaces it. `stack` off shows
+  the single frame; toggling on starts the merge if it has not run.
+  The GPU state is cleared whenever the shown source changes, since
+  `Prepared::matches` keys on parameters only.
+- The develop note names every member (`burst::source_name`), so an
+  exported file says what it was merged from. Exports and the
+  clipboard use whatever the session shows.
+- Sidebar: a Burst group (only for bursts) with the switch and the
+  merge's state (merging, merged from N frames with the mean
+  robustness weight, or the error).
+- Verified on DSC01126 (`idev-gui FILE`): file loaded in 154 ms,
+  burst lookup 83 ms, seven frames merged in 1.3 s, the preview
+  re-prepared on the swap; screenshot shows the "×7" title and the
+  Burst group reading "merged from 7 frames · mean weight 0.97". The
+  CLI's single-input `--merge` finds the same seven and refuses a
+  non-leader; the exported JPEG's note names all seven files.
+- Fixed beside this: `idev-gui FILE` indexed the file's position in
+  `files` but opened `view[selected]`, so with hidden JPEG pairs it
+  opened a different file (DSC01128 for DSC01126).
+- Not in this chunk: an edited burst's regenerated thumbnail is
+  developed from the single raw (the thumbnail worker does not merge);
+  a merged-plane cache; choosing the sharpest frame as reference; the
+  merged plane stays u16 (rounding adds 0.29 DN against a merged floor
+  near 0.6 DN).
 
 ## Milestones
 

@@ -145,6 +145,10 @@ pub struct DevelopParams {
     pub geometry: Geometry,
     pub sharpen: Sharpen,
     pub denoise: Denoise,
+    /// When the image leads a continuous-drive burst (`burst::group`),
+    /// develop the burst merged onto it (`burst::merge`) instead of the
+    /// single frame. Meaningless, and ignored, outside a burst.
+    pub stack: bool,
 }
 
 /// Noise reduction: an impulse filter on the sensor plane before
@@ -246,6 +250,7 @@ impl Default for DevelopParams {
             geometry: Geometry::default(),
             sharpen: Sharpen::default(),
             denoise: Denoise::default(),
+            stack: true,
         }
     }
 }

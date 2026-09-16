@@ -629,9 +629,21 @@ fn develop(
             continue;
         }
         let load = || -> Result<(Source, String)> {
-            let name = format!("{}+{}", file_name(input), files.len() - 1);
+            let name = burst::source_name(files);
             match burst_mode {
                 Some(Burst::Merge) => {
+                    // One input: the burst it leads, from its neighbours.
+                    let found;
+                    let files: &[PathBuf] = if files.len() == 1 {
+                        found = burst::members_of(input, &sensor::summary(input)?)?;
+                        if found.len() < 2 {
+                            bail!("{}: not the first frame of a burst", input.display());
+                        }
+                        &found
+                    } else {
+                        files
+                    };
+                    let name = burst::source_name(files);
                     let (merged, shifts) = burst::merge_files(files)?;
                     for ((f, s), (o, w)) in files
                         .iter()

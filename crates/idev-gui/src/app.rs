@@ -387,13 +387,41 @@ impl Drop for Library {
     }
 }
 
+/// The burst merge of the open session (`burst::merge_files` over the
+/// members, on its own thread).
+enum Merge {
+    /// Not started: not a burst, or the single frame was wanted.
+    Idle,
+    Running(Receiver<Result<burst::Merged>>),
+    /// Landed; `weight` is the mean robustness weight of the other
+    /// frames (1 when they agreed with the reference everywhere).
+    Done {
+        weight: f32,
+    },
+    Failed(String),
+}
+
+/// What the session's load thread sends: the file, then (when the
+/// caller did not know them) the burst's members.
+enum Loading {
+    Frame(Result<Source>),
+    Members(Result<Vec<PathBuf>>),
+}
+
 /// The raw open in develop mode.
 struct Session {
     index: usize,
     path: PathBuf,
     name: String,
-    frame: Option<Arc<Source>>,
-    load_rx: Receiver<Result<Source>>,
+    /// The burst this file leads, itself first; one entry outside
+    /// bursts (or with the library's Stack view off).
+    members: Vec<PathBuf>,
+    /// The file itself, once unpacked.
+    single: Option<Arc<Source>>,
+    /// The burst merged onto it, once the merge lands.
+    merged: Option<Arc<Source>>,
+    merge: Merge,
+    load_rx: Receiver<Loading>,
     load_error: Option<String>,
     params: DevelopParams,
     sidecar: SidecarWriter,
@@ -402,39 +430,121 @@ struct Session {
 }
 
 impl Session {
-    fn open(index: usize, path: PathBuf, wakeup: &SharedWakeup) -> Result<Session> {
+    /// `members` is the burst the file leads when the library knows it;
+    /// `None` (a file opened directly) has the load thread find it from
+    /// the file's neighbours once the file is unpacked.
+    fn open(
+        index: usize,
+        path: PathBuf,
+        members: Option<Vec<PathBuf>>,
+        wakeup: &SharedWakeup,
+    ) -> Result<Session> {
         let params = DevelopParams::for_raw(&path)?;
         let (tx, load_rx) = channel();
         {
             let path = path.clone();
             let wakeup = wakeup.clone();
+            let find_members = members.is_none();
             std::thread::Builder::new()
                 .name("idev-unpack".into())
                 .spawn(move || {
                     let t = Instant::now();
                     let r = Source::load(&path);
                     tracing::info!("loaded in {:.0?}", t.elapsed());
-                    let _ = tx.send(r);
+                    let exif = r.as_ref().ok().map(|s| s.exif().clone());
+                    let _ = tx.send(Loading::Frame(r));
                     wake(&wakeup);
+                    if let (true, Some(exif)) = (find_members, exif) {
+                        let t = Instant::now();
+                        let r = burst::members_of(&path, &exif);
+                        tracing::info!("burst lookup in {:.0?}", t.elapsed());
+                        let _ = tx.send(Loading::Members(r));
+                        wake(&wakeup);
+                    }
                 })
                 .context("spawn unpack thread")?;
         }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
         let sidecar = SidecarWriter::spawn(sidecar_path(&path));
-        Ok(Session {
+        let mut session = Session {
             index,
-            path,
-            name,
-            frame: None,
+            path: path.clone(),
+            name: String::new(),
+            members: vec![path],
+            single: None,
+            merged: None,
+            merge: Merge::Idle,
             load_rx,
             load_error: None,
             params,
             sidecar,
             edited: false,
-        })
+        };
+        session.set_members(members.unwrap_or_else(|| session.members.clone()), wakeup);
+        Ok(session)
+    }
+
+    /// The burst is known: name the session after it and start the
+    /// merge when the parameters want it.
+    fn set_members(&mut self, members: Vec<PathBuf>, wakeup: &SharedWakeup) {
+        self.members = members;
+        self.name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if self.members.len() > 1 {
+            self.name.push_str(&format!(" ×{}", self.members.len()));
+        }
+        if self.params.stack {
+            self.start_merge(wakeup);
+        }
+    }
+
+    /// Whether the merge is what this session develops (once it lands).
+    fn stacked(&self) -> bool {
+        self.members.len() > 1 && self.params.stack
+    }
+
+    /// What the session develops: the merge when wanted and landed,
+    /// else the file itself.
+    fn frame(&self) -> Option<Arc<Source>> {
+        if self.stacked()
+            && let Some(m) = &self.merged
+        {
+            return Some(m.clone());
+        }
+        self.single.clone()
+    }
+
+    /// Names the shown source for the develop note.
+    fn source_name(&self) -> String {
+        if self.stacked() && self.merged.is_some() {
+            burst::source_name(&self.members)
+        } else {
+            burst::source_name(&self.members[..1])
+        }
+    }
+
+    /// Start the merge unless it has run or is running.
+    fn start_merge(&mut self, wakeup: &SharedWakeup) {
+        if self.members.len() < 2 || !matches!(self.merge, Merge::Idle) {
+            return;
+        }
+        let (tx, rx) = channel();
+        let members = self.members.clone();
+        let wakeup = wakeup.clone();
+        match std::thread::Builder::new()
+            .name("idev-merge".into())
+            .spawn(move || {
+                let t = Instant::now();
+                let r = burst::merge_files(&members).map(|(m, _)| m);
+                tracing::info!("merged {} frames in {:.1?}", members.len(), t.elapsed());
+                let _ = tx.send(r);
+                wake(&wakeup);
+            }) {
+            Ok(_) => self.merge = Merge::Running(rx),
+            Err(e) => self.merge = Merge::Failed(format!("spawn merge thread: {e}")),
+        }
     }
 }
 
@@ -593,11 +703,13 @@ impl IdevApp {
                 .context("spawn cache sweep")?;
         }
         let thumb_gpu = Arc::new(ThumbGpu::default());
+        let library = Library::open(dir, files, wakeup.clone(), cache.clone(), thumb_gpu.clone());
+        // `selected` indexes the view, which can hide files (JPEG
+        // pairs, burst frames): position within it, not within `files`.
         let selected = file
             .as_ref()
-            .and_then(|f| files.iter().position(|p| p == f))
-            .unwrap_or(0);
-        let library = Library::open(dir, files, wakeup.clone(), cache.clone(), thumb_gpu.clone());
+            .and_then(|f| library.view.iter().position(|&i| library.files[i] == *f));
+        let selected = selected.unwrap_or(0);
         let mut app = Self {
             library,
             notice: None,
@@ -648,7 +760,12 @@ impl IdevApp {
             tint: Scrub::default(),
         };
         if let Some(file) = file {
-            if app.library.files.get(selected) == Some(&file) {
+            let shown = app
+                .library
+                .view
+                .get(selected)
+                .map(|&i| &app.library.files[i]);
+            if shown == Some(&file) {
                 app.open_selected();
             } else {
                 anyhow::bail!(
@@ -751,7 +868,23 @@ impl IdevApp {
             return;
         }
         self.close_session();
-        match Session::open(index, path, &self.wakeup) {
+        let lib = &self.library;
+        // With the Stack view on, a shown raw is a leader or alone;
+        // before its summary has arrived the burst is unknown and the
+        // session looks for it. With the view off every file is alone.
+        let members: Option<Vec<PathBuf>> = if !lib.stack {
+            Some(vec![path.clone()])
+        } else if lib.exifs[index].is_some() || !source::is_raw(&path) {
+            Some(
+                std::iter::once(index)
+                    .chain((0..lib.files.len()).filter(|&i| lib.burst_lead[i] == Some(index)))
+                    .map(|i| lib.files[i].clone())
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        match Session::open(index, path, members, &self.wakeup) {
             Ok(s) => {
                 self.session = Some(s);
                 self.mode = Mode::Develop;
@@ -821,7 +954,8 @@ impl IdevApp {
         self.contrast.set(c, 2);
         self.hue.set(h, 2);
         self.white.set(w, 2);
-        let raw = s.frame.as_deref().and_then(Source::as_raw);
+        let frame = s.frame();
+        let raw = frame.as_deref().and_then(Source::as_raw);
         let temp = match (s.params.white_balance, raw) {
             (WhiteBalance::Temperature { kelvin, tint }, _) => Some(Temperature { kelvin, tint }),
             (WhiteBalance::AsShot, Some(f)) => {
@@ -846,6 +980,21 @@ impl IdevApp {
             s.edited = true;
         }
         wake(&self.wakeup);
+    }
+
+    /// The session shows a different source (its file landed, the
+    /// merge did, or the stack switch flipped): drop the resident GPU
+    /// data, which `Prepared::matches` keys on parameters alone.
+    fn source_changed(&mut self) {
+        if let Some(g) = self.gpu.as_mut() {
+            g.clear();
+        }
+        self.histogram = None;
+        // The host runs before_paint ahead of before_build in a frame,
+        // so the texture for this frame can only be made in the next
+        // one: ask for it.
+        wake(&self.wakeup);
+        self.seed_controls();
     }
 
     fn reset_params(&mut self) {
@@ -888,10 +1037,14 @@ impl IdevApp {
     /// on a worker with its own headless device.
     fn export(&mut self, kind: ExportKind) {
         let Some(s) = &self.session else { return };
-        let Some(frame) = s.frame.clone() else {
+        let Some(frame) = s.frame() else {
             self.toasts.push(ToastSpec::info("still loading"));
             return;
         };
+        if s.stacked() && s.merged.is_none() {
+            self.toasts.push(ToastSpec::info("still merging"));
+            return;
+        }
         let params = s.params.clone();
         let long_edge = copy_edge(&self.export_edge);
         let stem = s
@@ -900,7 +1053,7 @@ impl IdevApp {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "image".into());
         let dir = s.path.parent().map(Path::to_path_buf).unwrap_or_default();
-        let name = s.name.clone();
+        let name = s.source_name();
         let (tx, rx) = channel();
         self.export_rx.push(rx);
         self.exports_running += 1;
@@ -932,7 +1085,7 @@ impl IdevApp {
 
     fn open_copy_dialog(&mut self) {
         let Some(s) = &self.session else { return };
-        if s.frame.is_none() {
+        if s.frame().is_none() {
             self.toasts.push(ToastSpec::info("still loading"));
             return;
         }
@@ -984,9 +1137,13 @@ impl IdevApp {
     fn copy_to_clipboard(&mut self) {
         let Some(copy) = self.copy.take() else { return };
         let Some(s) = &self.session else { return };
-        let Some(frame) = s.frame.clone() else { return };
+        let Some(frame) = s.frame() else { return };
+        if s.stacked() && s.merged.is_none() {
+            self.toasts.push(ToastSpec::info("still merging"));
+            return;
+        }
         let params = s.params.clone();
-        let name = s.name.clone();
+        let name = s.source_name();
         let long_edge = copy_edge(&copy.edge);
         let kind = copy.kind;
         let (tx, rx) = channel();
@@ -1027,25 +1184,36 @@ impl IdevApp {
         if self.library.drain() && self.library.view_uses_metadata() {
             self.refresh_view();
         }
-        let mut loaded = false;
-        if let Some(s) = self.session.as_mut()
-            && s.frame.is_none()
-        {
-            match s.load_rx.try_recv() {
-                Ok(Ok(frame)) => {
-                    s.frame = Some(Arc::new(frame));
-                    loaded = true;
+        // The shown source changed: the file landed, or the merge did.
+        let mut changed = false;
+        if let Some(s) = self.session.as_mut() {
+            while let Ok(loaded) = s.load_rx.try_recv() {
+                match loaded {
+                    Loading::Frame(Ok(frame)) => {
+                        s.single = Some(Arc::new(frame));
+                        changed = true;
+                    }
+                    Loading::Frame(Err(e)) => s.load_error = Some(format!("{e:#}")),
+                    Loading::Members(Ok(members)) => s.set_members(members, &self.wakeup),
+                    Loading::Members(Err(e)) => s.merge = Merge::Failed(format!("{e:#}")),
                 }
-                Ok(Err(e)) => s.load_error = Some(format!("{e:#}")),
-                Err(_) => {}
+            }
+            if let Merge::Running(rx) = &s.merge {
+                match rx.try_recv() {
+                    Ok(Ok(m)) => {
+                        let others = &m.mean_weight[1..];
+                        let weight = others.iter().sum::<f32>() / others.len().max(1) as f32;
+                        s.merged = Some(Arc::new(Source::Raw(Box::new(m.frame))));
+                        s.merge = Merge::Done { weight };
+                        changed |= s.params.stack;
+                    }
+                    Ok(Err(e)) => s.merge = Merge::Failed(format!("{e:#}")),
+                    Err(_) => {}
+                }
             }
         }
-        if loaded {
-            // The host runs before_paint ahead of before_build in a
-            // frame, so the texture for this frame can only be made in
-            // the next one: ask for it.
-            wake(&self.wakeup);
-            self.seed_controls();
+        if changed {
+            self.source_changed();
         }
         let mut done = Vec::new();
         for (i, rx) in self.export_rx.iter().enumerate() {
@@ -1292,7 +1460,7 @@ impl IdevApp {
     /// The sidebar in info mode: every metadata group as name/value rows.
     fn metadata_panel(&self, s: &Session) -> El {
         let mut sections: Vec<El> = Vec::new();
-        match &s.frame {
+        match s.frame() {
             None => sections.push(sidebar_group([text("loading…").muted()])),
             Some(f) if f.metadata().is_empty() => {
                 sections.push(sidebar_group([text("no metadata").muted()]))
@@ -1341,7 +1509,7 @@ impl IdevApp {
         };
 
         let mut info: Vec<El> = Vec::new();
-        if let Some(f) = &s.frame {
+        if let Some(f) = s.frame() {
             if let Source::Image(i) = f.as_ref() {
                 info.push(text(i.encoding.clone()).caption().muted());
             }
@@ -1398,6 +1566,9 @@ impl IdevApp {
                 ),
             ]),
         ];
+        if s.members.len() > 1 {
+            sections.push(sidebar_group(burst_group(s)));
+        }
         if is_raw {
             sections.push(sidebar_group([
                 sidebar_group_label("White balance"),
@@ -1581,7 +1752,7 @@ impl IdevApp {
     }
 
     fn canvas(&self, s: &Session) -> El {
-        let Some(frame) = &s.frame else {
+        let Some(frame) = s.frame() else {
             let msg = match &s.load_error {
                 Some(e) => text(e.clone()).text_color(tokens::DESTRUCTIVE),
                 None => text(format!("Unpacking {}…", s.name)).muted(),
@@ -1758,7 +1929,7 @@ impl IdevApp {
     /// The ctrl-C dialog: encoding and size for the clipboard offer.
     fn copy_modal(&self, s: &Session) -> Option<El> {
         let copy = self.copy.as_ref()?;
-        let size = s.frame.as_ref().map(|frame| {
+        let size = s.frame().map(|frame| {
             let layout = geometry::layout(frame.size(), frame.orientation(), &s.params.geometry);
             let (w, h) = (layout.width, layout.height);
             match copy_edge(&copy.edge) {
@@ -1870,7 +2041,7 @@ impl IdevApp {
             // Refit an existing crop to the new ratio about its centre.
             if let Some(r) = aspect.ratio()
                 && let Some(s) = self.session.as_mut()
-                && let (Some(frame), Some([x, y, w, h])) = (&s.frame, s.params.geometry.crop)
+                && let (Some(frame), Some([x, y, w, h])) = (s.frame(), s.params.geometry.crop)
             {
                 let view = geometry::oriented_size(frame.size(), frame.orientation());
                 let (vw, vh) = (view.0 as f32, view.1 as f32);
@@ -1898,7 +2069,7 @@ impl IdevApp {
                     if let (Some(anchor), Some(to)) =
                         (self.crop_anchor, Self::image_fraction(event))
                         && let Some(s) = self.session.as_mut()
-                        && let Some(frame) = &s.frame
+                        && let Some(frame) = s.frame()
                     {
                         let view = geometry::oriented_size(frame.size(), frame.orientation());
                         let rect = self.crop_from_drag(anchor, to, view);
@@ -2161,6 +2332,14 @@ impl IdevApp {
             self.params_changed();
             return;
         }
+        if switch::apply_event(&mut s.params.stack, event, "stack") {
+            if s.params.stack {
+                s.start_merge(&self.wakeup);
+            }
+            self.params_changed();
+            self.source_changed();
+            return;
+        }
         let mut tone_kind = String::new();
         if tabs::apply_event(&mut tone_kind, event, "tone", |s| Some(s.to_string())) {
             s.params.tone = match tone_kind.as_str() {
@@ -2397,7 +2576,7 @@ impl WinitWgpuApp for IdevApp {
             return;
         }
         let Some(s) = &self.session else { return };
-        let Some(frame) = s.frame.clone() else {
+        let Some(frame) = s.frame() else {
             return;
         };
         let params = self.preview_params(s);
@@ -2485,13 +2664,34 @@ impl WinitWgpuApp for IdevApp {
     }
 }
 
+/// The burst sidebar group: the stack switch and the merge's state.
+fn burst_group(s: &Session) -> Vec<El> {
+    let n = s.members.len();
+    let state = match (&s.merge, s.params.stack) {
+        (Merge::Failed(e), _) => text(e.clone()).caption().text_color(tokens::DESTRUCTIVE),
+        (Merge::Idle, _) => text("single frame").caption().muted(),
+        (Merge::Running(_), true) => text("merging…").caption().muted(),
+        (Merge::Running(_), false) => text("single frame · merging…").caption().muted(),
+        (Merge::Done { weight }, true) => {
+            text(format!("merged from {n} frames · mean weight {weight:.2}"))
+                .caption()
+                .muted()
+        }
+        (Merge::Done { .. }, false) => text("single frame · merge ready").caption().muted(),
+    };
+    vec![
+        sidebar_group_label("Burst"),
+        field_row(format!("Merge {n} frames"), switch("stack", s.params.stack)),
+        state,
+    ]
+}
+
 /// The lens sidebar group: three switches, or a note when the file has
 /// no correction tables.
 fn lens_group(s: &Session) -> Vec<El> {
     let mut items = vec![sidebar_group_label("Lens")];
     match s
-        .frame
-        .as_ref()
+        .frame()
         .map(|f| f.as_raw().is_some_and(|r| r.lens.is_some()))
     {
         Some(true) => {
