@@ -1241,9 +1241,19 @@ impl Developer {
     /// Output size of the colour pass for a downscale factor.
     /// The output geometry (orientation, straighten, crop) for `params`.
     pub fn layout(prepared: &Prepared, params: &DevelopParams) -> Layout {
+        let inset = match &prepared.lens {
+            Some(l) => l.valid_inset(
+                prepared.width,
+                prepared.height,
+                params.lens.distortion,
+                params.lens.chromatic_aberration,
+            ),
+            None => (0.0, 0.0),
+        };
         geometry::layout(
             (prepared.width, prepared.height),
             prepared.orientation,
+            inset,
             &params.geometry,
         )
     }

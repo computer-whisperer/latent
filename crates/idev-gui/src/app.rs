@@ -1764,11 +1764,7 @@ impl IdevApp {
                 .justify(Justify::Center)
                 .fill_size();
         };
-        let shown = geometry::layout(
-            frame.size(),
-            frame.orientation(),
-            &self.preview_params(s).geometry,
-        );
+        let shown = frame.layout(&s.params.lens, &self.preview_params(s).geometry);
         let (w, h) = (shown.width as f32, shown.height as f32);
         let content = match self.gpu.as_ref().and_then(|g| g.preview.as_ref()) {
             Some(p) => surface(p.texture.clone())
@@ -1787,7 +1783,7 @@ impl IdevApp {
             // The dimming outside it is done by the colour pass
             // (`Render::dim_outside`): translucent fills over an app
             // surface do not composite darker in damascene 0.8.
-            let real = geometry::layout(frame.size(), frame.orientation(), &s.params.geometry);
+            let real = frame.layout(&s.params.lens, &s.params.geometry);
             let [cx, cy, cw, ch] = real.crop;
             let gap = || column(Vec::<El>::new());
             let overlay = column([
@@ -1931,7 +1927,7 @@ impl IdevApp {
     fn copy_modal(&self, s: &Session) -> Option<El> {
         let copy = self.copy.as_ref()?;
         let size = s.frame().map(|frame| {
-            let layout = geometry::layout(frame.size(), frame.orientation(), &s.params.geometry);
+            let layout = frame.layout(&s.params.lens, &s.params.geometry);
             let (w, h) = (layout.width, layout.height);
             match copy_edge(&copy.edge) {
                 Some(edge) => idev_core::gpu::sized(w, h, edge),
@@ -2583,7 +2579,7 @@ impl WinitWgpuApp for IdevApp {
         let params = self.preview_params(s);
         let dim_outside = self
             .crop_mode
-            .then(|| geometry::layout(frame.size(), frame.orientation(), &s.params.geometry).crop);
+            .then(|| frame.layout(&s.params.lens, &s.params.geometry).crop);
         let render = Render {
             target: OutputTarget { peak: self.peak() },
             scale: self.wanted_scale(),

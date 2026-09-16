@@ -235,6 +235,114 @@ fn lens_correction(tiff: &GenericTiffReader) -> Option<LensCorrection> {
     })
 }
 
+impl LensCorrection {
+    /// Table value at normalised radius `r`: linear between knots,
+    /// clamped, as the colour pass samples it.
+    fn spline(&self, table: &[f32], r: f32) -> f32 {
+        let k = &self.knots;
+        if k.is_empty() || table.is_empty() {
+            return 1.0;
+        }
+        if r <= k[0] {
+            return table[0];
+        }
+        for i in 1..k.len().min(table.len()) {
+            if r <= k[i] {
+                let t = (r - k[i - 1]) / (k[i] - k[i - 1]).max(1e-6);
+                return table[i - 1] + (table[i] - table[i - 1]) * t;
+            }
+        }
+        table[k.len().min(table.len()) - 1]
+    }
+
+    /// The largest source-over-output radius factor any enabled
+    /// channel uses at normalised radius `r`: how far past its own
+    /// position an output pixel there samples.
+    pub fn reach(&self, r: f32, distortion: bool, chromatic_aberration: bool) -> f32 {
+        let d = if distortion {
+            self.spline(&self.distortion, r)
+        } else {
+            1.0
+        };
+        if chromatic_aberration {
+            let red = self.spline(&self.ca_red, r);
+            let blue = self.spline(&self.ca_blue, r);
+            d * red.max(blue).max(1.0)
+        } else {
+            d
+        }
+    }
+
+    /// Pixels to take off each side of a `width × height` camera RGB
+    /// frame so that every remaining pixel's corrected source lies
+    /// inside the frame: outside that, the colour pass samples clamped
+    /// at the edge and smears it into a stretched fringe. The same on
+    /// both sides, since the correction is radial about the centre.
+    /// `(0, 0)` when nothing is enabled or the tables only pull inward.
+    pub fn valid_inset(
+        &self,
+        width: u32,
+        height: u32,
+        distortion: bool,
+        chromatic_aberration: bool,
+    ) -> (f32, f32) {
+        if !distortion && !chromatic_aberration {
+            return (0.0, 0.0);
+        }
+        let (w, h) = (width as f32, height as f32);
+        let (cx, cy) = (w * 0.5, h * 0.5);
+        let rf = 1.0 / (cx * cx + cy * cy).sqrt();
+        let (mut dx, mut dy) = (0.0f32, 0.0f32);
+        const STEPS: usize = 256;
+        for _ in 0..64 {
+            // Largest overshoot of the mapped source past the frame
+            // along the current rectangle's perimeter, per axis.
+            let (mut vx, mut vy) = (0.0f32, 0.0f32);
+            let mut check = |x: f32, y: f32| {
+                let (ox, oy) = (x - cx, y - cy);
+                let f = self.reach(
+                    rf * (ox * ox + oy * oy).sqrt(),
+                    distortion,
+                    chromatic_aberration,
+                );
+                let (sx, sy) = (cx + f * ox, cy + f * oy);
+                vx = vx.max(-sx).max(sx - w);
+                vy = vy.max(-sy).max(sy - h);
+            };
+            for i in 0..=STEPS {
+                let t = i as f32 / STEPS as f32;
+                let x = dx + t * (w - 2.0 * dx);
+                let y = dy + t * (h - 2.0 * dy);
+                check(x, dy);
+                check(x, h - dy);
+                check(dx, y);
+                check(w - dx, y);
+            }
+            if vx <= 0.0 && vy <= 0.0 {
+                break;
+            }
+            // Moving an edge in by v moves its source in by at least v
+            // (the factor is above 1 wherever it overshoots), so this
+            // converges from below in a few rounds.
+            dx = (dx + vx.max(0.0)).min(w * 0.25);
+            dy = (dy + vy.max(0.0)).min(h * 0.25);
+        }
+        tracing::debug!(
+            dx,
+            dy,
+            width,
+            height,
+            distortion_on = distortion,
+            ca_on = chromatic_aberration,
+            distortion = ?self.distortion,
+            ca_red = ?self.ca_red,
+            ca_blue = ?self.ca_blue,
+            "lens valid inset"
+        );
+        (dx, dy)
+    }
+}
+
 impl SensorFrame {
     pub fn cfa_at(&self, x: u32, y: u32) -> CfaColor {
         self.cfa[((y & 1) * 2 + (x & 1)) as usize]

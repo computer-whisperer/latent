@@ -1449,10 +1449,37 @@ now holds image data) and in the develop (6124 × 4116 out of
 
 Not a crop preset, because the merge knows its coverage exactly and
 a preset would have to guess it. The distortion correction's own
-fringe is the same shape of problem with a computable valid rectangle
-(where the mapped source stays inside), and would fit the same slot:
-a source-declared content rectangle that the default crop honours.
-Not done.
+fringe is the same shape of problem; handled in the next entry.
+
+### The distortion fringe (2026-09-16)
+
+The fringe the user saw was this one, not the merge's: it stays with
+a two-frame burst and goes away with distortion off. The new lens's
+tables reach 1.039 at the corner, so an output corner samples 106 px
+past the frame horizontally and 71 px vertically, and the clamped
+sampling smears the edge pixel across that band. (Both my CLI
+developments of the reproduction file had distortion off without my
+noticing: the file's sidecar had it off from the user's testing.
+`--lens all` reproduces it.)
+
+Fix: `LensCorrection::valid_inset(w, h, distortion, ca)` finds the
+symmetric inset inside which every output pixel's corrected source
+stays in the frame, by walking the rectangle's perimeter with the
+tables' largest per-channel factor and growing the inset by the
+largest overshoot until none is left (a few rounds; radial symmetry
+makes symmetric exact). `geometry::layout` takes the inset and the
+default crop (`None`) is the largest view-aspect rectangle inside the
+rotated content less that inset; an explicit crop is untouched.
+`Source::layout(lens, geometry)` and `Developer::layout` both derive
+it from the frame's tables and the lens switches, so the canvas, the
+crop overlay and the render agree, and toggling distortion resizes the
+output (the preview texture is keyed on size since the crop fix).
+On DSC01419: 6192 × 4128 → 5979 × 3986 with distortion, no fringe;
+the merge's own inset composes with it through the frame's crop.
+
+Cost: the perimeter walk runs per layout call (4 × 257 table lookups,
+a few µs); not cached. The CA tables' factors are within 1.0002 of 1
+and add under a pixel.
 
 ## Milestones
 

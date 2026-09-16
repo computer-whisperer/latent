@@ -13,7 +13,9 @@ use rawler::Orientation;
 use crate::color::{
     Gamut, Mat3, XYZ_FROM_BT2020, apply, invert, mul, pq_eotf, xyz_from_chromaticities,
 };
+use crate::geometry::{self, Layout};
 use crate::metadata::{self, Metadata};
+use crate::params::{Geometry, LensParams};
 use crate::sensor::{self, ExifSummary, SensorFrame};
 
 /// Camera raws the pipeline unpacks with rawler.
@@ -128,6 +130,22 @@ impl Source {
             Source::Image(i) => &i.metadata,
             Source::Rgb(r) => &r.frame.metadata,
         }
+    }
+
+    /// Pixels the lens correction cannot fill on each side, x and y
+    /// (`LensCorrection::valid_inset`); zero for rendered images and
+    /// files without tables.
+    pub fn lens_inset(&self, lens: &LensParams) -> (f32, f32) {
+        let (w, h) = self.size();
+        match self.as_raw().and_then(|f| f.lens.as_ref()) {
+            Some(l) => l.valid_inset(w, h, lens.distortion, lens.chromatic_aberration),
+            None => (0.0, 0.0),
+        }
+    }
+
+    /// The output geometry for these parameters.
+    pub fn layout(&self, lens: &LensParams, geo: &Geometry) -> Layout {
+        geometry::layout(self.size(), self.orientation(), self.lens_inset(lens), geo)
     }
 
     /// The sensor frame behind a raw or a reconstruction (whose plane

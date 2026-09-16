@@ -12,7 +12,10 @@
 //!
 //! `Geometry::crop` is given as fractions of the view frame. `None`
 //! means the largest rectangle of the view's aspect that stays inside
-//! the rotated content (the whole frame at 0°).
+//! the rotated content (the whole frame at 0°), where the content is
+//! the sensor frame less `inset` on every side: what the lens
+//! correction can fill without sampling past the edge
+//! (`LensCorrection::valid_inset`), or the whole frame.
 
 use rawler::Orientation;
 
@@ -78,20 +81,35 @@ fn unorient(sensor: (u32, u32), orientation: Orientation) -> ([[f32; 2]; 2], [f3
 
 /// Largest rectangle of the view's own aspect, centred, that stays
 /// inside the content after rotation by `angle_deg`; as fractions.
-pub fn auto_crop(view: (u32, u32), angle_deg: f32) -> [f32; 4] {
+/// The content is the view less `inset` on every side (view axes).
+pub fn auto_crop(view: (u32, u32), inset: (f32, f32), angle_deg: f32) -> [f32; 4] {
     let (w, h) = (view.0 as f32, view.1 as f32);
+    let (cw, ch) = ((w - 2.0 * inset.0).max(1.0), (h - 2.0 * inset.1).max(1.0));
     let a = angle_deg.to_radians().abs();
     let (s, c) = a.sin_cos();
-    let k = (w / (w * c + h * s))
-        .min(h / (w * s + h * c))
+    let k = (cw / (w * c + h * s))
+        .min(ch / (w * s + h * c))
         .clamp(0.0, 1.0);
     [(1.0 - k) * 0.5, (1.0 - k) * 0.5, k, k]
 }
 
-pub fn layout(sensor: (u32, u32), orientation: Orientation, geo: &Geometry) -> Layout {
+/// `inset` is in sensor pixels per side (x, y), before orientation.
+pub fn layout(
+    sensor: (u32, u32),
+    orientation: Orientation,
+    inset: (f32, f32),
+    geo: &Geometry,
+) -> Layout {
     let view = oriented_size(sensor, orientation);
     let (vw, vh) = (view.0 as f32, view.1 as f32);
-    let frac = geo.crop.unwrap_or_else(|| auto_crop(view, geo.angle_deg));
+    let view_inset = if view == sensor {
+        inset
+    } else {
+        (inset.1, inset.0)
+    };
+    let frac = geo
+        .crop
+        .unwrap_or_else(|| auto_crop(view, view_inset, geo.angle_deg));
     let crop = [frac[0] * vw, frac[1] * vh, frac[2] * vw, frac[3] * vh];
     let width = (crop[2].round() as u32).max(1);
     let height = (crop[3].round() as u32).max(1);
@@ -149,7 +167,12 @@ mod tests {
 
     #[test]
     fn identity_is_exact() {
-        let l = layout((6192, 4128), Orientation::Normal, &Geometry::default());
+        let l = layout(
+            (6192, 4128),
+            Orientation::Normal,
+            (0.0, 0.0),
+            &Geometry::default(),
+        );
         assert_eq!((l.width, l.height), (6192, 4128));
         assert_eq!(l.m, [[1.0, 0.0], [0.0, 1.0]]);
         assert_eq!(l.t, [0.0, 0.0]);
@@ -166,7 +189,7 @@ mod tests {
         let pixels: Vec<u32> = (0..w * h).collect();
         for o in ALL {
             let (ow, oh, out) = orient(w, h, 1, &pixels, o);
-            let l = layout((w, h), o, &Geometry::default());
+            let l = layout((w, h), o, (0.0, 0.0), &Geometry::default());
             assert_eq!((l.width, l.height), (ow, oh), "{o:?}");
             for y in 0..oh {
                 for x in 0..ow {
@@ -186,7 +209,7 @@ mod tests {
             angle_deg: 90.0,
             crop: Some([0.0, 0.0, 1.0, 1.0]),
         };
-        let l = layout((10, 10), Orientation::Normal, &geo);
+        let l = layout((10, 10), Orientation::Normal, (0.0, 0.0), &geo);
         let (sx, sy) = l.source((9.5, 5.0));
         assert!(
             (sx - 5.0).abs() < 1e-4 && (sy - 0.5).abs() < 1e-4,
@@ -195,15 +218,51 @@ mod tests {
     }
 
     #[test]
+    fn inset_shrinks_the_default_crop_only() {
+        // 30 px off each side in x, 10 in y, on a 3:2 frame: the crop
+        // keeps the aspect, so x binds (2940/3000 = 0.98).
+        let l = layout(
+            (3000, 2000),
+            Orientation::Normal,
+            (30.0, 10.0),
+            &Geometry::default(),
+        );
+        assert_eq!((l.width, l.height), (2940, 1960));
+        assert!(
+            (l.crop[0] - 30.0).abs() < 1e-3 && (l.crop[1] - 20.0).abs() < 1e-3,
+            "{:?}",
+            l.crop
+        );
+        // Rotated 90°: the insets swap with the axes.
+        let r = layout(
+            (3000, 2000),
+            Orientation::Rotate90,
+            (30.0, 10.0),
+            &Geometry::default(),
+        );
+        assert_eq!((r.width, r.height), (1960, 2940));
+        // An explicit crop is the user's: untouched.
+        let geo = Geometry {
+            angle_deg: 0.0,
+            crop: Some([0.0, 0.0, 1.0, 1.0]),
+        };
+        let e = layout((3000, 2000), Orientation::Normal, (30.0, 10.0), &geo);
+        assert_eq!((e.width, e.height), (3000, 2000));
+    }
+
+    #[test]
     fn auto_crop_fits_rotated_content() {
-        assert_eq!(auto_crop((3000, 2000), 0.0), [0.0, 0.0, 1.0, 1.0]);
-        let c = auto_crop((3000, 2000), 5.0);
+        assert_eq!(
+            auto_crop((3000, 2000), (0.0, 0.0), 0.0),
+            [0.0, 0.0, 1.0, 1.0]
+        );
+        let c = auto_crop((3000, 2000), (0.0, 0.0), 5.0);
         // The corner of the crop, rotated back into the content, stays inside.
         let geo = Geometry {
             angle_deg: 5.0,
             crop: None,
         };
-        let l = layout((3000, 2000), Orientation::Normal, &geo);
+        let l = layout((3000, 2000), Orientation::Normal, (0.0, 0.0), &geo);
         for (vx, vy) in [
             (l.crop[0], l.crop[1]),
             (l.crop[0] + l.crop[2], l.crop[1]),
@@ -222,7 +281,7 @@ mod tests {
             angle_deg: 5.0,
             crop: Some([c[0] - 0.01, c[1] - 0.01, c[2] + 0.02, c[3] + 0.02]),
         };
-        let l2 = layout((3000, 2000), Orientation::Normal, &bigger);
+        let l2 = layout((3000, 2000), Orientation::Normal, (0.0, 0.0), &bigger);
         let outside = [
             (l2.crop[0], l2.crop[1]),
             (l2.crop[0] + l2.crop[2], l2.crop[1]),
