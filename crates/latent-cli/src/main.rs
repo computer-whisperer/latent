@@ -334,9 +334,10 @@ enum Cmd {
         /// Write the resolved parameters to each raw's sidecar.
         #[arg(long)]
         save_params: bool,
-        /// Treat the inputs as one burst: align them to the first,
-        /// merge on the sensor plane, develop the result with the first
-        /// frame's parameters. Needs -o.
+        /// Treat the inputs as one burst: align them to the sharpest,
+        /// leave out blurred frames, merge on the sensor plane, develop
+        /// the result with the first input's parameters. A single input
+        /// merges the burst it leads. Needs -o.
         #[arg(long, requires = "out", conflicts_with = "superres")]
         merge: bool,
         /// Treat the inputs as one burst and reconstruct camera RGB at
