@@ -2045,67 +2045,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "idev-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "idev-core",
- "idev-formats",
- "toml 1.1.6+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "idev-core"
-version = "0.1.0"
-dependencies = [
- "achromat",
- "anyhow",
- "bytemuck",
- "half",
- "pollster 0.4.0",
- "rawler",
- "rustfft",
- "serde",
- "toml 1.1.6+spec-1.1.0",
- "tracing",
- "wgpu",
-]
-
-[[package]]
-name = "idev-formats"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "avif-serialize",
- "exr",
- "half",
- "image",
- "png",
- "rav1e",
- "v_frame",
-]
-
-[[package]]
-name = "idev-gui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "damascene-core",
- "damascene-wgpu",
- "damascene-winit-wgpu",
- "idev-core",
- "idev-formats",
- "rfd",
- "tracing",
- "tracing-subscriber",
- "wgpu",
- "wl-clipboard-rs",
-]
-
-[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2516,6 +2455,67 @@ dependencies = [
  "euclid",
  "polycool",
  "smallvec",
+]
+
+[[package]]
+name = "latent-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "latent-core",
+ "latent-formats",
+ "toml 1.1.6+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "latent-core"
+version = "0.1.0"
+dependencies = [
+ "achromat",
+ "anyhow",
+ "bytemuck",
+ "half",
+ "pollster 0.4.0",
+ "rawler",
+ "rustfft",
+ "serde",
+ "toml 1.1.6+spec-1.1.0",
+ "tracing",
+ "wgpu",
+]
+
+[[package]]
+name = "latent-formats"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "avif-serialize",
+ "exr",
+ "half",
+ "image",
+ "png",
+ "rav1e",
+ "v_frame",
+]
+
+[[package]]
+name = "latent-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "damascene-core",
+ "damascene-wgpu",
+ "damascene-winit-wgpu",
+ "latent-core",
+ "latent-formats",
+ "rfd",
+ "tracing",
+ "tracing-subscriber",
+ "wgpu",
+ "wl-clipboard-rs",
 ]
 
 [[package]]

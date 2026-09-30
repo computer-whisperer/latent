@@ -56,7 +56,7 @@ impl Gpu {
         // hardware offers.
         let limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("idev"),
+            label: Some("latent"),
             required_features: wgpu::Features::empty(),
             required_limits: limits,
             ..Default::default()
@@ -548,73 +548,73 @@ impl Developer {
         Developer {
             linearize: Pass::new(
                 d,
-                "idev::linearize",
+                "latent::linearize",
                 include_str!("shaders/linearize.wgsl"),
                 &[Uniform, StorageBuffer, StorageTexture(R32Float)],
             ),
             impulse: Pass::new(
                 d,
-                "idev::impulse",
+                "latent::impulse",
                 include_str!("shaders/impulse.wgsl"),
                 &[Uniform, Texture, StorageTexture(R32Float)],
             ),
             bilinear: Pass::new(
                 d,
-                "idev::bilinear",
+                "latent::bilinear",
                 include_str!("shaders/demosaic_bilinear.wgsl"),
                 &[Uniform, Texture, StorageTexture(Rgba16Float)],
             ),
             rcd_vh: Pass::new(
                 d,
-                "idev::rcd_vh",
+                "latent::rcd_vh",
                 include_str!("shaders/rcd_vh.wgsl"),
                 &[Uniform, Texture, StorageTexture(Rg32Float)],
             ),
             rcd_green: Pass::new(
                 d,
-                "idev::rcd_green",
+                "latent::rcd_green",
                 include_str!("shaders/rcd_green.wgsl"),
                 &[Uniform, Texture, Texture, StorageTexture(R32Float)],
             ),
             rcd_rb: Pass::new(
                 d,
-                "idev::rcd_rb",
+                "latent::rcd_rb",
                 include_str!("shaders/rcd_rb.wgsl"),
                 &[Uniform, Texture, Texture, StorageTexture(Rgba16Float)],
             ),
             colour: Pass::new(
                 d,
-                "idev::colour",
+                "latent::colour",
                 include_str!("shaders/colour.wgsl"),
                 &[Uniform, Texture, StorageTexture(Rgba16Float)],
             ),
             histogram: Pass::new(
                 d,
-                "idev::histogram",
+                "latent::histogram",
                 include_str!("shaders/histogram.wgsl"),
                 &[Uniform, Texture, StorageBufferRw],
             ),
             resample: Pass::new(
                 d,
-                "idev::resample",
+                "latent::resample",
                 include_str!("shaders/resample.wgsl"),
                 &[Uniform, Texture, StorageTexture(Rgba16Float)],
             ),
             sharpen_blur: Pass::new(
                 d,
-                "idev::sharpen_blur",
+                "latent::sharpen_blur",
                 include_str!("shaders/sharpen_blur.wgsl"),
                 &[Uniform, Texture, StorageTexture(R32Float)],
             ),
             sharpen_apply: Pass::new(
                 d,
-                "idev::sharpen_apply",
+                "latent::sharpen_apply",
                 include_str!("shaders/sharpen_apply.wgsl"),
                 &[Uniform, Texture, Texture, StorageTexture(Rgba16Float)],
             ),
             denoise: Pass::new(
                 d,
-                "idev::denoise",
+                "latent::denoise",
                 include_str!("shaders/denoise.wgsl"),
                 &[Uniform, Texture, StorageTexture(Rgba16Float)],
             ),
@@ -640,7 +640,7 @@ impl Developer {
         let queue = &gpu.queue;
         let out = texture(
             device,
-            "idev::denoised",
+            "latent::denoised",
             wgpu::Extent3d {
                 width: prepared.width,
                 height: prepared.height,
@@ -664,7 +664,7 @@ impl Developer {
             },
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("idev::denoise"),
+            label: Some("latent::denoise"),
         });
         let bg = self.denoise.bind(
             device,
@@ -706,14 +706,14 @@ impl Developer {
         let usage = wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
         let blur_h = texture(
             device,
-            "idev::sharpen::h",
+            "latent::sharpen::h",
             extent,
             wgpu::TextureFormat::R32Float,
             usage,
         );
         let blur_v = texture(
             device,
-            "idev::sharpen::v",
+            "latent::sharpen::v",
             extent,
             wgpu::TextureFormat::R32Float,
             usage,
@@ -748,7 +748,7 @@ impl Developer {
             },
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("idev::sharpen"),
+            label: Some("latent::sharpen"),
         });
         let bg = self
             .sharpen_blur
@@ -792,7 +792,7 @@ impl Developer {
         let (w, h) = Self::output_size(prepared, params, render.scale);
         let scratch = texture(
             &gpu.device,
-            "idev::render::scratch",
+            "latent::render::scratch",
             wgpu::Extent3d {
                 width: w,
                 height: h,
@@ -831,14 +831,14 @@ impl Developer {
         };
         let mid = texture(
             device,
-            "idev::resample::mid",
+            "latent::resample::mid",
             extent(output.0, input.1),
             wgpu::TextureFormat::Rgba16Float,
             usage,
         );
         let out = texture(
             device,
-            "idev::resample::out",
+            "latent::resample::out",
             extent(output.0, output.1),
             wgpu::TextureFormat::Rgba16Float,
             usage,
@@ -868,7 +868,7 @@ impl Developer {
             },
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("idev::resample"),
+            label: Some("latent::resample"),
         });
         let bg = self
             .resample
@@ -902,7 +902,7 @@ impl Developer {
         };
         let cam_rgb = texture(
             &gpu.device,
-            "idev::cam_rgb",
+            "latent::cam_rgb",
             size,
             wgpu::TextureFormat::Rgba16Float,
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
@@ -957,7 +957,7 @@ impl Developer {
         };
         let cam_rgb = texture(
             &gpu.device,
-            "idev::cam_rgb",
+            "latent::cam_rgb",
             size,
             wgpu::TextureFormat::Rgba16Float,
             wgpu::TextureUsages::STORAGE_BINDING
@@ -1047,7 +1047,7 @@ impl Developer {
             &padded
         };
         let raw_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("idev::raw"),
+            label: Some("latent::raw"),
             size: raw_bytes.len() as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -1068,14 +1068,14 @@ impl Developer {
             wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING;
         let plane = texture(
             device,
-            "idev::plane",
+            "latent::plane",
             full,
             wgpu::TextureFormat::R32Float,
             intermediate,
         );
         let cam_rgb = texture(
             device,
-            "idev::cam_rgb",
+            "latent::cam_rgb",
             cropped,
             wgpu::TextureFormat::Rgba16Float,
             intermediate,
@@ -1118,7 +1118,7 @@ impl Developer {
         );
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("idev::prepare"),
+            label: Some("latent::prepare"),
         });
         let bg = self.linearize.bind(
             device,
@@ -1137,7 +1137,7 @@ impl Developer {
         let plane = if impulse > 0.0 {
             let filtered = texture(
                 device,
-                "idev::plane_filtered",
+                "latent::plane_filtered",
                 full,
                 wgpu::TextureFormat::R32Float,
                 intermediate,
@@ -1178,14 +1178,14 @@ impl Developer {
             Demosaic::Rcd => {
                 let vhlpf = texture(
                     device,
-                    "idev::rcd_vhlpf",
+                    "latent::rcd_vhlpf",
                     full,
                     wgpu::TextureFormat::Rg32Float,
                     intermediate,
                 );
                 let green = texture(
                     device,
-                    "idev::rcd_green",
+                    "latent::rcd_green",
                     full,
                     wgpu::TextureFormat::R32Float,
                     intermediate,
@@ -1391,7 +1391,7 @@ impl Developer {
             },
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("idev::colour"),
+            label: Some("latent::colour"),
         });
         let bg = self.colour.bind(
             device,
@@ -1419,7 +1419,7 @@ impl Developer {
         let queue = &gpu.queue;
         let size = (3 * 256 * std::mem::size_of::<u32>()) as u64;
         let bins = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("idev::histogram::bins"),
+            label: Some("latent::histogram::bins"),
             size,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
@@ -1427,7 +1427,7 @@ impl Developer {
             mapped_at_creation: false,
         });
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("idev::histogram::staging"),
+            label: Some("latent::histogram::staging"),
             size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -1443,7 +1443,7 @@ impl Developer {
             },
         );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("idev::histogram"),
+            label: Some("latent::histogram"),
         });
         encoder.clear_buffer(&bins, 0, None);
         let bg = self.histogram.bind(
@@ -1497,7 +1497,7 @@ impl Developer {
         let (w, h) = Self::output_size(&prepared, params, 1);
         let working = texture(
             device,
-            "idev::working",
+            "latent::working",
             wgpu::Extent3d {
                 width: w,
                 height: h,
@@ -1531,7 +1531,7 @@ impl Developer {
         let out = if Self::sharpens(params) {
             let sharp = texture(
                 device,
-                "idev::sharpened",
+                "latent::sharpened",
                 wgpu::Extent3d {
                     width: ow,
                     height: oh,
@@ -1576,7 +1576,7 @@ impl Developer {
         let (out_w, out_h) = Self::output_size(prepared, params, scale);
         let working = texture(
             device,
-            "idev::working",
+            "latent::working",
             wgpu::Extent3d {
                 width: out_w,
                 height: out_h,
@@ -1621,13 +1621,13 @@ fn read_back_rgba16f(
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let padded_row = unpadded.div_ceil(align) * align;
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("idev::readback"),
+        label: Some("latent::readback"),
         size: (padded_row * height) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("idev::readback"),
+        label: Some("latent::readback"),
     });
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -1707,7 +1707,7 @@ fn tex(t: &Tex) -> wgpu::BindingResource<'_> {
 
 fn uniform_buffer<T: Pod>(device: &wgpu::Device, queue: &wgpu::Queue, value: &T) -> wgpu::Buffer {
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("idev::uniforms"),
+        label: Some("latent::uniforms"),
         size: std::mem::size_of::<T>() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,

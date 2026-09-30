@@ -216,7 +216,7 @@ const EXIF_REPLACED: &[u16] = &[
 pub fn develop_note(source_name: &str, params: &DevelopParams) -> String {
     let toml = toml::to_string_pretty(params).unwrap_or_default();
     format!(
-        "Developed by idev {} from {source_name}\n\n{toml}",
+        "Developed by latent {} from {source_name}\n\n{toml}",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -269,7 +269,7 @@ pub fn exif_for_output(tags: &Tags, out: &Output) -> Result<Vec<u8>> {
     root.add_untyped_tag(
         0x0131,
         Value::Ascii(TiffAscii::new(format!(
-            "idev {}",
+            "latent {}",
             env!("CARGO_PKG_VERSION")
         ))),
     );
@@ -1678,7 +1678,7 @@ mod tests {
             width: 3096,
             height: 2064,
             srgb: true,
-            note: "Developed by idev\nexposure = 0.5\n",
+            note: "Developed by latent\nexposure = 0.5\n",
         };
         let block = exif_for_output(&tags, &out).unwrap();
         assert!(block.len() < 65_000);
@@ -1694,11 +1694,11 @@ mod tests {
         assert_eq!(meta.get("Image", "Colour space"), Some("sRGB"));
         assert_eq!(meta.get("Exposure", "Exposure time"), Some("1/80 s"));
         assert_eq!(meta.get("GPS", "Latitude"), Some("28.172644"));
-        assert!(meta.get("Camera", "Software").unwrap().starts_with("idev "));
+        assert!(meta.get("Camera", "Software").unwrap().starts_with("latent "));
         assert!(meta.get("Camera", "Description").is_none());
         assert_eq!(
             meta.get("Camera", "User comment"),
-            Some("Developed by idev (+1 lines)")
+            Some("Developed by latent (+1 lines)")
         );
         let root = tiff.root_ifd();
         assert!(
@@ -1711,7 +1711,7 @@ mod tests {
             "MakerNote must not be copied"
         );
         let comment = exif.get_entry(0x9286u16).unwrap().value.get_data();
-        assert!(comment.starts_with(b"ASCII\0\0\0Developed by idev"));
+        assert!(comment.starts_with(b"ASCII\0\0\0Developed by latent"));
     }
 
     #[test]

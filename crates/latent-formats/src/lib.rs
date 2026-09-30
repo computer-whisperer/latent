@@ -1,5 +1,5 @@
 //! Output encoders. Each function takes pixels already transformed to
-//! the target encoding; the color decisions live in `idev-core::output`.
+//! the target encoding; the color decisions live in `latent-core::output`.
 
 mod avif;
 

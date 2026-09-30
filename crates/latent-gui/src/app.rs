@@ -29,20 +29,20 @@ use damascene_core::widgets::number_scrubber::{self, ScrubDrag, ScrubberOpts};
 use damascene_core::widgets::{switch, tabs, text_input};
 use damascene_core::{BuildCx, EventCx, KeyChord, UiEvent, UiEventKind};
 use damascene_winit_wgpu::{Wakeup, WinitWgpuApp};
-use idev_core::burst;
-use idev_core::color::Gamut;
-use idev_core::geometry;
-use idev_core::gpu::{
+use latent_core::burst;
+use latent_core::color::Gamut;
+use latent_core::geometry;
+use latent_core::gpu::{
     Developer, DisplayPrimaries, Gpu, Histogram, HistogramReadback, OutputTarget, Prepared, Render,
 };
-use idev_core::metadata;
-use idev_core::params::{
+use latent_core::metadata;
+use latent_core::params::{
     DEFAULT_WHITE, Demosaic, DevelopParams, Highlights, ToneCurve, WhiteBalance, sidecar_path,
 };
-use idev_core::sensor::ExifSummary;
-use idev_core::source::{self, Source};
-use idev_core::whitepoint::{self, Temperature};
-use idev_core::{WorkingImage, output};
+use latent_core::sensor::ExifSummary;
+use latent_core::source::{self, Source};
+use latent_core::whitepoint::{self, Temperature};
+use latent_core::{WorkingImage, output};
 
 use crate::library::{self, Filter, Item, Loaded, Loader, LoaderResults, SortKey, sort_indices};
 use crate::thumbs::{CACHE_BUDGET, ThumbCache, ThumbGpu};
@@ -73,7 +73,7 @@ impl SidecarWriter {
     fn spawn(path: PathBuf) -> SidecarWriter {
         let (tx, rx) = channel::<DevelopParams>();
         let thread = std::thread::Builder::new()
-            .name("idev-sidecar".into())
+            .name("latent-sidecar".into())
             .spawn(move || {
                 while let Ok(mut latest) = rx.recv() {
                     // Absorb further changes until the stream goes quiet.
@@ -446,7 +446,7 @@ impl Session {
             let wakeup = wakeup.clone();
             let find_members = members.is_none();
             std::thread::Builder::new()
-                .name("idev-unpack".into())
+                .name("latent-unpack".into())
                 .spawn(move || {
                     let t = Instant::now();
                     let r = Source::load(&path);
@@ -534,7 +534,7 @@ impl Session {
         let members = self.members.clone();
         let wakeup = wakeup.clone();
         match std::thread::Builder::new()
-            .name("idev-merge".into())
+            .name("latent-merge".into())
             .spawn(move || {
                 let t = Instant::now();
                 let r = burst::merge_files(&members);
@@ -696,7 +696,7 @@ impl IdevApp {
         {
             let cache = cache.clone();
             std::thread::Builder::new()
-                .name("idev-thumb-sweep".into())
+                .name("latent-thumb-sweep".into())
                 .spawn(move || {
                     cache.sweep(CACHE_BUDGET);
                 })
@@ -804,7 +804,7 @@ impl IdevApp {
         let wakeup = self.wakeup.clone();
         let start = self.library.dir.clone();
         std::thread::Builder::new()
-            .name("idev-folder-picker".into())
+            .name("latent-folder-picker".into())
             .spawn(move || {
                 let dialog = rfd::FileDialog::new()
                     .set_title("Open folder")
@@ -1059,7 +1059,7 @@ impl IdevApp {
         self.exports_running += 1;
         let wakeup = self.wakeup.clone();
         std::thread::Builder::new()
-            .name("idev-export".into())
+            .name("latent-export".into())
             .spawn(move || {
                 let suffix = match kind {
                     ExportKind::HdrPng | ExportKind::HdrAvif => ".hdr",
@@ -1151,7 +1151,7 @@ impl IdevApp {
         self.toasts.push(ToastSpec::info("copying…"));
         let wakeup = self.wakeup.clone();
         std::thread::Builder::new()
-            .name("idev-copy".into())
+            .name("latent-copy".into())
             .spawn(move || {
                 let result = (|| {
                     let (img, exif) = develop_for(&frame, &name, &params, kind, long_edge)?;
@@ -1930,7 +1930,7 @@ impl IdevApp {
             let layout = frame.layout(&s.params.lens, &s.params.geometry);
             let (w, h) = (layout.width, layout.height);
             match copy_edge(&copy.edge) {
-                Some(edge) => idev_core::gpu::sized(w, h, edge),
+                Some(edge) => latent_core::gpu::sized(w, h, edge),
                 None => (w, h),
             }
         });
@@ -2026,7 +2026,7 @@ impl IdevApp {
         }
         if event.is_click_or_activate("crop-reset") {
             if let Some(s) = self.session.as_mut() {
-                s.params.geometry = idev_core::params::Geometry::default();
+                s.params.geometry = latent_core::params::Geometry::default();
             }
             self.seed_controls();
             self.params_changed();
@@ -2612,7 +2612,7 @@ impl WinitWgpuApp for IdevApp {
             .is_none_or(|p| p.scale != scale || p.size != (w, h))
         {
             let texture = g.gpu.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("idev::preview"),
+                label: Some("latent::preview"),
                 size: wgpu::Extent3d {
                     width: w,
                     height: h,
@@ -2828,7 +2828,7 @@ fn develop_for(
 /// Encode into memory; only the kinds in [`ExportKind::CLIPBOARD`].
 fn encode(img: &WorkingImage, kind: ExportKind, exif: Option<&[u8]>) -> Result<Vec<u8>> {
     match kind {
-        ExportKind::Jpeg => idev_formats::encode_jpeg_srgb8(
+        ExportKind::Jpeg => latent_formats::encode_jpeg_srgb8(
             img.width,
             img.height,
             &output::srgb8(img),
@@ -2836,9 +2836,9 @@ fn encode(img: &WorkingImage, kind: ExportKind, exif: Option<&[u8]>) -> Result<V
             exif,
         ),
         ExportKind::Png => {
-            idev_formats::encode_png_srgb8(img.width, img.height, &output::srgb8(img), exif)
+            latent_formats::encode_png_srgb8(img.width, img.height, &output::srgb8(img), exif)
         }
-        ExportKind::HdrPng => idev_formats::encode_png_bt2020_pq16(
+        ExportKind::HdrPng => latent_formats::encode_png_bt2020_pq16(
             img.width,
             img.height,
             &output::bt2020_pq16(img),
@@ -2866,7 +2866,7 @@ fn export_to(
             std::fs::write(path, encode(&img, kind, exif)?)
                 .with_context(|| format!("write {}", path.display()))?
         }
-        ExportKind::Avif => idev_formats::write_avif_srgb8(
+        ExportKind::Avif => latent_formats::write_avif_srgb8(
             path,
             img.width,
             img.height,
@@ -2874,7 +2874,7 @@ fn export_to(
             EXPORT_QUALITY,
             exif,
         )?,
-        ExportKind::HdrAvif => idev_formats::write_avif_bt2020_pq10(
+        ExportKind::HdrAvif => latent_formats::write_avif_bt2020_pq10(
             path,
             img.width,
             img.height,
@@ -2882,7 +2882,7 @@ fn export_to(
             EXPORT_QUALITY,
             exif,
         )?,
-        ExportKind::Exr => idev_formats::write_exr_rgb_f32(
+        ExportKind::Exr => latent_formats::write_exr_rgb_f32(
             path,
             img.width,
             img.height,

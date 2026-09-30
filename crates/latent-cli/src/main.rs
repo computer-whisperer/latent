@@ -3,17 +3,17 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use idev_core::gpu::{Developer, Gpu, OutputTarget};
-use idev_core::params::{
+use latent_core::gpu::{Developer, Gpu, OutputTarget};
+use latent_core::params::{
     Demosaic, DevelopParams, Highlights, LensParams, ToneCurve, WhiteBalance, sidecar_path,
 };
-use idev_core::sensor::{self, ExifSummary};
-use idev_core::source::Source;
-use idev_core::{WorkingImage, output};
-use idev_core::{burst, corners, metadata};
+use latent_core::sensor::{self, ExifSummary};
+use latent_core::source::Source;
+use latent_core::{WorkingImage, output};
+use latent_core::{burst, corners, metadata};
 
 #[derive(Parser)]
-#[command(name = "idev", about = "Raw developer")]
+#[command(name = "latent", about = "Raw developer")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -431,7 +431,7 @@ fn main() -> Result<()> {
             let Source::Raw(frame) = Source::load(&file)? else {
                 bail!("{}: not a camera raw", file.display());
             };
-            idev_formats::write_pgm16(&out, frame.width, frame.height, &frame.data)
+            latent_formats::write_pgm16(&out, frame.width, frame.height, &frame.data)
         }
         Cmd::Params { file, overrides } => {
             let p = match file {
@@ -502,7 +502,7 @@ fn inspect(file: &Path, all: bool) -> Result<()> {
     println!("black        {:?}", f.black);
     println!("white        {:?}", f.white);
     println!("wb as shot   {:?}", f.wb_as_shot);
-    if let Some(w) = idev_core::whitepoint::white_from_neutral(&f.matrices, f.neutral_as_shot()) {
+    if let Some(w) = latent_core::whitepoint::white_from_neutral(&f.matrices, f.neutral_as_shot()) {
         println!(
             "white        {:.0} K  tint {:+.1}  xy ({:.4}, {:.4})",
             w.temperature.kelvin, w.temperature.tint, w.xy.x, w.xy.y
@@ -788,11 +788,11 @@ fn raw_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
         if p.is_dir() {
             for entry in std::fs::read_dir(p).with_context(|| format!("read {}", p.display()))? {
                 let f = entry?.path();
-                if f.is_file() && idev_core::source::is_raw(&f) {
+                if f.is_file() && latent_core::source::is_raw(&f) {
                     files.push(f);
                 }
             }
-        } else if idev_core::source::is_raw(p) {
+        } else if latent_core::source::is_raw(p) {
             files.push(p.clone());
         } else {
             eprintln!("{}: not a camera raw, skipped", p.display());
@@ -873,7 +873,7 @@ fn burst_stats(inputs: &[PathBuf], pgm: Option<&Path>) -> Result<()> {
     let t = Instant::now();
     let frames = burst::load_all(&files)?;
     let t_load = t.elapsed();
-    let refs: Vec<&idev_core::sensor::SensorFrame> = frames.iter().collect();
+    let refs: Vec<&latent_core::sensor::SensorFrame> = frames.iter().collect();
     let t = Instant::now();
     let shifts = burst::align_all(&refs)?;
     let t_align = t.elapsed();
@@ -935,7 +935,7 @@ fn burst_stats(inputs: &[PathBuf], pgm: Option<&Path>) -> Result<()> {
         single.sigma(100.0),
         single.sigma(1000.0)
     );
-    let below = |f: &idev_core::sensor::SensorFrame| {
+    let below = |f: &latent_core::sensor::SensorFrame| {
         let c = f.crop;
         let mut n = 0u64;
         for y in c.y..c.y + c.height {
@@ -960,8 +960,8 @@ fn burst_stats(inputs: &[PathBuf], pgm: Option<&Path>) -> Result<()> {
     );
     // Halves merged separately: the model between them is the noise of
     // an N/2-frame merge, at every signal level.
-    let evens: Vec<&idev_core::sensor::SensorFrame> = refs.iter().step_by(2).copied().collect();
-    let odds: Vec<&idev_core::sensor::SensorFrame> =
+    let evens: Vec<&latent_core::sensor::SensorFrame> = refs.iter().step_by(2).copied().collect();
+    let odds: Vec<&latent_core::sensor::SensorFrame> =
         refs.iter().skip(1).step_by(2).copied().collect();
     let even_shifts: Vec<burst::Shift> = shifts.iter().step_by(2).copied().collect();
     let mut odd_shifts: Vec<burst::Shift> = shifts.iter().skip(1).step_by(2).copied().collect();
@@ -996,7 +996,7 @@ fn burst_stats(inputs: &[PathBuf], pgm: Option<&Path>) -> Result<()> {
         println!("half-split model: not enough samples");
     }
     if let Some(p) = pgm {
-        idev_formats::write_pgm16(
+        latent_formats::write_pgm16(
             p,
             merged.frame.width,
             merged.frame.height,
@@ -1022,7 +1022,7 @@ fn burst_score(inputs: &[PathBuf]) -> Result<()> {
     }
     let t = Instant::now();
     let frames = burst::load_all(&files)?;
-    let refs: Vec<&idev_core::sensor::SensorFrame> = frames.iter().collect();
+    let refs: Vec<&latent_core::sensor::SensorFrame> = frames.iter().collect();
     let mut corner_sets: Vec<Vec<corners::Corner>> = Vec::new();
     std::thread::scope(|s| {
         let handles: Vec<_> = refs
@@ -1187,19 +1187,19 @@ fn encode(
     match (fmt, hdr) {
         (Format::Exr, _) => {
             let rgb = output::scrgb_linear_f32(img);
-            idev_formats::write_exr_rgb_f32(path, img.width, img.height, &rgb)
+            latent_formats::write_exr_rgb_f32(path, img.width, img.height, &rgb)
         }
         (Format::Png, None) => {
-            idev_formats::write_png_srgb8(path, img.width, img.height, &output::srgb8(img), exif)
+            latent_formats::write_png_srgb8(path, img.width, img.height, &output::srgb8(img), exif)
         }
-        (Format::Png, Some(_)) => idev_formats::write_png_bt2020_pq16(
+        (Format::Png, Some(_)) => latent_formats::write_png_bt2020_pq16(
             path,
             img.width,
             img.height,
             &output::bt2020_pq16(img),
             exif,
         ),
-        (Format::Jpg, None) => idev_formats::write_jpeg_srgb8(
+        (Format::Jpg, None) => latent_formats::write_jpeg_srgb8(
             path,
             img.width,
             img.height,
@@ -1210,7 +1210,7 @@ fn encode(
         (Format::Jpg, Some(_)) => {
             bail!("JPEG has no HDR encoding; use png, avif or exr with --hdr")
         }
-        (Format::Avif, None) => idev_formats::write_avif_srgb8(
+        (Format::Avif, None) => latent_formats::write_avif_srgb8(
             path,
             img.width,
             img.height,
@@ -1218,7 +1218,7 @@ fn encode(
             quality,
             exif,
         ),
-        (Format::Avif, Some(_)) => idev_formats::write_avif_bt2020_pq10(
+        (Format::Avif, Some(_)) => latent_formats::write_avif_bt2020_pq10(
             path,
             img.width,
             img.height,

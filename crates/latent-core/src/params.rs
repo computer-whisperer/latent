@@ -256,7 +256,7 @@ impl Default for DevelopParams {
 }
 
 /// Sidecar extension, appended to the raw's full file name.
-pub const SIDECAR_SUFFIX: &str = ".idev.toml";
+pub const SIDECAR_SUFFIX: &str = ".latent.toml";
 
 pub fn sidecar_path(raw: &Path) -> PathBuf {
     let mut name = raw

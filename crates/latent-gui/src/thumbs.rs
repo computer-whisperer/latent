@@ -18,13 +18,13 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use damascene_core::image::Image;
-use idev_core::WorkingImage;
-use idev_core::color::srgb_oetf;
-use idev_core::gpu::{Developer, Gpu, OutputTarget};
-use idev_core::output;
-use idev_core::params::{DevelopParams, sidecar_path};
-use idev_core::sensor::{self, ExifSummary};
-use idev_core::source::{self, Source};
+use latent_core::WorkingImage;
+use latent_core::color::srgb_oetf;
+use latent_core::gpu::{Developer, Gpu, OutputTarget};
+use latent_core::output;
+use latent_core::params::{DevelopParams, sidecar_path};
+use latent_core::sensor::{self, ExifSummary};
+use latent_core::source::{self, Source};
 
 /// Long edge of a thumbnail in pixels. Tiles are ~240 logical px wide,
 /// so this covers a 2x display without upscaling.
@@ -74,14 +74,14 @@ impl ThumbCache {
         ThumbCache { root }
     }
 
-    /// `$XDG_CACHE_HOME/idev/thumbs` (or `~/.cache/…`): the local cache
+    /// `$XDG_CACHE_HOME/latent/thumbs` (or `~/.cache/…`): the local cache
     /// directory, never the (possibly network) folder being browsed.
     pub fn standard() -> Option<Self> {
         let base = std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-        Some(Self::new(base.join("idev/thumbs")))
+        Some(Self::new(base.join("latent/thumbs")))
     }
 
     /// The thumbnail for `raw`: a cache hit if neither the raw nor its

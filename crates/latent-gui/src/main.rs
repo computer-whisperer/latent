@@ -1,6 +1,6 @@
-//! idev-gui — browse a folder of raws and develop them interactively.
+//! latent-gui — browse a folder of raws and develop them interactively.
 //!
-//! Usage: `idev-gui [DIR | FILE.ARW]` (default: the current directory).
+//! Usage: `latent-gui [DIR | FILE.ARW]` (default: the current directory).
 
 mod app;
 mod library;
@@ -17,7 +17,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "idev_gui=info,idev_core=info".into()),
+                .unwrap_or_else(|_| "latent_gui=info,latent_core=info".into()),
         )
         .init();
 
@@ -40,10 +40,10 @@ fn main() -> Result<()> {
     let wakeup = app::SharedWakeup::default();
     let app = app::IdevApp::new(dir, file, wakeup.clone())?;
     let config = HostConfig::default()
-        .with_app_id("idev-gui")
+        .with_app_id("latent-gui")
         .with_color_preferences(ColorPreferences::hdr_extended())
         .with_external_wakeup(move |w| *wakeup.lock().unwrap() = Some(w));
     let viewport = Rect::new(0.0, 0.0, 1600.0, 1000.0);
-    run_host_app_with_config("idev", viewport, app, config)
+    run_host_app_with_config("latent", viewport, app, config)
         .map_err(|e| anyhow::anyhow!("host error: {e}"))
 }

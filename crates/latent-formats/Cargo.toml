@@ -1,11 +1,12 @@
 [package]
-name = "idev-formats"
+name = "latent-formats"
 description = "Output encoders for developed images"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true

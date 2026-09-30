@@ -8,6 +8,7 @@ edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 authors = ["Christian Balcom"]
+repository = "https://github.com/computer-whisperer/latent"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -36,9 +37,9 @@ achromat = { git = "https://github.com/computer-whisperer/achromat.git", branch 
 
 # Our own pixel loops and the codecs are hot even in dev runs; keep the
 # CLI/GUI crates unoptimised for debugging.
-[profile.dev.package.idev-core]
+[profile.dev.package.latent-core]
 opt-level = 2
-[profile.dev.package.idev-formats]
+[profile.dev.package.latent-formats]
 opt-level = 2
 [profile.dev.package.rawler]
 opt-level = 3

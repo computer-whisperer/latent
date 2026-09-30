@@ -12,8 +12,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::{Context, Result};
-use idev_core::sensor::ExifSummary;
-use idev_core::source::is_raw;
+use latent_core::sensor::ExifSummary;
+use latent_core::source::is_raw;
 
 use crate::app::{SharedWakeup, wake};
 use crate::thumbs::{Thumb, ThumbCache, ThumbGpu};
@@ -26,7 +26,7 @@ pub fn scan_dir(dir: &Path) -> Result<Vec<PathBuf>> {
         std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?
     {
         let p = entry?.path();
-        if p.is_file() && idev_core::source::is_supported(&p) {
+        if p.is_file() && latent_core::source::is_supported(&p) {
             files.push(p);
         }
     }
@@ -101,7 +101,7 @@ impl Loader {
         for n in 0..workers {
             let shared = Arc::clone(&shared);
             std::thread::Builder::new()
-                .name(format!("idev-thumb-{n}"))
+                .name(format!("latent-thumb-{n}"))
                 .spawn(move || worker(shared))
                 .expect("spawning thumbnail worker");
         }

@@ -1,7 +1,8 @@
-# image_developer — design (draft, 2026-09-10)
+# latent — design and decision record
 
-Status: planning. Nothing built. This file is the ground truth for the
-plan; the conversation that produced it is not.
+Started as a draft on 2026-09-10; the arcs below record what was built
+and why, in order. This file is the ground truth; the conversations
+that produced it are not.
 
 ## Goal
 
@@ -153,8 +154,8 @@ crates/<name>-gui/      damascene WinitWgpuApp: library grid (lifted from
                         (viewport over AppTexture, control panel, histogram)
 ```
 
-Name TBD (project dir is `image_developer`; the ecosystem favors
-optics/color names). Sidecar extension follows the name.
+Named `latent` (2026-09-29; see decision 4). The sidecar extension
+follows the name.
 
 Not in achromat: the pipeline has parameters and GPU deps, achromat is a
 decode stack. But `<name>-core` exposes `develop_default(path) ->
@@ -222,7 +223,7 @@ CPU output transform (orientation, primaries, transfer) → encoder.
 - **Formats.** JPEG (sRGB, quality param), PQ PNG (16-bit, BT.2020
   primaries, PQ, `cICP` chunk, 203 nits = diffuse white), EXR and
   sRGB PNG as before. Orientation applied on the CPU before encode.
-- **Sidecars** `<raw>.idev.toml` = `DevelopParams`; CLI flags
+- **Sidecars** `<raw>.latent.toml` = `DevelopParams`; CLI flags
   override; `--save-params` writes back. **Batch**: many inputs, one
   GPU, one output directory, skip-existing.
 
@@ -248,7 +249,7 @@ Everything in the arc landed; the CLI is usable for real batches.
   including readback, so the GPU is not the bottleneck. Encoders are:
   JPEG q92 1 s, 8-bit PNG 3 s, 16-bit PQ PNG far longer (zlib on
   noisy 16-bit data; not tuned). EXR 0.7 s.
-- Sidecars work as `<raw>.idev.toml`; `--save-params` writes the
+- Sidecars work as `<raw>.latent.toml`; `--save-params` writes the
   resolved parameters, later runs pick them up, flags override.
 
 ## Milestone 3 arc (started 2026-09-10): single-image develop window
@@ -256,7 +257,7 @@ Everything in the arc landed; the CLI is usable for real batches.
 Decisions: preview-scale pipeline for slider drags, full resolution at
 1:1 and on export; single-image window first, library view later.
 
-- **Crate `idev-gui`**, binary `idev-gui <raw>`. damascene
+- **Crate `latent-gui`**, binary `latent-gui <raw>`. damascene
   `WinitWgpuApp` host: `gpu_setup` wraps the host device in `Gpu`,
   `before_paint` reruns whatever is dirty.
 - **Pipeline split for interactivity.** The full-resolution linearize
@@ -330,7 +331,7 @@ develop with the sidecar's parameters once one exists. The embedded
 preview is instant (1616×1080 JPEG, ~200 KB, in every a6700 ARW) and
 matches the camera's rendering; the developed thumbnail shows the edit.
 
-- **Entry point**: `idev-gui [PATH]`. A directory opens the library;
+- **Entry point**: `latent-gui [PATH]`. A directory opens the library;
   a file opens the develop view on it with its folder as the library;
   no argument means the current directory. `o` picks another folder.
 - **App structure**: one `IdevApp` with `Mode::{Library, Develop}`.
@@ -340,13 +341,13 @@ matches the camera's rendering; the developed thumbnail shows the edit.
   file, Escape returns to the grid, Left/Right in develop mode step
   through the folder. Dropping a session joins its sidecar writer, so
   the thumbnail requeued on return sees the final sidecar.
-- **Thumbnails**: `idev-gui::thumbs` is the explorer-thumbs design
+- **Thumbnails**: `latent-gui::thumbs` is the explorer-thumbs design
   (content-addressed by path + mtime + size, temp-and-rename, corrupt
   = miss, LRU byte sweep) with two changes: the key also covers the
   sidecar's mtime + size, and entries are sRGB RGBA8 at a 512 px long
   edge rather than linear f16 (developed thumbs are rendered for the
   SDR target, so nothing above diffuse white is lost). Cache root is
-  `$XDG_CACHE_HOME/idev/thumbs`.
+  `$XDG_CACHE_HOME/latent/thumbs`.
 - **Producing a thumbnail**: no sidecar → rawler's `preview_image`
   (the JPEGInterchangeFormat blob), box-downscaled in linear light and
   rotated by the EXIF orientation. Sidecar → `unpack` + `prepare` +
@@ -372,7 +373,7 @@ Verified by screenshot on the 239-file card folder: the grid fills
 within the first seconds (embedded previews; three workers), the
 selection ring and captions render, a raw given a sidecar with +1 EV
 shows the brighter developed thumbnail and the dot marker, and
-`idev-gui FILE` opens in develop mode (unpack 83 ms, prepare 68 ms on
+`latent-gui FILE` opens in develop mode (unpack 83 ms, prepare 68 ms on
 the host device). The thumbnail cache holds ~420 KB per entry (101 MB
 for the folder). The headless thumbnail device is created lazily on
 the first developed thumbnail. Not exercised by me: keyboard
@@ -413,7 +414,7 @@ Survey results that shape the order:
   panel cannot show the colour. Semantics to agree with the user
   before building.
 - **Gallery.** damascene-gallery views JXR/JXL/AVIF/EXR/PNG through
-  achromat; idev's library only lists raws. Retiring it needs a
+  achromat; latent's library only lists raws. Retiring it needs a
   non-raw path in the library (achromat decode → thumbnail → viewer).
   Proposal: keep it until then.
 
@@ -446,7 +447,7 @@ soft-proof questions go back to the user.
 
 ## AVIF export results (2026-09-11)
 
-- `idev-formats::avif`: rav1e (pure Rust, no assembly, `threading`)
+- `latent-formats::avif`: rav1e (pure Rust, no assembly, `threading`)
   plus avif-serialize. Still picture, 4:4:4, identity matrix (planes
   carry G, B, R), full range, 10-bit in both flavours. SDR widens
   sRGB 8-bit; HDR narrows the PQ 16-bit samples. ravif's quality →
@@ -533,7 +534,7 @@ metadata because achromat returns pixels only.
 
 Built:
 
-- `idev-core::metadata` — `Metadata { groups: [Group { name, fields:
+- `latent-core::metadata` — `Metadata { groups: [Group { name, fields:
   [Field { name, value }] }] }`, rendered to strings at load time.
   Groups: Camera, Exposure, Lens, Time, Image, GPS, Sony, Other.
   Known tags have a name and a domain formatter (exposure as `1/80 s`,
@@ -587,7 +588,7 @@ every `Source` (structural and bulky tags dropped at load), and
 `metadata::exif_for_output` writes a TIFF block from them with
 rawler's writer: IFD0 whitelist (make, model, description, artist,
 copyright, resolution, modify date) plus `Orientation` = 1, `Software`
-= "idev x.y.z", pointers to the Exif and GPS IFDs; the Exif IFD copied
+= "latent x.y.z", pointers to the Exif and GPS IFDs; the Exif IFD copied
 whole except MakerNote, the source's colour space and dimensions, and
 the JPEG-encoding tags, with the output's `PixelX/YDimension`,
 `ColorSpace` (sRGB, or Uncalibrated for the PQ outputs where cICP is
@@ -786,7 +787,7 @@ line shows the output size after crop and resize. Enter or Copy
 develops on a worker with the same `develop_for` the file exports use
 (headless device, current parameters including crop and straighten,
 EXIF block) and encodes in memory (`encode_*` variants of the PNG and
-JPEG writers in `idev-formats`; the file writers now wrap them). The
+JPEG writers in `latent-formats`; the file writers now wrap them). The
 bytes go on the Wayland clipboard through `wl-clipboard-rs`
 (data-control protocol, the same crate damascene's text copy uses):
 one MIME type, the chosen one, served by a thread the crate keeps
@@ -937,12 +938,12 @@ shot+read noise model. Staged here:
   reference frame's `SensorFrame` with the merged plane. CPU, row
   bands over `std::thread::scope`: this is a load-time step like
   unpack, not an interactive stage.
-- CLI: `idev burst FILES|DIR` lists groups; `idev burst --stats
+- CLI: `latent burst FILES|DIR` lists groups; `latent burst --stats
   FILES` aligns and merges the given frames as one burst and prints
   shifts, weights, the noise model, the below-black σ before and
   after, and a half-split check (evens vs odds merged separately,
   model between them; expected σ ratio √(N/2)). `--pgm` dumps the
-  merged plane. `idev develop --merge FILES -o OUT` merges and
+  merged plane. `latent develop --merge FILES -o OUT` merges and
   develops with the first frame's sidecar.
 - GUI: the library's Stack toggle also collapses a burst onto its
   first frame with an "×N" badge. Merging in the GUI waits for the
@@ -952,13 +953,13 @@ shot+read noise model. Staged here:
 
 Built as designed: `burst.rs` (grouping, `align`, `noise_model`,
 `merge`, parallel loaders), `ExifSummary::{subsec_ms, sequence}` with
-the thumbnail cache at format 4, `idev burst` / `idev burst --stats`
-/ `idev develop --merge`, and the library's Stack toggle collapsing
+the thumbnail cache at format 4, `latent burst` / `latent burst --stats`
+/ `latent develop --merge`, and the library's Stack toggle collapsing
 bursts with an "×N" caption. rustfft is the one new dependency; the
 merge and the FFT rows run over `std::thread::scope` bands.
 
 - Grouping: 239 frames of the first session and ~300 of the second
-  fall into the same bursts the hand-made table found; `idev burst`
+  fall into the same bursts the hand-made table found; `latent burst`
   on a folder takes ~270 ms per file (rawler metadata plus the
   makernote parse, on ceph).
 - Alignment on the real bursts: shifts drift smoothly (4 → 35 px over
@@ -1072,8 +1073,8 @@ pipeline; this is a load-time step like unpack until then).
   radius, so scale-free), geometry and everything downstream are
   unchanged. 2× of the a6700 crop is 12384 × 8256, inside the 16384
   texture limit the headless device already requests.
-- **CLI**: `idev develop --superres SCALE [--kernel SIGMA] FILES -o
-  OUT`; `idev burst --stats` also prints each frame's similarity fit.
+- **CLI**: `latent develop --superres SCALE [--kernel SIGMA] FILES -o
+  OUT`; `latent burst --stats` also prints each frame's similarity fit.
 - **Evaluation**: on a sharp 28 mm 1/8 s skyline set, the width of
   isolated point lights in (a) the single frame's RCD develop
   upscaled 2× against (b) the 2× reconstruction, and at 1× the
@@ -1089,13 +1090,13 @@ over the reference's signal mask (Cauchy reweighting from the third
 iteration). Synthetic checks: a (5.3, −3.7) px shift recovered within
 0.1 px, a 0.3° roll within 0.03°. `burst::reconstruct`,
 `Source::Rgb(CameraRgb)` with `Developer::prepare_rgb` (the colour
-setup is now shared with the raw path), `idev develop --superres
-SCALE [--kernel σ]`, `idev burst --stats` prints the fits.
+setup is now shared with the raw path), `latent develop --superres
+SCALE [--kernel σ]`, `latent burst --stats` prints the fits.
 
 - Fits on real bursts: 9–16 tiles per frame, rolls of −0.18° to
   +0.32° between frames, scale within 0.3 %; robustness weights
   0.94–0.96; no uncovered output values at 1× or 2×.
-- Timing, 6 frames, 24 threads, debug profile with idev-core at
+- Timing, 6 frames, 24 threads, debug profile with latent-core at
   opt-level 2: 1× 10.5 s wall (load + align + reconstruct 5 s,
   develop 0.5 s, PNG 5 s); 2× 27 s (8 s, 2 s, 16 s). The 2× plane is
   816 MB f16, doubled once for the white-balance upload.
@@ -1158,7 +1159,7 @@ SCALE [--kernel σ]`, `idev burst --stats` prints the fits.
   On the night pair DSC01233/1234 the refined similarity lands within
   0.3 px of the measured light positions (rotation −0.12°, independent
   tile estimate −0.11°), where it was 5 px off.
-- **Scorer** (`corners.rs`, `idev burst --score`): X-corners on the
+- **Scorer** (`corners.rs`, `latent burst --score`): X-corners on the
   half-resolution plane by the saddle response of a σ = 2 quad blur,
   refined by gradient orthogonality over a 6-quad disc centred on the
   running estimate (the disc must exceed the blur width: at 4 quads
@@ -1204,7 +1205,7 @@ only where it lowered the tile's residual and stayed under 12 px,
 interpolated bilinearly between tile centres and extrapolated linearly
 past the outer ones. Tiles with under 150 masked quads in either frame
 keep the global fit, which is what the night skylines get outside the
-horizon. The reconstruction now takes fields; `idev burst --score`
+horizon. The reconstruction now takes fields; `latent burst --score`
 reports the field as a model.
 
 Kill test, board bursts, strongest corners, rms px:
@@ -1341,12 +1342,12 @@ needed for night bursts. Script: scratchpad `night/corner_check.py`.
 - The session holds the burst's member paths, the single reference
   frame and, once it lands, the merge. The members come from the
   library's grouping while its Stack view is on; a file opened before
-  its summary arrived, or directly (`idev-gui FILE`), has the load
+  its summary arrived, or directly (`latent-gui FILE`), has the load
   thread find them with `burst::members_of`, which walks the folder's
   raws by name from the file while the burst rule holds (one summary
   read per member plus one past each end; 8 reads in ~1 s on ceph for
   the 7-frame set). A file that is not its burst's first frame is
-  alone. `idev develop --merge FILE` with one input uses the same
+  alone. `latent develop --merge FILE` with one input uses the same
   lookup. The reference shows
   immediately as before; the merge runs on its own thread
   (`burst::merge_files` over the members, reloading the reference:
@@ -1360,13 +1361,13 @@ needed for night bursts. Script: scratchpad `night/corner_check.py`.
 - Sidebar: a Burst group (only for bursts) with the switch and the
   merge's state (merging, merged from N frames with the mean
   robustness weight, or the error).
-- Verified on DSC01126 (`idev-gui FILE`): file loaded in 154 ms,
+- Verified on DSC01126 (`latent-gui FILE`): file loaded in 154 ms,
   burst lookup 83 ms, seven frames merged in 1.3 s, the preview
   re-prepared on the swap; screenshot shows the "×7" title and the
   Burst group reading "merged from 7 frames · mean weight 0.97". The
   CLI's single-input `--merge` finds the same seven and refuses a
   non-leader; the exported JPEG's note names all seven files.
-- Fixed beside this: `idev-gui FILE` indexed the file's position in
+- Fixed beside this: `latent-gui FILE` indexed the file's position in
   `files` but opened `view[selected]`, so with hidden JPEG pairs it
   opened a different file (DSC01128 for DSC01126).
 - Reported after: cropping showed the image tiled several times until
@@ -1503,7 +1504,12 @@ and add under a pixel.
    implementations to keep identical, and 26 MP sliders need the GPU.
 3. Working space: linear BT.2020, D65, f16. Rejected scRGB-linear:
    negative values complicate every stage in between.
-4. Name: open. Crates use the placeholder prefix `idev` until chosen;
-   the playground directory is a placeholder too. Rename is mechanical.
+4. Name: **latent** (2026-09-29), after the latent image: captured but
+   invisible until developed, which is what a raw file is. Chose-because:
+   apt, short to type, free on crates.io. Rejected: dichroic (optics-family
+   fit but says nothing about developing), argent and emulsion (taken on
+   crates.io), halide (collides with the Halide language). The working
+   prefix `idev` and its `.idev.toml` sidecars were dropped without a
+   fallback.
 5. damascene-gallery will be retired once the GUI covers browsing; this
    project is meant to grow into the user's image processing system.
